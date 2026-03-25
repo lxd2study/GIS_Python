@@ -1,0 +1,27 @@
+# Remote Sensing Tools dependencies
+
+# Web framework
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+python-multipart>=0.0.6
+
+# Raster processing
+numpy>=1.24.0
+gdal>=3.6.0
+
+# Validation and settings
+pydantic>=2.0.0
+pydantic-settings>=2.0.0
+
+# Atmospheric correction
+Py6S>=1.9.2
+
+# Utilities
+python-dotenv>=1.0.0
+httpx>=0.27.0
+pystac-client>=0.8.0
+planetary-computer>=1.0.0
+
+# Optional tools dependencies
+python-docx>=0.8.11  # For md_to_docx.py
+PyMuPDF>=1.23.0  # For pdf_to_png.py

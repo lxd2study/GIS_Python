@@ -1,0 +1,37 @@
+﻿__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+.env
+frontend-vue/.env
+frontend-vue/.env.local
+logs/
+*.log
+temp/
+cache/
+output/
+data/
+
+frontend-vue/node_modules/
+frontend-vue/dist/
+frontend-vue/.vite/
+frontend-vue/.vite-temp/
+
+# IDE
+.idea/
+.vscode/
+
+# Claude Code
+.claude/
+
+# Docs - internal / thesis materials
+docs/proposal/
+docs/archive/
+
+# OS
+Thumbs.db
+.DS_Store
