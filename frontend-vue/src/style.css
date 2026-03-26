@@ -40,6 +40,7 @@ body {
 
 .page.no-scroll {
   height: 100vh;
+  height: 100dvh;
   overflow: hidden;
 }
 
@@ -1049,6 +1050,12 @@ select:focus {
   margin-bottom: 0.4rem;
   border-bottom: 2px solid var(--line);
   flex-shrink: 0;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+
+.tabs-bar::-webkit-scrollbar {
+  display: none;
 }
 
 .tab-btn {
@@ -1061,6 +1068,7 @@ select:focus {
   cursor: pointer;
   position: relative;
   transition: all 0.2s;
+  flex-shrink: 0;
 }
 
 .tab-btn:hover {
@@ -1103,6 +1111,13 @@ select:focus {
 /* 指数百科 - 可滚动布局 */
 .scrollable .indices-view {
   min-height: auto;
+}
+
+@media (max-width: 900px) {
+  .no-scroll .batch-view {
+    overflow-y: auto;
+    padding-bottom: 0.75rem;
+  }
 }
 
 @keyframes fadeIn {

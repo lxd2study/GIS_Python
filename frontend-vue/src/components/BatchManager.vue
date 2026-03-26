@@ -4,7 +4,7 @@
     <div class="toolbar">
       <div class="toolbar-left">
         <span class="toolbar-title">处理流程编辑器</span>
-        <span class="toolbar-hint">将节点拖入画布，连线构建处理管线</span>
+        <span class="toolbar-hint">{{ supportsTouch ? '轻触节点卡片添加到当前视图，拖动画布调整流程布局' : '将节点拖入画布，连线构建处理管线' }}</span>
       </div>
       <div class="toolbar-right">
         <select v-model="state.priority" class="priority-select">
@@ -34,20 +34,38 @@
     <div class="main-area">
       <!-- 左侧节点面板 -->
       <div class="node-palette">
-        <div class="palette-title">可用节点</div>
-        <div class="palette-hint">拖拽到画布</div>
-        <div v-for="nt in nodeTypes" :key="nt.type" class="palette-item"
-          draggable="true" @dragstart="onDragStart($event, nt)">
-          <span class="palette-icon" v-html="nt.iconSvg"></span>
+        <div class="palette-header">
           <div>
-            <div class="palette-name">{{ nt.label }}</div>
-            <div class="palette-desc">{{ nt.desc }}</div>
+            <div class="palette-title">可用节点</div>
+            <div class="palette-hint">{{ supportsTouch ? '轻触卡片快速添加' : '拖拽到画布' }}</div>
+          </div>
+          <button v-if="supportsTouch" class="palette-fit-btn" @click="vfFitView()" type="button">查看全局</button>
+        </div>
+        <div class="palette-list">
+          <div v-for="nt in nodeTypes" :key="nt.type" class="palette-item"
+            :class="{ tappable: supportsTouch }"
+            :draggable="!supportsTouch"
+            tabindex="0"
+            @click="handlePaletteActivate(nt)"
+            @keydown.enter.prevent="addNodeFromPalette(nt)"
+            @keydown.space.prevent="addNodeFromPalette(nt)"
+            @dragstart="onDragStart($event, nt)"
+            @dragend="onDragEnd">
+            <span class="palette-icon" v-html="nt.iconSvg"></span>
+            <div class="palette-copy">
+              <div class="palette-name-row">
+                <div class="palette-name">{{ nt.label }}</div>
+                <span v-if="supportsTouch" class="palette-badge">点按添加</span>
+              </div>
+              <div class="palette-desc">{{ nt.desc }}</div>
+            </div>
           </div>
         </div>
       </div>
 
       <!-- 中间画布 -->
-      <div class="canvas-wrapper" @drop="onDrop" @dragover.prevent>
+      <div ref="canvasWrapperRef" class="canvas-wrapper" :class="{ touch: supportsTouch }" @drop.prevent="onDrop" @dragover.prevent>
+        <div v-if="supportsTouch" class="canvas-mobile-tip">拖动画布浏览流程，点左侧卡片即可把节点放到当前视图</div>
         <VueFlow
           v-model:nodes="state.nodes"
           v-model:edges="state.edges"
@@ -64,10 +82,10 @@
           class="vue-flow-canvas"
         >
           <Background pattern-color="#e5e7eb" :gap="20" />
-          <MiniMap :node-color="miniMapColor" :node-stroke-width="2" style="background:#f9fafb" />
+          <MiniMap v-if="!supportsTouch" :node-color="miniMapColor" :node-stroke-width="2" style="background:#f9fafb" />
         </VueFlow>
         <!-- 自定义缩放控件 -->
-        <div class="canvas-controls">
+        <div class="canvas-controls" :class="{ compact: supportsTouch }">
           <button class="ctrl-btn" @click="vfZoomIn()" title="放大">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
               <circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
@@ -382,7 +400,7 @@
 </template>
 
 <script setup>
-import { reactive, computed, onMounted, onUnmounted, markRaw } from 'vue'
+import { reactive, computed, onMounted, onUnmounted, markRaw, ref } from 'vue'
 import { VueFlow, applyEdgeChanges, applyNodeChanges, useVueFlow } from '@vue-flow/core'
 import { Background } from '@vue-flow/background'
 import { MiniMap } from '@vue-flow/minimap'
@@ -401,7 +419,9 @@ import OutputNode     from './flow-nodes/OutputNode.vue'
 const props = defineProps(['apiBase'])
 const emit = defineEmits(['toast'])
 
-const { zoomIn: vfZoomIn, zoomOut: vfZoomOut, fitView: vfFitView } = useVueFlow()
+const { zoomIn: vfZoomIn, zoomOut: vfZoomOut, fitView: vfFitView, screenToFlowCoordinate } = useVueFlow()
+const canvasWrapperRef = ref(null)
+const supportsTouch = ref(false)
 
 const customNodeTypes = {
   datadir:      markRaw(DataDirNode),
@@ -517,28 +537,87 @@ function selectNoneScenes() {
 // ─── 画布交互 ─────────────────────────────────────────────
 let dragNodeType = null
 let nodeCounter = 100
+const NODE_HALF_WIDTH = 85
+const NODE_HALF_HEIGHT = 42
 
-function onDragStart(event, nt) {
-  dragNodeType = nt.type
-  event.dataTransfer.effectAllowed = 'move'
+function updateInteractionMode() {
+  if (typeof window === 'undefined') return
+  supportsTouch.value = window.innerWidth <= 900 || window.matchMedia('(pointer: coarse)').matches
 }
 
-function onDrop(event) {
-  if (!dragNodeType) return
-  const rect = event.currentTarget.getBoundingClientRect()
-  const id = `${dragNodeType}-${++nodeCounter}`
+function getDefaultNodeData(type) {
   const defaults = {
     atmospheric: { method: 'DOS', apply_cloud_mask: false },
     conditional: {},
     clip:        { clip_extent: '', clip_shapefile: '' },
     synthesis:   { composites: [], custom_formula: '', custom_name: '' },
   }
+  return JSON.parse(JSON.stringify(defaults[type] || {}))
+}
+
+function resolveNodePosition(screenPoint, offsetIndex = 0) {
+  const rect = canvasWrapperRef.value?.getBoundingClientRect()
+  const fallbackPoint = rect
+    ? {
+        x: rect.left + rect.width * 0.55,
+        y: rect.top + Math.max(120, rect.height * 0.42),
+      }
+    : { x: 320, y: 220 }
+  const basePoint = screenPoint || fallbackPoint
+  const flowPoint = screenToFlowCoordinate(basePoint)
+  const spreadX = (offsetIndex % 3) * 28
+  const spreadY = Math.floor(offsetIndex / 3) * 22
+
+  return {
+    x: Math.max(24, flowPoint.x - NODE_HALF_WIDTH + spreadX),
+    y: Math.max(24, flowPoint.y - NODE_HALF_HEIGHT + spreadY),
+  }
+}
+
+function createPaletteNode(nodeType, screenPoint = null) {
+  const offsetIndex = state.nodes.filter(node => node.deletable).length
+  const id = `${nodeType}-${++nodeCounter}`
   state.nodes.push({
-    id, type: dragNodeType,
-    position: { x: event.clientX - rect.left - 75, y: event.clientY - rect.top - 40 },
-    data: defaults[dragNodeType] || {},
+    id,
+    type: nodeType,
+    position: resolveNodePosition(screenPoint, offsetIndex),
+    data: getDefaultNodeData(nodeType),
     deletable: true,
   })
+}
+
+function handlePaletteActivate(nt) {
+  if (supportsTouch.value) {
+    addNodeFromPalette(nt)
+  }
+}
+
+function addNodeFromPalette(nt) {
+  createPaletteNode(nt.type)
+}
+
+function onDragStart(event, nt) {
+  if (supportsTouch.value) return
+  dragNodeType = nt.type
+  if (event.dataTransfer) {
+    event.dataTransfer.effectAllowed = 'move'
+    event.dataTransfer.dropEffect = 'move'
+    event.dataTransfer.setData('application/vueflow', nt.type)
+    event.dataTransfer.setData('text/plain', nt.type)
+  }
+}
+
+function onDragEnd() {
+  dragNodeType = null
+}
+
+function onDrop(event) {
+  const droppedType =
+    dragNodeType ||
+    event.dataTransfer?.getData('application/vueflow') ||
+    event.dataTransfer?.getData('text/plain')
+  if (!droppedType) return
+  createPaletteNode(droppedType, { x: event.clientX, y: event.clientY })
   dragNodeType = null
 }
 
@@ -749,8 +828,17 @@ async function clearQueue() {
   await Promise.all(cancellable.map(j => cancelJob(j.job_id)))
 }
 
-onMounted(() => { fetchQueue(); state.pollingTimer = setInterval(fetchQueue, 3000) })
-onUnmounted(() => clearInterval(state.pollingTimer))
+onMounted(() => {
+  updateInteractionMode()
+  window.addEventListener('resize', updateInteractionMode)
+  fetchQueue()
+  state.pollingTimer = setInterval(fetchQueue, 3000)
+})
+
+onUnmounted(() => {
+  clearInterval(state.pollingTimer)
+  window.removeEventListener('resize', updateInteractionMode)
+})
 
 // ─── 路径选择器 ───────────────────────────────────────────
 async function pickPath(field) {
@@ -808,10 +896,10 @@ function confirmPick() {
   padding: 8px 16px; background: #fff; border-bottom: 1px solid #e5e7eb;
   flex-shrink: 0; gap: 12px;
 }
-.toolbar-left { display: flex; align-items: baseline; gap: 12px; }
+.toolbar-left { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; min-width: 0; }
 .toolbar-title { font-size: 14px; font-weight: 700; color: #111827; }
-.toolbar-hint { font-size: 12px; color: #9ca3af; }
-.toolbar-right { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+.toolbar-hint { font-size: 12px; color: #9ca3af; line-height: 1.5; }
+.toolbar-right { display: flex; align-items: center; gap: 8px; flex-shrink: 0; flex-wrap: wrap; justify-content: flex-end; }
 .priority-select { padding: 5px 8px; border: 1px solid #d1d5db; border-radius: 6px; font-size: 13px; background: #fff; cursor: pointer; }
 .btn-divider { width: 1px; height: 20px; background: #e5e7eb; margin: 0 2px; }
 .btn-ghost {
@@ -836,23 +924,59 @@ function confirmPick() {
   width: 145px; flex-shrink: 0; background: #f9fafb;
   border-right: 1px solid #e5e7eb; padding: 10px 8px; overflow-y: auto;
 }
+.palette-header {
+  display: flex; align-items: flex-start; justify-content: space-between;
+  gap: 8px; margin-bottom: 8px;
+}
+.palette-fit-btn {
+  border: 1px solid #dbe4f0; background: #fff; color: #2563eb;
+  border-radius: 999px; padding: 4px 8px; font-size: 11px; font-weight: 600;
+  cursor: pointer; white-space: nowrap;
+}
+.palette-fit-btn:hover { background: #eff6ff; border-color: #bfdbfe; }
 .palette-title { font-size: 10px; font-weight: 700; color: #6b7280; text-transform: uppercase; letter-spacing: .05em; margin-bottom: 2px; }
 .palette-hint { font-size: 10px; color: #9ca3af; margin-bottom: 8px; }
+.palette-list { display: flex; flex-direction: column; gap: 6px; }
 .palette-item {
   display: flex; align-items: center; gap: 8px; padding: 8px 8px;
-  border-radius: 8px; margin-bottom: 5px; background: #fff;
+  border-radius: 8px; margin-bottom: 0; background: #fff;
   border: 1px solid #e5e7eb; cursor: grab; user-select: none;
-  transition: box-shadow 0.15s, border-color 0.15s;
+  transition: box-shadow 0.15s, border-color 0.15s, transform 0.15s;
 }
 .palette-item:hover { border-color: #93c5fd; box-shadow: 0 2px 6px rgba(0,0,0,.08); }
 .palette-item:active { cursor: grabbing; }
+.palette-item.tappable { cursor: pointer; }
+.palette-item.tappable:active { transform: translateY(1px); cursor: pointer; }
+.palette-item:focus-visible {
+  outline: none;
+  border-color: #3b82f6;
+  box-shadow: 0 0 0 3px rgba(59,130,246,.18);
+}
 .palette-icon { display: flex; align-items: center; color: #374151; flex-shrink: 0; }
+.palette-copy { flex: 1; min-width: 0; }
+.palette-name-row {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 8px;
+}
 .palette-name { font-size: 12px; font-weight: 600; color: #111827; }
 .palette-desc { font-size: 10px; color: #6b7280; }
+.palette-badge {
+  display: inline-flex; align-items: center; border-radius: 999px;
+  padding: 2px 6px; font-size: 10px; font-weight: 600;
+  color: #1d4ed8; background: #dbeafe; white-space: nowrap;
+}
 
 /* ── 画布 ── */
 .canvas-wrapper { flex: 1; min-width: 0; background: #f3f4f6; position: relative; overflow: hidden; }
+.canvas-wrapper.touch { background: linear-gradient(180deg, #f8fafc 0%, #eef2ff 100%); }
 .vue-flow-canvas { width: 100%; height: 100%; }
+.canvas-mobile-tip {
+  position: absolute; top: 10px; left: 12px; right: 12px; z-index: 4;
+  padding: 6px 10px; border-radius: 10px; border: 1px solid rgba(191,219,254,.95);
+  background: rgba(255,255,255,.92); color: #334155; font-size: 11px;
+  line-height: 1.4; box-shadow: 0 8px 18px rgba(15,23,42,.06); pointer-events: none;
+  backdrop-filter: blur(10px);
+}
 
 /* 自定义缩放控件 */
 .canvas-controls {
@@ -867,6 +991,7 @@ function confirmPick() {
   transition: background 0.15s;
 }
 .ctrl-btn:hover { background: #f3f4f6; }
+.canvas-controls.compact .ctrl-btn { width: 32px; height: 32px; }
 
 /* 消除 Vue Flow 节点 wrapper 自带的边框/背景，避免双层框 */
 :deep(.vue-flow__node) {
@@ -880,7 +1005,7 @@ function confirmPick() {
 /* ── 右侧面板容器 ── */
 .right-panel {
   width: 270px; flex-shrink: 0; position: relative;
-  border-left: 1px solid #e5e7eb; display: flex; flex-direction: column;
+  border-left: 1px solid #e5e7eb; display: flex; flex-direction: column; background: #fff;
 }
 
 /* ── 侧边配置面板 ── */
@@ -1020,4 +1145,86 @@ function confirmPick() {
 .picker-empty { padding: 20px; text-align: center; color: #9ca3af; font-size: 13px; }
 .picker-footer { display: flex; align-items: center; justify-content: space-between; padding: 10px 16px; border-top: 1px solid #e5e7eb; }
 .picker-current { font-size: 11px; color: #6b7280; max-width: 300px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+@media (max-width: 1080px) {
+  .toolbar { padding: 10px 12px; }
+  .node-palette { width: 160px; }
+  .right-panel { width: 248px; }
+}
+
+@media (max-width: 900px) {
+  .batch-manager { height: auto; min-height: 100%; overflow: visible; }
+  .main-area { flex-direction: column; overflow: visible; }
+  .node-palette {
+    width: 100%; border-right: none; border-bottom: 1px solid #e5e7eb;
+    padding: 10px 10px 12px; overflow: visible;
+  }
+  .palette-header { margin-bottom: 10px; }
+  .palette-hint { margin-bottom: 0; }
+  .palette-list {
+    flex-direction: row; overflow-x: auto; overflow-y: hidden;
+    padding-bottom: 4px; scrollbar-width: thin;
+  }
+  .palette-item {
+    min-width: 188px; flex: 0 0 188px;
+  }
+  .canvas-wrapper {
+    flex: none; height: 52vh; min-height: 360px;
+  }
+  .canvas-controls {
+    left: auto; right: 12px; bottom: 12px; flex-direction: row;
+  }
+  .right-panel {
+    width: 100%; min-height: 340px; flex: none;
+    border-left: none; border-top: 1px solid #e5e7eb;
+  }
+  .queue-panel { min-height: 340px; }
+}
+
+@media (max-width: 640px) {
+  .toolbar {
+    align-items: flex-start;
+  }
+  .toolbar-right {
+    width: 100%; justify-content: flex-start;
+  }
+  .priority-select {
+    min-width: 118px;
+  }
+  .btn,
+  .btn-ghost {
+    justify-content: center;
+  }
+  .palette-item {
+    min-width: 172px; flex-basis: 172px;
+  }
+  .canvas-wrapper {
+    height: 48vh; min-height: 320px;
+  }
+  .canvas-mobile-tip {
+    top: 8px; left: 8px; right: 8px; font-size: 10px;
+  }
+  .side-panel-body { padding: 10px; }
+  .side-panel-footer {
+    flex-direction: column-reverse;
+  }
+  .side-panel-footer .btn {
+    width: 100%;
+  }
+  .scene-list-header,
+  .queue-header,
+  .picker-footer {
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+  .queue-stats {
+    width: 100%; flex-wrap: wrap;
+  }
+  .picker-dialog {
+    width: calc(100vw - 20px);
+  }
+  .picker-current {
+    max-width: none; white-space: normal; word-break: break-all;
+  }
+}
 </style>

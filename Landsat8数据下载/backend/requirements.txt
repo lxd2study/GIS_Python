@@ -1,0 +1,5 @@
+fastapi
+uvicorn[standard]
+pystac-client
+planetary-computer
+httpx
