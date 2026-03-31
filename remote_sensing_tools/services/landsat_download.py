@@ -64,6 +64,7 @@ class LandsatDownloadService:
         "lwir11": "B10 - 热红外 TIRS1",
         "lwir12": "B11 - 热红外 TIRS2",
         "qa_pixel": "QA_PIXEL - 质量评估",
+        "qa_radsat": "QA_RADSAT - 饱和质量评估",
         "B1": "B1 - 海岸/气溶胶",
         "B2": "B2 - 蓝",
         "B3": "B3 - 绿",
@@ -76,6 +77,7 @@ class LandsatDownloadService:
         "B10": "B10 - 热红外 TIRS1",
         "B11": "B11 - 热红外 TIRS2",
         "QA_PIXEL": "QA_PIXEL - 质量评估",
+        "QA_RADSAT": "QA_RADSAT - 饱和质量评估",
         "MTL.txt": "MTL.txt - 元数据文件",
         "mtl.txt": "MTL.txt - 元数据文件",
     }
@@ -88,7 +90,6 @@ class LandsatDownloadService:
         "mtl.json",
         "mtl.xml",
         "ang",
-        "qa_radsat",
         "ANG.txt",
         "MTL.json",
     }

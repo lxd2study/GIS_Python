@@ -71,13 +71,15 @@ def dn_to_radiance(dn_array: np.ndarray, band_name: str,
     Returns:
         辐射亮度数组
     """
-    ml = radiance_mult.get(band_name, 0.00001)
-    al = radiance_add.get(band_name, 0.1)
+    ml = np.float32(radiance_mult.get(band_name, 0.00001))
+    al = np.float32(radiance_add.get(band_name, 0.1))
 
-    radiance = ml * dn_array.astype(np.float32) + al
+    radiance = np.asarray(dn_array, dtype=np.float32)
+    np.multiply(radiance, ml, out=radiance)
+    radiance += al
 
     # 确保辐射亮度为正值
-    radiance = np.maximum(radiance, 0.0)
+    np.maximum(radiance, np.float32(0.0), out=radiance)
 
     return radiance
 
@@ -119,16 +121,21 @@ def radiance_to_reflectance(radiance: np.ndarray, band_name: str,
         logger.debug("使用MTL提供的日地距离，距离平方: %.6f", d_squared)
 
     # 太阳辐照度
-    esun_value = esun.get(band_name, 1500.0)
+    esun_value = np.float32(esun.get(band_name, 1500.0))
 
     # 太阳高度角转弧度
-    sun_elevation_rad = np.deg2rad(sun_elevation)
+    sun_elevation_rad = np.float32(np.deg2rad(sun_elevation))
 
-    # 计算反射率
-    reflectance = (np.pi * radiance * d_squared) / (esun_value * np.sin(sun_elevation_rad))
+    sin_sun = np.float32(np.sin(sun_elevation_rad))
+    if abs(float(sin_sun)) <= 1e-6:
+        sin_sun = np.float32(np.sin(np.deg2rad(45.0)))
+
+    scale = np.float32((np.float32(np.pi) * np.float32(d_squared)) / (esun_value * sin_sun))
+    reflectance = np.asarray(radiance, dtype=np.float32)
+    np.multiply(reflectance, scale, out=reflectance)
 
     # 限制在合理范围，但允许小的负值用于后续处理
-    reflectance = np.clip(reflectance, -0.1, 2.0)
+    np.clip(reflectance, np.float32(-0.1), np.float32(2.0), out=reflectance)
 
     return reflectance
 

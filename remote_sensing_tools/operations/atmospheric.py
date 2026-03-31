@@ -14,6 +14,8 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+DOS_MAX_SAMPLE_SIZE = 1_000_000
+
 
 # ============================================================================
 # Py6S 库导入 (可选依赖)
@@ -70,18 +72,28 @@ class SixSCoefficients:
         Returns:
             地表反射率数组
         """
+        surface_reflectance = np.asarray(toa_reflectance, dtype=np.float32)
+        xb = np.float32(self.xb)
+
         if self.xc is not None:
             # 三系数模型（非线性）
-            denom = self.xa + self.xc * toa_reflectance
-            denom = np.where(np.abs(denom) < 1e-10, 1e-10, denom)
-            surface_reflectance = (toa_reflectance - self.xb) / denom
+            xa = np.float32(self.xa)
+            xc = np.float32(self.xc)
+            denom = np.empty_like(surface_reflectance, dtype=np.float32)
+            np.multiply(surface_reflectance, xc, out=denom)
+            denom += xa
+            np.copyto(denom, np.float32(1e-10), where=np.abs(denom) < 1e-10)
+            np.subtract(surface_reflectance, xb, out=surface_reflectance)
+            np.divide(surface_reflectance, denom, out=surface_reflectance)
         else:
             # 二系数线性模型
-            xa = self.xa if abs(self.xa) > 1e-10 else 1e-10
-            surface_reflectance = (toa_reflectance - self.xb) / xa
+            xa = np.float32(self.xa if abs(self.xa) > 1e-10 else 1e-10)
+            np.subtract(surface_reflectance, xb, out=surface_reflectance)
+            np.divide(surface_reflectance, xa, out=surface_reflectance)
 
         # 限制到物理有效范围 [0, 1]
-        return np.clip(surface_reflectance, 0, 1)
+        np.clip(surface_reflectance, np.float32(0.0), np.float32(1.0), out=surface_reflectance)
+        return surface_reflectance
 
 
 @dataclass
@@ -481,22 +493,28 @@ def dark_object_subtraction(
     Returns:
         大气校正后的反射率
     """
-    # 获取大于0的反射率值
-    positive_reflectance = reflectance[reflectance > 0]
+    corrected = np.asarray(reflectance, dtype=np.float32)
+
+    # 仅对有限数量的采样像元估计暗目标值，避免为整幅影像额外分配大块内存。
+    flat = corrected.reshape(-1)
+    step = max(1, flat.size // DOS_MAX_SAMPLE_SIZE)
+    sampled = flat[::step]
+    sampled = sampled[np.isfinite(sampled) & (sampled > 0)]
 
     # 检查是否有有效值
-    if len(positive_reflectance) == 0:
-        return np.clip(reflectance, 0, 1)
+    if sampled.size == 0:
+        np.clip(corrected, np.float32(0.0), np.float32(1.0), out=corrected)
+        return corrected
 
     # 计算暗目标值（第percentile百分位）
-    dark_value = np.percentile(positive_reflectance, percentile)
+    dark_value = np.float32(np.percentile(sampled, percentile))
 
-    # 减去暗目标值
-    corrected = reflectance - dark_value
+    # 原地减去暗目标值，避免复制整幅数组
+    np.subtract(corrected, dark_value, out=corrected)
 
     # 限制到物理有效范围 [0, 1] - 保持这个限制，因为反射率应该在0-1之间
     # 注意：这个限制不会影响NDVI计算，因为NDVI会在自己的函数中处理
-    corrected = np.clip(corrected, 0, 1)
+    np.clip(corrected, np.float32(0.0), np.float32(1.0), out=corrected)
 
     return corrected
 
@@ -528,26 +546,106 @@ def cloud_mask_from_qa(
     if qa.size == 0:
         raise ValueError(f"QA波段文件为空: {qa_band_path}")
 
-    # Landsat 8 QA位定义
-    # Bit 4: Cloud (1=Yes, 0=No)
-    # Bits 5-6: Cloud Confidence (00=Not Determined, 01=Low, 10=Medium, 11=High)
-
-    cloud_bit = 4
-    cloud_confidence_bits = [5, 6]
-
-    # 提取云标记
-    cloud = np.bitwise_and(qa, 1 << cloud_bit) > 0
-
-    # 提取云置信度
-    conf_value = (
-        (np.bitwise_and(qa, 1 << cloud_confidence_bits[0]) > 0).astype(int) +
-        (np.bitwise_and(qa, 1 << cloud_confidence_bits[1]) > 0).astype(int) * 2
-    )
-
-    # 根据置信度阈值创建掩膜
+    qa_fields = decode_qa_pixel_bits(qa)
     threshold_map = {'low': 1, 'medium': 2, 'high': 3}
     threshold = threshold_map.get(confidence_threshold, 2)
 
-    cloud_mask = np.logical_or(cloud, conf_value >= threshold).astype(np.uint8)
+    cloud_mask = np.logical_or.reduce((
+        qa_fields["fill"],
+        qa_fields["dilated_cloud"],
+        qa_fields["cirrus"],
+        qa_fields["cloud"],
+        qa_fields["cloud_shadow"],
+        qa_fields["snow"],
+        qa_fields["cloud_confidence"] >= threshold,
+    )).astype(np.uint8)
 
     return cloud_mask
+
+
+def decode_qa_pixel_bits(qa: np.ndarray) -> Dict[str, np.ndarray]:
+    """解析 Landsat Collection 2 QA_PIXEL 位字段。"""
+    qa_uint16 = np.asarray(qa, dtype=np.uint16)
+    return {
+        "fill": np.bitwise_and(qa_uint16, 1 << 0) > 0,
+        "dilated_cloud": np.bitwise_and(qa_uint16, 1 << 1) > 0,
+        "cirrus": np.bitwise_and(qa_uint16, 1 << 2) > 0,
+        "cloud": np.bitwise_and(qa_uint16, 1 << 3) > 0,
+        "cloud_shadow": np.bitwise_and(qa_uint16, 1 << 4) > 0,
+        "snow": np.bitwise_and(qa_uint16, 1 << 5) > 0,
+        "clear": np.bitwise_and(qa_uint16, 1 << 6) > 0,
+        "water": np.bitwise_and(qa_uint16, 1 << 7) > 0,
+        "cloud_confidence": np.right_shift(np.bitwise_and(qa_uint16, 0b11 << 8), 8),
+        "shadow_confidence": np.right_shift(np.bitwise_and(qa_uint16, 0b11 << 10), 10),
+        "snow_confidence": np.right_shift(np.bitwise_and(qa_uint16, 0b11 << 12), 12),
+        "cirrus_confidence": np.right_shift(np.bitwise_and(qa_uint16, 0b11 << 14), 14),
+    }
+
+
+def summarize_qa_pixel(qa_band_path: str) -> Dict[str, float]:
+    """统计 QA_PIXEL 掩膜信息，供 API 返回质量摘要。"""
+    dataset = gdal.Open(qa_band_path)
+    if dataset is None:
+        raise FileNotFoundError(f"无法打开QA波段: {qa_band_path}")
+
+    qa = dataset.ReadAsArray()
+    dataset = None
+
+    if qa.size == 0:
+        raise ValueError(f"QA波段文件为空: {qa_band_path}")
+
+    qa_fields = decode_qa_pixel_bits(qa)
+    total_pixels = int(qa.size)
+    summary = {
+        "qa_total_pixels": total_pixels,
+        "qa_fill_pixels": int(np.count_nonzero(qa_fields["fill"])),
+        "qa_dilated_cloud_pixels": int(np.count_nonzero(qa_fields["dilated_cloud"])),
+        "qa_cloud_pixels": int(np.count_nonzero(qa_fields["cloud"])),
+        "qa_cloud_shadow_pixels": int(np.count_nonzero(qa_fields["cloud_shadow"])),
+        "qa_cirrus_pixels": int(np.count_nonzero(qa_fields["cirrus"])),
+        "qa_snow_pixels": int(np.count_nonzero(qa_fields["snow"])),
+        "qa_water_pixels": int(np.count_nonzero(qa_fields["water"])),
+        "qa_clear_pixels": int(np.count_nonzero(qa_fields["clear"])),
+    }
+    summary["qa_clear_ratio"] = round(summary["qa_clear_pixels"] / total_pixels, 6) if total_pixels else 0.0
+    return summary
+
+
+def saturation_mask_from_qa_radsat(qa_radsat_band_path: str) -> np.ndarray:
+    """从 QA_RADSAT 提取饱和/遮挡掩膜。"""
+    dataset = gdal.Open(qa_radsat_band_path)
+    if dataset is None:
+        raise FileNotFoundError(f"无法打开QA_RADSAT波段: {qa_radsat_band_path}")
+
+    qa_radsat = dataset.ReadAsArray()
+    dataset = None
+
+    if qa_radsat.size == 0:
+        raise ValueError(f"QA_RADSAT波段文件为空: {qa_radsat_band_path}")
+
+    return (np.asarray(qa_radsat, dtype=np.uint16) > 0).astype(np.uint8)
+
+
+def summarize_qa_radsat(qa_radsat_band_path: str) -> Dict[str, float]:
+    """统计 QA_RADSAT 掩膜信息。"""
+    dataset = gdal.Open(qa_radsat_band_path)
+    if dataset is None:
+        raise FileNotFoundError(f"无法打开QA_RADSAT波段: {qa_radsat_band_path}")
+
+    qa_radsat = dataset.ReadAsArray()
+    dataset = None
+
+    if qa_radsat.size == 0:
+        raise ValueError(f"QA_RADSAT波段文件为空: {qa_radsat_band_path}")
+
+    qa_uint16 = np.asarray(qa_radsat, dtype=np.uint16)
+    total_pixels = int(qa_uint16.size)
+    saturated_mask = qa_uint16 > 0
+    terrain_occlusion = np.bitwise_and(qa_uint16, 1 << 11) > 0
+    summary = {
+        "qa_radsat_total_pixels": total_pixels,
+        "qa_radsat_saturated_pixels": int(np.count_nonzero(saturated_mask)),
+        "qa_radsat_terrain_occlusion_pixels": int(np.count_nonzero(terrain_occlusion)),
+    }
+    summary["qa_radsat_saturated_ratio"] = round(summary["qa_radsat_saturated_pixels"] / total_pixels, 6) if total_pixels else 0.0
+    return summary

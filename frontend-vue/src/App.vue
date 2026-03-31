@@ -11,6 +11,12 @@ const API_KEY = 'rst_vue_api_base'
 const OUTPUT_MODE_KEY = 'rst_output_mode'
 const OUTPUT_BASE_KEY = 'rst_output_base'
 const OUTPUT_MANUAL_KEY = 'rst_output_manual'
+const TOAST_DURATION = {
+  idle: 2200,
+  ok: 2600,
+  warn: 3600,
+  error: 5200
+}
 
 const CORE_BANDS = ['B2', 'B3', 'B4', 'B5']
 const ALL_BANDS = Array.from({ length: 11 }, (_, i) => `B${i + 1}`)
@@ -63,7 +69,9 @@ const state = reactive({
   bands: [],
   mtlFile: null,
   qaFile: null,
+  qaRadsatFile: null,
   shapeFiles: [],
+  productLevel: 'L1',
   clipExtent: '',
   selectedComposites: ['true_color', 'ndvi'],
   customFormula: '',
@@ -161,9 +169,25 @@ function normalizePath(path) {
   return (path || '').trim().replace(/[\\/]+$/, '')
 }
 
+let toastTimer = null
+
 function setToast(text, type = 'idle') {
+  if (toastTimer) {
+    window.clearTimeout(toastTimer)
+    toastTimer = null
+  }
+
   state.toast = text
   state.toastType = type
+
+  if (!text) return
+
+  const duration = TOAST_DURATION[type] ?? TOAST_DURATION.idle
+  toastTimer = window.setTimeout(() => {
+    state.toast = ''
+    state.toastType = 'idle'
+    toastTimer = null
+  }, duration)
 }
 
 function parseDetail(detail) {
@@ -359,6 +383,7 @@ function onPickFile(event, type) {
   }
   if (type === 'mtl') state.mtlFile = files[0] || null
   if (type === 'qa') state.qaFile = files[0] || null
+  if (type === 'qa_radsat') state.qaRadsatFile = files[0] || null
   if (type === 'shape') state.shapeFiles = files
 }
 
@@ -408,11 +433,13 @@ async function submitTask() {
     state.bands.forEach((file) => body.append('bands', file))
     if (state.mtlFile) body.append('mtl_file', state.mtlFile)
     if (state.qaFile) body.append('qa_band', state.qaFile)
+    if (state.qaRadsatFile) body.append('qa_radsat_band', state.qaRadsatFile)
     state.shapeFiles.forEach((file) => body.append('clip_shapefile', file))
 
     body.append('output_dir', outputDirResolved.value)
     body.append('apply_cloud_mask', String(state.applyCloudMask))
     body.append('atm_correction_method', state.atmMethod)
+    body.append('product_level', state.productLevel)
 
     if (state.clipExtent.trim()) body.append('clip_extent', state.clipExtent.trim())
     if (state.selectedComposites.length) body.append('create_composites', state.selectedComposites.join(','))
@@ -472,7 +499,9 @@ function resetForm() {
   state.bands = []
   state.mtlFile = null
   state.qaFile = null
+  state.qaRadsatFile = null
   state.shapeFiles = []
+  state.productLevel = 'L1'
   state.clipExtent = ''
   state.selectedComposites = ['true_color', 'ndvi']
   state.customFormula = ''
@@ -612,6 +641,10 @@ onMounted(() => {
 
 onBeforeUnmount(() => {
   stopPolling()
+  if (toastTimer) {
+    window.clearTimeout(toastTimer)
+    toastTimer = null
+  }
 })
 </script>
 
@@ -700,6 +733,14 @@ onBeforeUnmount(() => {
             </div>
           </div>
 
+          <label class="field-compact">
+            <span>产品级别</span>
+            <select v-model="state.productLevel">
+              <option value="L1">L1: DN/辐射定标链</option>
+              <option value="L2">L2: 地表反射率直用</option>
+            </select>
+          </label>
+
           <!-- 可选文件 -->
           <label class="field-compact">
             <span>MTL 文件</span>
@@ -709,6 +750,11 @@ onBeforeUnmount(() => {
           <label class="field-compact">
             <span>QA 文件</span>
             <input type="file" accept=".tif,.tiff,.img" @change="(e) => onPickFile(e, 'qa')" />
+          </label>
+
+          <label class="field-compact">
+            <span>QA_RADSAT</span>
+            <input type="file" accept=".tif,.tiff,.img" @change="(e) => onPickFile(e, 'qa_radsat')" />
           </label>
 
           <!-- 输出路径 -->
@@ -783,7 +829,7 @@ onBeforeUnmount(() => {
 
             <label class="field-compact">
               <span>大气校正</span>
-              <select v-model="state.atmMethod">
+              <select v-model="state.atmMethod" :disabled="state.productLevel === 'L2'">
                 <option value="DOS">DOS</option>
                 <option value="6S">6S</option>
               </select>

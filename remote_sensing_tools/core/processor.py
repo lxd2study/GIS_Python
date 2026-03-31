@@ -15,6 +15,8 @@ from typing import Dict, List, Tuple, Optional, Callable
 
 logger = logging.getLogger(__name__)
 PROCESSED_BAND_NODATA = -9999.0
+LANDSAT_L2_SR_SCALE = np.float32(0.0000275)
+LANDSAT_L2_SR_OFFSET = np.float32(-0.2)
 
 # 启用GDAL异常处理
 gdal.UseExceptions()
@@ -26,7 +28,14 @@ from .constants import (
 )
 from .config import settings
 from ..operations.radiometric import dn_to_radiance, radiance_to_reflectance
-from ..operations.atmospheric import dark_object_subtraction, cloud_mask_from_qa, sixs_atmospheric_correction
+from ..operations.atmospheric import (
+    cloud_mask_from_qa,
+    dark_object_subtraction,
+    saturation_mask_from_qa_radsat,
+    sixs_atmospheric_correction,
+    summarize_qa_pixel,
+    summarize_qa_radsat,
+)
 from ..operations.geometric import clip_raster
 from ..operations.synthesis import create_composite, create_custom_index
 
@@ -87,11 +96,41 @@ class Landsat8Processor:
             'cloud_mask': None,
             'metadata': {},
             'atm_correction_method': None,
+            'product_level': 'L1',
+            'processing_mode': 'l1_preprocess',
+            'qa_mask_summary': None,
+            'valid_pixel_ratio': None,
         }
 
     @staticmethod
+    def _normalize_product_level(product_level: Optional[str]) -> str:
+        return 'L2' if str(product_level or 'L1').upper() == 'L2' else 'L1'
+
+    @staticmethod
+    def _processing_mode_for_level(product_level: str) -> str:
+        return 'l2_analysis' if product_level == 'L2' else 'l1_preprocess'
+
+    @staticmethod
+    def _sample_valid_values(
+        array: np.ndarray,
+        *,
+        positive_only: bool = False,
+        max_samples: int = 1_000_000,
+    ) -> np.ndarray:
+        flat = np.asarray(array).reshape(-1)
+        step = max(1, flat.size // max_samples)
+        sample = flat[::step]
+        mask = np.isfinite(sample)
+        if positive_only:
+            mask &= sample > 0
+        return sample[mask]
+
+    @staticmethod
     def _log_array_stats(label: str, array: np.ndarray) -> None:
-        valid = array[np.isfinite(array)]
+        if not logger.isEnabledFor(logging.DEBUG):
+            return
+
+        valid = Landsat8Processor._sample_valid_values(array)
         if valid.size == 0:
             logger.debug("%s统计: 无有效像元", label)
             return
@@ -110,7 +149,11 @@ class Landsat8Processor:
         if dataset is None:
             raise Exception(f"无法打开波段文件: {band_path}")
 
-        dn = dataset.ReadAsArray()
+        raster_band = dataset.GetRasterBand(1)
+        try:
+            dn = raster_band.ReadAsArray(buf_type=gdal.GDT_Float32)
+        except TypeError:
+            dn = raster_band.ReadAsArray().astype(np.float32, copy=False)
         dataset = None
 
         if dn.size == 0:
@@ -120,7 +163,7 @@ class Landsat8Processor:
 
     @staticmethod
     def _log_reflectance_quality(band_name: str, reflectance: np.ndarray) -> None:
-        valid = reflectance[np.isfinite(reflectance)]
+        valid = Landsat8Processor._sample_valid_values(reflectance)
         if valid.size == 0:
             logger.warning("波段 %s 无有效反射率像元", band_name)
             return
@@ -165,10 +208,11 @@ class Landsat8Processor:
         apply_atm_correction: bool,
         atm_correction_method: str,
     ) -> Tuple[np.ndarray, str]:
-        if not apply_atm_correction:
+        normalized_method = str(atm_correction_method or 'DOS').upper()
+        if not apply_atm_correction or normalized_method in {'NONE', 'NO', 'SKIP', 'SKIPPED'}:
             return reflectance, 'NONE'
 
-        if atm_correction_method.upper() != '6S':
+        if normalized_method != '6S':
             logger.info("波段 %s: 使用 DOS (暗目标法) 进行大气校正", band_name)
             corrected = dark_object_subtraction(reflectance)
             logger.info("波段 %s DOS大气校正完成", band_name)
@@ -188,6 +232,20 @@ class Landsat8Processor:
             logger.info("波段 %s DOS大气校正完成", band_name)
             self._log_array_stats(f"波段 {band_name} DOS校正后", corrected)
             return corrected, 'DOS(6S失败回退)'
+
+    def _load_l2_surface_reflectance(self, band_path: str, band_name: str) -> np.ndarray:
+        raw_values = self._load_band_array(band_path)
+        self._log_array_stats(f"波段 {band_name} L2原始值", raw_values)
+
+        reflectance = np.asarray(raw_values, dtype=np.float32)
+        valid_mask = np.isfinite(reflectance) & (reflectance > 0)
+        np.multiply(reflectance, LANDSAT_L2_SR_SCALE, out=reflectance)
+        reflectance += LANDSAT_L2_SR_OFFSET
+        reflectance[~valid_mask] = np.nan
+        if np.any(valid_mask):
+            reflectance[valid_mask] = np.clip(reflectance[valid_mask], -0.2, 1.6)
+        self._log_array_stats(f"波段 {band_name} L2表面反射率", reflectance)
+        return reflectance
 
     def read_mtl_file(self, mtl_path: str) -> Dict:
         """
@@ -262,14 +320,18 @@ class Landsat8Processor:
             return None
 
         sun_elevation = float(self.metadata.get('sun_elevation', 45.0))
-        sin_sun = np.sin(np.deg2rad(sun_elevation))
+        sin_sun = np.float32(np.sin(np.deg2rad(sun_elevation)))
         if sin_sun <= 0:
-            sin_sun = np.sin(np.deg2rad(45.0))
+            sin_sun = np.float32(np.sin(np.deg2rad(45.0)))
 
-        m_rho = self.REFLECTANCE_MULT[band_name]
-        a_rho = self.REFLECTANCE_ADD[band_name]
-        reflectance = (m_rho * dn_array.astype(np.float32) + a_rho) / sin_sun
-        return np.clip(reflectance, -0.1, 2.0)
+        m_rho = np.float32(self.REFLECTANCE_MULT[band_name])
+        a_rho = np.float32(self.REFLECTANCE_ADD[band_name])
+        reflectance = np.asarray(dn_array, dtype=np.float32)
+        np.multiply(reflectance, m_rho, out=reflectance)
+        reflectance += a_rho
+        np.divide(reflectance, sin_sun, out=reflectance)
+        np.clip(reflectance, np.float32(-0.1), np.float32(2.0), out=reflectance)
+        return reflectance
 
     def dn_to_radiance(self, dn_array: np.ndarray, band_name: str) -> np.ndarray:
         """
@@ -418,26 +480,77 @@ class Landsat8Processor:
         apply_cloud_mask: bool,
         qa_band_path: Optional[str],
         report: Callable,
-    ) -> Tuple[Optional[np.ndarray], Optional[str]]:
+    ) -> Tuple[Optional[np.ndarray], Optional[str], Optional[Dict]]:
         if not (apply_cloud_mask and qa_band_path and os.path.exists(qa_band_path)):
-            report('cloud_mask', '未启用云掩膜或未提供QA文件', progress=35, status='completed')
-            return None, None
+            report('cloud_mask', '未启用 QA 掩膜或未提供 QA 文件', progress=35, status='completed')
+            return None, None, None
 
         try:
-            report('cloud_mask', '正在提取云掩膜', progress=35, status='active')
+            report('cloud_mask', '正在提取 QA 质量掩膜', progress=35, status='active')
             cloud_mask = cloud_mask_from_qa(qa_band_path)
+            qa_summary = summarize_qa_pixel(qa_band_path)
             reference_band_path = next((path for path in band_paths.values() if os.path.exists(path)), None)
             if reference_band_path is None:
                 raise Exception("未找到可用于生成云掩膜的参考波段")
 
             cloud_mask_path = self._safe_join(output_dir, 'cloud_mask.tif')
             cloud_mask = self._save_cloud_mask(cloud_mask, reference_band_path, qa_band_path, cloud_mask_path)
-            report('cloud_mask', '云掩膜处理完成', progress=45, status='completed')
-            return cloud_mask, cloud_mask_path
+            report('cloud_mask', 'QA 质量掩膜处理完成', progress=45, status='completed')
+            return cloud_mask, cloud_mask_path, qa_summary
         except Exception as exc:
             logger.warning("云掩膜处理失败，跳过云掩膜: %s", str(exc))
             report('cloud_mask', '云掩膜处理失败，已跳过', progress=45, status='exception')
+            return None, None, None
+
+    def _prepare_saturation_mask(
+        self,
+        qa_radsat_band_path: Optional[str],
+    ) -> Tuple[Optional[np.ndarray], Optional[Dict]]:
+        if not (qa_radsat_band_path and os.path.exists(qa_radsat_band_path)):
             return None, None
+
+        try:
+            return saturation_mask_from_qa_radsat(qa_radsat_band_path), summarize_qa_radsat(qa_radsat_band_path)
+        except Exception as exc:
+            logger.warning("QA_RADSAT 掩膜处理失败，已跳过: %s", str(exc))
+            return None, None
+
+    @staticmethod
+    def _combine_quality_masks(*masks: Optional[np.ndarray]) -> Optional[np.ndarray]:
+        valid_masks = [np.asarray(mask, dtype=np.uint8) for mask in masks if mask is not None]
+        if not valid_masks:
+            return None
+
+        combined = valid_masks[0].copy()
+        for mask in valid_masks[1:]:
+            if mask.shape != combined.shape:
+                logger.warning("质量掩膜尺寸不匹配，已跳过一个附加掩膜")
+                continue
+            combined = np.logical_or(combined, mask).astype(np.uint8)
+        return combined
+
+    @staticmethod
+    def _merge_quality_summary(
+        qa_summary: Optional[Dict],
+        qa_radsat_summary: Optional[Dict],
+        quality_mask: Optional[np.ndarray],
+    ) -> Optional[Dict]:
+        summary: Dict[str, object] = {}
+        if qa_summary:
+            summary.update(qa_summary)
+        if qa_radsat_summary:
+            summary.update(qa_radsat_summary)
+
+        summary['qa_pixel_used'] = qa_summary is not None
+        summary['qa_radsat_used'] = qa_radsat_summary is not None
+
+        if quality_mask is not None and quality_mask.size:
+            masked_pixels = int(np.count_nonzero(quality_mask))
+            total_pixels = int(quality_mask.size)
+            summary['masked_pixels'] = masked_pixels
+            summary['valid_pixel_ratio'] = round((total_pixels - masked_pixels) / total_pixels, 6)
+
+        return summary or None
 
     @staticmethod
     def _filter_bands_to_process(band_paths: Dict[str, str]) -> Tuple[List[Tuple[str, str]], List[str]]:
@@ -459,19 +572,19 @@ class Landsat8Processor:
         return bands_to_process, skipped_bands
 
     @staticmethod
-    def _apply_cloud_mask_to_reflectance(
+    def _apply_quality_mask_to_reflectance(
         reflectance: np.ndarray,
-        cloud_mask: Optional[np.ndarray],
+        quality_mask: Optional[np.ndarray],
         band_name: str,
     ) -> np.ndarray:
-        if cloud_mask is None:
+        if quality_mask is None:
             return reflectance
 
-        if cloud_mask.shape != reflectance.shape:
-            logger.warning("波段 %s 与云掩膜尺寸不匹配，跳过云掩膜处理", band_name)
+        if quality_mask.shape != reflectance.shape:
+            logger.warning("波段 %s 与质量掩膜尺寸不匹配，跳过掩膜处理", band_name)
             return reflectance
 
-        reflectance[cloud_mask == 1] = 0
+        reflectance[quality_mask == 1] = np.nan
         return reflectance
 
     @staticmethod
@@ -481,11 +594,14 @@ class Landsat8Processor:
             raise Exception(f"无法打开参考波段文件: {reference_band_path}")
 
         # 处理结果中的无效区域统一写成显式 NoData，避免裁剪边缘显示成黑边。
-        reflectance_to_write = np.where(
-            np.isfinite(reflectance),
-            reflectance,
-            PROCESSED_BAND_NODATA,
-        ).astype(np.float32)
+        reflectance_to_write = np.asarray(reflectance, dtype=np.float32)
+        np.nan_to_num(
+            reflectance_to_write,
+            copy=False,
+            nan=PROCESSED_BAND_NODATA,
+            posinf=PROCESSED_BAND_NODATA,
+            neginf=PROCESSED_BAND_NODATA,
+        )
 
         driver = gdal.GetDriverByName('GTiff')
         out_ds = driver.Create(
@@ -529,10 +645,11 @@ class Landsat8Processor:
         self,
         band_info: Tuple[str, str],
         output_dir: str,
-        cloud_mask: Optional[np.ndarray],
+        quality_mask: Optional[np.ndarray],
         clip_extent: Optional[List[float]],
         clip_shapefile: Optional[str],
         atm_correction_method: str,
+        product_level: str,
     ) -> Tuple[str, Optional[str], Optional[str], Optional[str]]:
         band_name, band_path = band_info
 
@@ -545,8 +662,9 @@ class Landsat8Processor:
                 band_name,
                 apply_atm_correction=True,
                 atm_correction_method=atm_correction_method,
+                product_level=product_level,
             )
-            reflectance = self._apply_cloud_mask_to_reflectance(reflectance, cloud_mask, band_name)
+            reflectance = self._apply_quality_mask_to_reflectance(reflectance, quality_mask, band_name)
             self._log_reflectance_quality(band_name, reflectance)
 
             output_band_path = self._safe_join(output_dir, f'{band_name}_processed.tif')
@@ -558,18 +676,68 @@ class Landsat8Processor:
                 clip_extent,
                 clip_shapefile,
             )
+            del reflectance
             return band_name, final_path, actual_method, None
         except Exception as exc:
             return band_name, None, None, str(exc)
+
+    @staticmethod
+    def _estimate_band_pixels(band_path: str) -> int:
+        try:
+            dataset = gdal.Open(band_path)
+        except RuntimeError:
+            return 0
+        if dataset is None:
+            return 0
+
+        try:
+            return int(dataset.RasterXSize) * int(dataset.RasterYSize)
+        finally:
+            dataset = None
+
+    def _resolve_band_workers(
+        self,
+        bands_to_process: List[Tuple[str, str]],
+        quality_mask: Optional[np.ndarray],
+        atm_correction_method: str,
+    ) -> int:
+        requested_workers = max(1, int(settings.MAX_WORKERS))
+        if not bands_to_process:
+            return 1
+
+        largest_band_pixels = max(self._estimate_band_pixels(band_path) for _, band_path in bands_to_process)
+        effective_workers = requested_workers
+
+        if largest_band_pixels >= 50_000_000:
+            effective_workers = 1
+        elif largest_band_pixels >= 20_000_000:
+            effective_workers = min(effective_workers, 2)
+
+        if quality_mask is not None and largest_band_pixels >= 20_000_000:
+            effective_workers = 1
+
+        if atm_correction_method.upper() == '6S':
+            effective_workers = 1
+
+        effective_workers = max(1, min(effective_workers, len(bands_to_process)))
+
+        logger.info(
+            "波段处理工作线程: 请求=%d, 实际=%d, 最大像元数=%d",
+            requested_workers,
+            effective_workers,
+            largest_band_pixels,
+        )
+        return effective_workers
 
     def _process_bands_parallel(
         self,
         bands_to_process: List[Tuple[str, str]],
         output_dir: str,
-        cloud_mask: Optional[np.ndarray],
+        quality_mask: Optional[np.ndarray],
         clip_extent: Optional[List[float]],
         clip_shapefile: Optional[str],
         atm_correction_method: str,
+        product_level: str,
         report: Callable,
     ) -> Tuple[Dict[str, str], Dict[str, str], int]:
         processed_count = 0
@@ -577,17 +745,20 @@ class Landsat8Processor:
         progress_lock = threading.Lock()
         band_results: Dict[str, str] = {}
         band_correction_methods: Dict[str, str] = {}
+        worker_atm_method = 'NONE' if product_level == 'L2' else atm_correction_method
+        max_workers = self._resolve_band_workers(bands_to_process, quality_mask, worker_atm_method)
 
-        with ThreadPoolExecutor(max_workers=settings.MAX_WORKERS) as executor:
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_band = {
                 executor.submit(
                     self._process_single_band,
                     band_info,
                     output_dir,
-                    cloud_mask,
+                    quality_mask,
                     clip_extent,
                     clip_shapefile,
                     atm_correction_method,
+                    product_level,
                 ): band_info[0]
                 for band_info in bands_to_process
             }
@@ -687,7 +858,8 @@ class Landsat8Processor:
 
     def process_band(self, band_path: str, band_name: str,
                     apply_atm_correction: bool = True,
-                    atm_correction_method: str = 'DOS') -> Tuple[np.ndarray, str]:
+                    atm_correction_method: str = 'DOS',
+                    product_level: str = 'L1') -> Tuple[np.ndarray, str]:
         """
         处理单个波段: DN -> 辐射亮度 -> 反射率 -> 大气校正
 
@@ -700,8 +872,13 @@ class Landsat8Processor:
         Returns:
             (处理后的反射率数组, 实际使用的校正方法)
         """
+        normalized_level = self._normalize_product_level(product_level)
+        if normalized_level == 'L2':
+            return self._load_l2_surface_reflectance(band_path, band_name), 'L2_SCALE'
+
         dn = self._load_band_array(band_path)
         reflectance = self._compute_toa_reflectance(dn, band_name)
+        del dn
         return self._apply_atmospheric_correction(
             reflectance,
             band_name,
@@ -718,7 +895,9 @@ class Landsat8Processor:
                             create_composites: List[str] = None,
                             apply_cloud_mask: bool = False,
                             qa_band_path: str = None,
+                            qa_radsat_band_path: str = None,
                             atm_correction_method: str = 'DOS',
+                            product_level: str = 'L1',
                             custom_index_formula: Optional[str] = None,
                             custom_index_name: Optional[str] = None,
                             progress_callback: Optional[Callable[[Dict], None]] = None) -> Dict:
@@ -744,24 +923,33 @@ class Landsat8Processor:
         """
         report = self._build_reporter(progress_callback)
         results = self._init_results()
+        normalized_level = self._normalize_product_level(product_level)
+        results['product_level'] = normalized_level
+        results['processing_mode'] = self._processing_mode_for_level(normalized_level)
 
         try:
             os.makedirs(output_dir, exist_ok=True)
             report('prepare_output', '•', progress=15, status='completed')
 
             self._load_metadata_for_preprocess(mtl_path, results, report)
-            cloud_mask, cloud_mask_path = self._prepare_cloud_mask(
+            cloud_mask, cloud_mask_path, qa_summary = self._prepare_cloud_mask(
                 band_paths,
                 output_dir,
                 apply_cloud_mask,
                 qa_band_path,
                 report,
             )
+            qa_radsat_mask, qa_radsat_summary = self._prepare_saturation_mask(qa_radsat_band_path)
+            quality_mask = self._combine_quality_masks(cloud_mask, qa_radsat_mask)
             results['cloud_mask'] = cloud_mask_path
+            results['qa_mask_summary'] = self._merge_quality_summary(qa_summary, qa_radsat_summary, quality_mask)
+            if results['qa_mask_summary'] and 'valid_pixel_ratio' in results['qa_mask_summary']:
+                results['valid_pixel_ratio'] = float(results['qa_mask_summary']['valid_pixel_ratio'])
 
             report('bands', '开始处理波段', progress=50, status='active')
             logger.info("开始处理 %d 个波段", len(band_paths))
             logger.info("请求的大气校正方法: %s", atm_correction_method)
+            logger.info("输入产品级别: %s", normalized_level)
             logger.info("支持的光学波段: %s", ', '.join(SUPPORTED_OPTICAL_BANDS))
             logger.info("并行工作线程数: %d", settings.MAX_WORKERS)
 
@@ -769,10 +957,11 @@ class Landsat8Processor:
             band_results, band_correction_methods, processed_count = self._process_bands_parallel(
                 bands_to_process,
                 output_dir,
-                cloud_mask,
+                quality_mask,
                 clip_extent,
                 clip_shapefile,
                 atm_correction_method,
+                normalized_level,
                 report,
             )
             results['processed_bands'] = band_results

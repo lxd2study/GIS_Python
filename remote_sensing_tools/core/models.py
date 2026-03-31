@@ -5,6 +5,9 @@ from enum import Enum
 from pydantic import BaseModel, Field
 
 
+ScalarValue = Union[str, float, int, bool]
+
+
 class CompositeType(str, Enum):
     """合成影像类型"""
     # RGB合成
@@ -52,10 +55,15 @@ class ProcessingResult(BaseModel):
     processed_bands: Dict[str, str] = Field(default_factory=dict)
     composites: Dict[str, str] = Field(default_factory=dict)
     cloud_mask: Optional[str] = None
-    metadata: Dict[str, Union[str, float]] = Field(default_factory=dict)
+    metadata: Dict[str, ScalarValue] = Field(default_factory=dict)
     summary: Optional[Dict] = None
     error: Optional[str] = None
     atm_correction_method: Optional[str] = None  # 实际使用的大气校正方法
+    skipped_bands: List[str] = Field(default_factory=list)
+    product_level: Optional[str] = None
+    processing_mode: Optional[str] = None
+    qa_mask_summary: Optional[Dict[str, ScalarValue]] = None
+    valid_pixel_ratio: Optional[float] = None
 
 
 class ProgressStep(BaseModel):
@@ -124,6 +132,8 @@ class BatchJobConfig(BaseModel):
     output_dir: str = Field(..., description="输出目录")
     mtl_file: Optional[str] = Field(None, description="MTL元数据文件路径")
     qa_band: Optional[str] = Field(None, description="QA波段路径")
+    qa_radsat_band: Optional[str] = Field(None, description="QA_RADSAT 波段路径")
+    product_level: str = Field("L1", pattern="^(L1|L2)$", description="输入产品级别")
 
     # 处理选项
     template: ProcessingTemplate = Field(ProcessingTemplate.STANDARD, description="处理流程模板")

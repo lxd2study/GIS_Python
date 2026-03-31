@@ -167,9 +167,22 @@ class GraphExecutor:
         if input_node and input_node["data"].get("band_dir"):
             d = input_node["data"]
             name = d.get("scene_name") or d["band_dir"].replace("\\", "/").split("/")[-1]
-            return [{"name": name, "path": d["band_dir"], "has_shp": False, "shp_file": None}]
+            return [{
+                "name": name,
+                "path": d["band_dir"],
+                "has_shp": False,
+                "shp_file": None,
+                "product_level": d.get("product_level") or GraphExecutor._infer_product_level(name, d["band_dir"]),
+            }]
 
         return []
+
+    @staticmethod
+    def _infer_product_level(scene_name: str, band_dir: str = "") -> str:
+        normalized = f"{scene_name} {band_dir}".upper()
+        if "_L2" in normalized or "L2SP" in normalized or "SURFACE_REFLECTANCE" in normalized:
+            return "L2"
+        return "L1"
 
     def _build_single_config(self, scene: Dict, ctx: Dict) -> BatchJobConfig:
         """为单个场景构建 BatchJobConfig"""
@@ -219,9 +232,18 @@ class GraphExecutor:
         #   - AtmosphericNode 存在 → 使用其配置的方法
         #   - RadiometricNode 存在但无 AtmosphericNode → 仅辐射定标，DOS 仍执行（保持原 processor 逻辑）
         #   - 两者都不存在 → 标记 "none"（跳过预处理，适用 Level-2 数据）
+        product_level = (
+            scene.get("product_level")
+            or (input_node["data"].get("product_level") if input_node else None)
+            or self._infer_product_level(scene["name"], scene["path"])
+        ).upper()
         atm_method = "DOS"
         apply_cloud_mask = False
-        if atm_node:
+        if product_level == "L2":
+            atm_method = "NONE"
+            if atm_node:
+                apply_cloud_mask = bool(atm_node["data"].get("apply_cloud_mask", False))
+        elif atm_node:
             atm_method       = atm_node["data"].get("method", "DOS")
             apply_cloud_mask = bool(atm_node["data"].get("apply_cloud_mask", False))
         elif not ctx["radiometric"]:
@@ -235,7 +257,9 @@ class GraphExecutor:
             mtl_file=scene.get("mtl_file") or (
                 (input_node["data"].get("mtl_file") or None) if input_node else None
             ),
-            qa_band=(input_node["data"].get("qa_band") or None) if input_node else None,
+            qa_band=scene.get("qa_band") or ((input_node["data"].get("qa_band") or None) if input_node else None),
+            qa_radsat_band=scene.get("qa_radsat_band") or ((input_node["data"].get("qa_radsat_band") or None) if input_node else None),
+            product_level=product_level,
             atm_correction_method=atm_method,
             apply_cloud_mask=apply_cloud_mask,
             clip_extent=clip_extent,

@@ -24,6 +24,9 @@
         <div class="scene-summary">
           已选 <strong>{{ selectedCount }}</strong> / {{ props.data.scenes.length }} 个场景
         </div>
+        <div class="scene-mtl">
+          <span class="level-badge" :class="productLevelClass">{{ productLevelLabel }}</span>
+        </div>
         <div class="scene-shp">
           <span class="shp-has">{{ shpCount }} 个含 SHP</span>
           <span v-if="noShpCount" class="shp-none">{{ noShpCount }} 个无 SHP</span>
@@ -36,6 +39,9 @@
       <!-- 单场景模式 -->
       <template v-else>
         <div v-if="props.data.scene_name" class="node-info">{{ props.data.scene_name }}</div>
+        <div class="scene-mtl">
+          <span class="level-badge" :class="productLevelClass">{{ productLevelLabel }}</span>
+        </div>
         <div v-if="props.data.band_dir" class="node-path" :title="props.data.band_dir">{{ shortPath(props.data.band_dir) }}</div>
         <div v-else class="node-hint">点击配置波段目录</div>
       </template>
@@ -55,6 +61,15 @@ const shpCount = computed(() => (props.data.scenes || []).filter(s => s.has_shp)
 const noShpCount = computed(() => (props.data.scenes || []).filter(s => !s.has_shp).length)
 const mtlCount = computed(() => (props.data.scenes || []).filter(s => s.mtl_file).length)
 const noMtlCount = computed(() => (props.data.scenes || []).filter(s => !s.mtl_file).length)
+const effectiveProductLevel = computed(() => {
+  if (isBatchMode.value) {
+    const sceneLevels = new Set((props.data.scenes || []).map((scene) => scene.product_level).filter(Boolean))
+    if (sceneLevels.size === 1) return [...sceneLevels][0]
+  }
+  return props.data.product_level || 'L1'
+})
+const productLevelLabel = computed(() => effectiveProductLevel.value === 'L2' ? 'L2 分析' : 'L1 预处理')
+const productLevelClass = computed(() => effectiveProductLevel.value === 'L2' ? 'level-l2' : 'level-l1')
 const isConfigured = computed(() => {
   if (isBatchMode.value) return selectedCount.value > 0
   return !!props.data.band_dir
@@ -93,4 +108,7 @@ function shortPath(p) {
 .scene-mtl { display: flex; gap: 6px; margin-top: 3px; }
 .mtl-has { font-size: 10px; color: #2563eb; background: #dbeafe; padding: 1px 5px; border-radius: 3px; }
 .mtl-none { font-size: 10px; color: #9ca3af; background: #f3f4f6; padding: 1px 5px; border-radius: 3px; }
+.level-badge { font-size: 10px; padding: 1px 5px; border-radius: 3px; font-weight: 600; }
+.level-l1 { color: #1e40af; background: #dbeafe; }
+.level-l2 { color: #166534; background: #dcfce7; }
 </style>

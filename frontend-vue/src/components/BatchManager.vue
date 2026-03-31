@@ -164,6 +164,13 @@
                   <input v-model="state.editingParams.scene_name" placeholder="如 LC08_L1TP_..." class="form-input" />
                 </div>
                 <div class="form-group">
+                  <label>产品级别</label>
+                  <select v-model="state.editingParams.product_level" class="form-input">
+                    <option value="L1">L1: 传统预处理链</option>
+                    <option value="L2">L2: 地表反射率直用</option>
+                  </select>
+                </div>
+                <div class="form-group">
                   <label>波段文件目录 <span class="required">*</span></label>
                   <div class="path-input-row">
                     <input v-model="state.editingParams.band_dir" placeholder="选择或输入目录路径" class="form-input" readonly />
@@ -181,10 +188,21 @@
                   <label>QA 波段文件（可选）</label>
                   <input v-model="state.editingParams.qa_band" placeholder="如 *_QA_PIXEL.TIF" class="form-input" />
                 </div>
+                <div class="form-group">
+                  <label>QA_RADSAT 波段文件（可选）</label>
+                  <input v-model="state.editingParams.qa_radsat_band" placeholder="如 *_QA_RADSAT.TIF" class="form-input" />
+                </div>
               </template>
 
               <!-- InputNode 配置（批量场景模式） -->
               <template v-else-if="state.selectedNode?.type === 'input' && state.editingParams.scenes?.length">
+                <div class="form-group">
+                  <label>产品级别</label>
+                  <select v-model="state.editingParams.product_level" class="form-input">
+                    <option value="L1">L1: 传统预处理链</option>
+                    <option value="L2">L2: 地表反射率直用</option>
+                  </select>
+                </div>
                 <div class="form-group">
                   <label>场景列表（来自数据目录）</label>
                   <div class="scene-list-header" style="margin-bottom:6px">
@@ -239,6 +257,9 @@
                     <input type="checkbox" v-model="state.editingParams.apply_cloud_mask" />
                     启用云掩膜（需要 QA 波段）
                   </label>
+                </div>
+                <div class="form-tip">
+                  若输入节点选择 <strong>L2</strong>，该节点只保留 QA 掩膜开关，大气校正会被自动跳过。
                 </div>
               </template>
 
@@ -449,7 +470,7 @@ const nodeTypes = [
 function createInitialNodes() {
   return [
     { id: 'datadir-1',     type: 'datadir',     position: { x: 40,  y: 120 }, data: { root_dir: '', scenes: [], selectedScenes: [] }, deletable: false },
-    { id: 'input-1',       type: 'input',       position: { x: 280, y: 120 }, data: { band_dir: '', scene_name: '', mtl_file: '', qa_band: '', scenes: [], selectedScenes: [] }, deletable: false },
+    { id: 'input-1',       type: 'input',       position: { x: 280, y: 120 }, data: { band_dir: '', scene_name: '', mtl_file: '', qa_band: '', qa_radsat_band: '', product_level: 'L1', scenes: [], selectedScenes: [] }, deletable: false },
     { id: 'radiometric-1', type: 'radiometric',  position: { x: 510, y: 120 }, data: {}, deletable: false },
     { id: 'output-1',      type: 'output',       position: { x: 750, y: 120 }, data: { output_dir: '' }, deletable: false },
   ]
@@ -704,6 +725,8 @@ async function scanAndPropagateScenes(dataDirNodeId) {
       if (inputNode) {
         inputNode.data.scenes = data.scenes
         inputNode.data.selectedScenes = data.scenes.map(s => s.name)
+        const levels = [...new Set(data.scenes.map(s => s.product_level).filter(Boolean))]
+        if (levels.length === 1) inputNode.data.product_level = levels[0]
       }
     }
   } catch (_) {}

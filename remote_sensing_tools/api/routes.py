@@ -81,6 +81,26 @@ def _detect_upload_band_name(filename: str) -> Optional[str]:
     return None
 
 
+def _infer_product_level(name: str, filenames: Optional[List[str]] = None) -> str:
+    normalized = (name or "").upper()
+    if "_L2" in normalized or "L2SP" in normalized:
+        return "L2"
+
+    for filename in filenames or []:
+        upper_name = filename.upper()
+        if any(token in upper_name for token in ("_SR_B", "_ST_B", "QA_PIXEL", "QA_RADSAT")):
+            return "L2"
+    return "L1"
+
+
+def _find_first_matching_file(scene_path: Path, patterns: List[str]) -> Optional[str]:
+    for pattern in patterns:
+        matches = list(scene_path.glob(pattern))
+        if matches:
+            return str(matches[0])
+    return None
+
+
 async def _save_upload(upload: UploadFile, target_path: str) -> None:
     """Persist an UploadFile to disk in chunks."""
     with open(target_path, "wb") as file_obj:
@@ -124,6 +144,8 @@ def _build_summary(
         "cloud_mask_applied": apply_cloud_mask and qa_path is not None,
         "clipped": is_clipped,
         "output_directory": os.path.normpath(output_dir),
+        "product_level": result.get("product_level"),
+        "processing_mode": result.get("processing_mode"),
     }
 
 
@@ -159,6 +181,7 @@ async def _prepare_async_preprocess_inputs(
     bands: List[UploadFile],
     mtl_file: Optional[UploadFile],
     qa_band: Optional[UploadFile],
+    qa_radsat_band: Optional[UploadFile],
     output_dir: str,
     clip_extent: Optional[str],
     clip_shapefile: Optional[List[UploadFile]],
@@ -192,6 +215,14 @@ async def _prepare_async_preprocess_inputs(
         qa_extension = Path(qa_band.filename or "").suffix or ".tif"
         qa_path = await _save_optional_upload(qa_band, os.path.join(temp_dir, f"BQA{qa_extension}"))
 
+    qa_radsat_path = None
+    if qa_radsat_band:
+        qa_radsat_extension = Path(qa_radsat_band.filename or "").suffix or ".tif"
+        qa_radsat_path = await _save_optional_upload(
+            qa_radsat_band,
+            os.path.join(temp_dir, f"QA_RADSAT{qa_radsat_extension}"),
+        )
+
     shapefile_path = file_manager.save_shapefiles(clip_shapefile, shape_dir) if clip_shapefile else None
     extent_list = file_manager.parse_extent(clip_extent)
     composite_list = file_manager.parse_composites(create_composites)
@@ -201,6 +232,7 @@ async def _prepare_async_preprocess_inputs(
         "band_paths": band_paths,
         "mtl_path": mtl_path,
         "qa_path": qa_path,
+        "qa_radsat_path": qa_radsat_path,
         "shapefile_path": shapefile_path,
         "extent_list": extent_list,
         "composite_list": composite_list,
@@ -254,11 +286,13 @@ def _run_async_preprocess_job(
     output_dir: str,
     mtl_path: Optional[str],
     qa_path: Optional[str],
+    qa_radsat_path: Optional[str],
     extent_list: Optional[List[float]],
     shapefile_path: Optional[str],
     composite_list: Optional[List[str]],
     apply_cloud_mask: bool,
     atm_correction_method: str,
+    product_level: str,
     custom_formula: Optional[str],
     custom_name: Optional[str],
     cleanup_temp_dir: Optional[str],
@@ -275,7 +309,9 @@ def _run_async_preprocess_job(
             create_composites=composite_list,
             apply_cloud_mask=apply_cloud_mask and qa_path is not None,
             qa_band_path=qa_path,
+            qa_radsat_band_path=qa_radsat_path,
             atm_correction_method=atm_correction_method,
+            product_level=product_level,
             custom_index_formula=custom_formula,
             custom_index_name=custom_name,
             progress_callback=lambda payload: _update_async_progress(progress_manager, job_id, payload),
@@ -571,15 +607,22 @@ def setup_routes(
                         if shp_files:
                             has_shp = True
                             shp_file = str(shp_files[0])
+                    filenames = [child.name for child in scene_path.iterdir() if child.is_file()]
+                    product_level = _infer_product_level(entry.name, filenames)
                     # 自动检测 MTL 元数据文件
                     mtl_files = list(scene_path.glob("*MTL*.txt"))
                     mtl_file = str(mtl_files[0]) if mtl_files else None
+                    qa_band = _find_first_matching_file(scene_path, ["*QA_PIXEL*.tif", "*QA_PIXEL*.TIF", "*BQA*.tif", "*BQA*.TIF"])
+                    qa_radsat_band = _find_first_matching_file(scene_path, ["*QA_RADSAT*.tif", "*QA_RADSAT*.TIF"])
                     scenes.append({
                         "name": entry.name,
                         "path": str(scene_path),
                         "has_shp": has_shp,
                         "shp_file": shp_file,
                         "mtl_file": mtl_file,
+                        "qa_band": qa_band,
+                        "qa_radsat_band": qa_radsat_band,
+                        "product_level": product_level,
                     })
         except PermissionError:
             raise HTTPException(status_code=403, detail=f"无权限访问目录: {target}")
@@ -615,6 +658,7 @@ def setup_routes(
         bands: List[UploadFile] = File(..., description="Landsat 8 波段文件列表"),
         mtl_file: Optional[UploadFile] = File(None, description="MTL元数据文件"),
         qa_band: Optional[UploadFile] = File(None, description="QA波段文件"),
+        qa_radsat_band: Optional[UploadFile] = File(None, description="QA_RADSAT 波段文件"),
         output_dir: str = Form(..., description="输出目录路径"),
         clip_extent: Optional[str] = Form(None, description="裁剪范围：xmin,ymin,xmax,ymax"),
         clip_shapefile: Optional[List[UploadFile]] = File(None, description="裁剪矢量文件"),
@@ -623,6 +667,7 @@ def setup_routes(
         custom_name: Optional[str] = Form(None, description="自定义指数名称"),
         apply_cloud_mask: bool = Form(False, description="是否应用云掩膜"),
         atm_correction_method: str = Form("DOS", description="大气校正方法: DOS 或 6S"),
+        product_level: str = Form("L1", description="输入产品级别: L1 或 L2"),
     ) -> Dict:
         if not bands:
             raise HTTPException(status_code=400, detail="必须上传至少一个波段文件")
@@ -642,6 +687,7 @@ def setup_routes(
                 bands=bands,
                 mtl_file=mtl_file,
                 qa_band=qa_band,
+                qa_radsat_band=qa_radsat_band,
                 output_dir=output_dir,
                 clip_extent=clip_extent,
                 clip_shapefile=clip_shapefile,
@@ -671,11 +717,13 @@ def setup_routes(
             output_dir=output_dir,
             mtl_path=preprocess_inputs["mtl_path"],
             qa_path=preprocess_inputs["qa_path"],
+            qa_radsat_path=preprocess_inputs["qa_radsat_path"],
             extent_list=preprocess_inputs["extent_list"],
             shapefile_path=preprocess_inputs["shapefile_path"],
             composite_list=preprocess_inputs["composite_list"],
             apply_cloud_mask=apply_cloud_mask,
             atm_correction_method=atm_correction_method,
+            product_level=product_level,
             custom_formula=custom_formula,
             custom_name=custom_name,
             cleanup_temp_dir=temp_dir,
