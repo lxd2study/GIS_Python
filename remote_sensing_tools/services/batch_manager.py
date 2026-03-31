@@ -5,6 +5,7 @@ import queue
 import threading
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Dict, List, Optional
 
 from ..core.models import (
@@ -16,7 +17,7 @@ from ..core.models import (
     ProcessingResult,
 )
 from ..core.processor import Landsat8Processor
-from ..utils.file_utils import collect_band_paths
+from ..utils.file_utils import collect_band_paths, detect_product_level_from_path, find_scene_support_files
 
 logger = logging.getLogger(__name__)
 
@@ -121,8 +122,43 @@ class BatchJobManager:
             self._mark_job_running(job)
 
         try:
-            band_paths = collect_band_paths(job.config.band_dir)
+            band_paths = collect_band_paths(
+                job.config.band_dir,
+                product_level=job.config.product_level,
+            )
+            scene_support_files = find_scene_support_files(
+                job.config.band_dir,
+                product_level=job.config.product_level,
+            )
             processor = Landsat8Processor()
+
+            def resolve_support_file(configured_path: Optional[str], detected_path: Optional[str]) -> Optional[str]:
+                if not configured_path:
+                    return detected_path
+
+                detected_level = detect_product_level_from_path(Path(configured_path))
+                if (
+                    job.config.product_level
+                    and detected_level
+                    and detected_level != job.config.product_level
+                    and detected_path
+                ):
+                    logger.info(
+                        "任务 %s 检测到辅助文件产品级别不匹配，已切换为自动发现的 %s 文件: %s",
+                        job.job_id,
+                        job.config.product_level,
+                        detected_path,
+                    )
+                    return detected_path
+
+                return configured_path
+
+            mtl_file = resolve_support_file(job.config.mtl_file, scene_support_files.get("mtl_file"))
+            qa_band = resolve_support_file(job.config.qa_band, scene_support_files.get("qa_band"))
+            qa_radsat_band = resolve_support_file(
+                job.config.qa_radsat_band,
+                scene_support_files.get("qa_radsat_band"),
+            )
 
             def progress_callback(progress_info: Dict):
                 with self.lock:
@@ -133,13 +169,13 @@ class BatchJobManager:
             result = processor.one_click_preprocess(
                 band_paths=band_paths,
                 output_dir=job.config.output_dir,
-                mtl_path=job.config.mtl_file,
+                mtl_path=mtl_file,
                 clip_extent=job.config.clip_extent,
                 clip_shapefile=job.config.clip_shapefile,
                 create_composites=job.config.create_composites,
                 apply_cloud_mask=job.config.apply_cloud_mask,
-                qa_band_path=job.config.qa_band,
-                qa_radsat_band_path=job.config.qa_radsat_band,
+                qa_band_path=qa_band,
+                qa_radsat_band_path=qa_radsat_band,
                 atm_correction_method=job.config.atm_correction_method,
                 product_level=job.config.product_level,
                 custom_index_formula=job.config.custom_index_formula,

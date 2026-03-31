@@ -249,6 +249,7 @@ class LandsatSearchRequest(BaseModel):
 class LandsatDownloadItem(BaseModel):
     """单个 Landsat 资产下载项。"""
     scene_id: str = Field(..., description="场景 ID")
+    level: Optional[str] = Field(None, pattern="^(L1|L2)$", description="产品级别")
     band: str = Field(..., description="资产键")
     filename: str = Field(..., description="建议保存文件名")
     url: str = Field(..., description="资产 URL")
@@ -264,3 +265,10 @@ class LandsatAuthRequest(BaseModel):
     """USGS 凭据配置请求。"""
     username: str = Field(..., min_length=1, description="用户名")
     password: str = Field(..., min_length=1, description="密码")
+
+
+class LandsatProxyRequest(BaseModel):
+    """Landsat 下载代理配置请求。"""
+    enabled: bool = Field(True, description="是否启用代理")
+    proxy_url: str = Field("", description="代理地址，例如 http://127.0.0.1:7890")
+    no_proxy: str = Field("", description="直连地址列表，使用逗号分隔")

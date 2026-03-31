@@ -46,6 +46,8 @@ class Settings(BaseSettings):
     # Landsat 下载配置
     LANDSAT_EROS_USERNAME: str = ""
     LANDSAT_EROS_PASSWORD: str = ""
+    LANDSAT_PROXY_URL: str = ""
+    LANDSAT_NO_PROXY: str = ""
 
     model_config = SettingsConfigDict(
         env_file=".env",

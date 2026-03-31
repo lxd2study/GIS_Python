@@ -148,20 +148,24 @@ class GraphExecutor:
         # 优先从 DataDirNode 的 scenes 取（批量主路径）
         if datadir and datadir["data"].get("scenes"):
             all_scenes = datadir["data"]["scenes"]
+            selected_values = datadir["data"].get("selectedScenes")
             selected = set(
-                datadir["data"].get("selectedScenes")
-                or [s["name"] for s in all_scenes]
+                selected_values
+                if isinstance(selected_values, list)
+                else [GraphExecutor._scene_selection_key(s) for s in all_scenes]
             )
-            return [s for s in all_scenes if s["name"] in selected]
+            return [s for s in all_scenes if GraphExecutor._scene_matches_selection(s, selected)]
 
         # DataDirNode 已将 scenes 传递给 InputNode
         if input_node and input_node["data"].get("scenes"):
             all_scenes = input_node["data"]["scenes"]
+            selected_values = input_node["data"].get("selectedScenes")
             selected = set(
-                input_node["data"].get("selectedScenes")
-                or [s["name"] for s in all_scenes]
+                selected_values
+                if isinstance(selected_values, list)
+                else [GraphExecutor._scene_selection_key(s) for s in all_scenes]
             )
-            return [s for s in all_scenes if s["name"] in selected]
+            return [s for s in all_scenes if GraphExecutor._scene_matches_selection(s, selected)]
 
         # 单场景模式：InputNode 手动填写 band_dir
         if input_node and input_node["data"].get("band_dir"):
@@ -176,6 +180,18 @@ class GraphExecutor:
             }]
 
         return []
+
+    @staticmethod
+    def _scene_selection_key(scene: Dict) -> str:
+        return scene.get("id") or scene.get("path") or scene.get("name", "")
+
+    @staticmethod
+    def _scene_matches_selection(scene: Dict, selected: set) -> bool:
+        return bool({
+            GraphExecutor._scene_selection_key(scene),
+            scene.get("path"),
+            scene.get("name"),
+        } & selected)
 
     @staticmethod
     def _infer_product_level(scene_name: str, band_dir: str = "") -> str:
@@ -233,10 +249,11 @@ class GraphExecutor:
         #   - RadiometricNode 存在但无 AtmosphericNode → 仅辐射定标，DOS 仍执行（保持原 processor 逻辑）
         #   - 两者都不存在 → 标记 "none"（跳过预处理，适用 Level-2 数据）
         product_level = (
-            scene.get("product_level")
-            or (input_node["data"].get("product_level") if input_node else None)
+            (input_node["data"].get("product_level") if input_node else None)
+            or scene.get("product_level")
             or self._infer_product_level(scene["name"], scene["path"])
         ).upper()
+        scene_product_files = (scene.get("product_files") or {}).get(product_level, {})
         atm_method = "DOS"
         apply_cloud_mask = False
         if product_level == "L2":
@@ -254,11 +271,11 @@ class GraphExecutor:
             band_dir=scene["path"],
             output_dir=output_dir,
             # 优先使用场景自动检测到的 MTL，其次用 InputNode 手动填写的
-            mtl_file=scene.get("mtl_file") or (
+            mtl_file=scene_product_files.get("mtl_file") or scene.get("mtl_file") or (
                 (input_node["data"].get("mtl_file") or None) if input_node else None
             ),
-            qa_band=scene.get("qa_band") or ((input_node["data"].get("qa_band") or None) if input_node else None),
-            qa_radsat_band=scene.get("qa_radsat_band") or ((input_node["data"].get("qa_radsat_band") or None) if input_node else None),
+            qa_band=scene_product_files.get("qa_band") or scene.get("qa_band") or ((input_node["data"].get("qa_band") or None) if input_node else None),
+            qa_radsat_band=scene_product_files.get("qa_radsat_band") or scene.get("qa_radsat_band") or ((input_node["data"].get("qa_radsat_band") or None) if input_node else None),
             product_level=product_level,
             atm_correction_method=atm_method,
             apply_cloud_mask=apply_cloud_mask,

@@ -8,9 +8,26 @@ import VectorSource from 'ol/source/Vector'
 import XYZ from 'ol/source/XYZ'
 import Draw, { createBox } from 'ol/interaction/Draw'
 import Feature from 'ol/Feature'
-import Polygon, { fromExtent as polygonFromExtent } from 'ol/geom/Polygon'
+import { fromExtent as polygonFromExtent } from 'ol/geom/Polygon'
 import { Fill, Stroke, Style } from 'ol/style'
 import { fromLonLat, transformExtent } from 'ol/proj'
+
+const DOWNLOAD_MAX_RETRIES = 3
+const DOWNLOAD_RETRY_DELAYS = [2000, 5000, 10000]
+const ACTIVE_DOWNLOAD_STATUSES = ['pending', 'downloading', 'retrying']
+const RETRYABLE_DOWNLOAD_PATTERNS = [
+  /peer closed connection/i,
+  /incomplete message body/i,
+  /failed to fetch/i,
+  /load failed/i,
+  /network/i,
+  /connection/i,
+  /socket/i,
+  /body stream/i,
+  /未发送回复/,
+  /连接中断/,
+  /服务器断线/,
+]
 
 const props = defineProps({ apiBase: { type: String, required: true } })
 const emit = defineEmits(['toast'])
@@ -20,6 +37,7 @@ const state = reactive({
   collections: [],
   downloadRoot: '',
   authStatus: { configured: false, username: '' },
+  proxyStatus: { enabled: false, configured: false, proxy_url: '', no_proxy: '' },
   level: 'L2',
   startDate: offsetDay(-90),
   endDate: offsetDay(0),
@@ -36,8 +54,11 @@ const state = reactive({
   modalScene: null,
   modalAssets: {},
   showAuthModal: false,
+  showProxyModal: false,
   authForm: { username: '', password: '' },
   authSaving: false,
+  proxyForm: { enabled: false, proxy_url: '', no_proxy: '' },
+  proxySaving: false,
   serverTasks: [],
   localTasks: {},
   localQueue: [],
@@ -54,14 +75,14 @@ let serverPollTimer = null
 const selectedScenes = computed(() => state.searchResults.filter((scene) => state.selectedScenes[scene.id]))
 const selectedSceneCount = computed(() => selectedScenes.value.length)
 const localTaskList = computed(() => Object.values(state.localTasks).sort((a, b) => b.createdAt - a.createdAt))
-const localActiveCount = computed(() => localTaskList.value.filter((task) => ['pending', 'downloading'].includes(task.status)).length)
-const serverActiveCount = computed(() => state.serverTasks.filter((task) => ['pending', 'downloading'].includes(task.status)).length)
+const localActiveCount = computed(() => localTaskList.value.filter((task) => ACTIVE_DOWNLOAD_STATUSES.includes(task.status)).length)
+const serverActiveCount = computed(() => state.serverTasks.filter((task) => ACTIVE_DOWNLOAD_STATUSES.includes(task.status)).length)
 const selectedModalAssetCount = computed(() => Object.values(state.modalAssets).filter(Boolean).length)
 
 function offsetDay(days) { const d = new Date(); d.setDate(d.getDate() + days); return d.toISOString().slice(0, 10) }
 function apiBase() { return (props.apiBase || '').trim().replace(/\/+$/, '') || 'http://127.0.0.1:5001' }
 function toast(message, type = 'idle') { emit('toast', { message, type }) }
-function statusLabel(status) { return { pending: '等待中', downloading: '下载中', completed: '已完成', failed: '失败', cancelled: '已取消' }[status] || status }
+function statusLabel(status) { return { pending: '等待中', downloading: '下载中', retrying: '重试中', completed: '已完成', failed: '失败', cancelled: '已取消' }[status] || status }
 function statusClass(status) { return `status-${status || 'pending'}` }
 function sceneDate(value) { return value ? String(value).slice(0, 10) : '未知日期' }
 function cloudText(value) { return value === null || value === undefined ? '--' : `${Number(value).toFixed(1)}%` }
@@ -71,6 +92,15 @@ function sizeText(done, total = 0) { const f = (v) => !v ? '0 B' : v >= 10737418
 function sortedAssets(assets) { return Object.entries(assets || {}).sort((a, b) => a[0].localeCompare(b[0], 'en')) }
 function filenameFrom(url, sceneId, band) { const name = (url || '').split('?')[0].split('/').pop(); return name || `${sceneId}_${band}.tif` }
 function errorText(detail) { if (typeof detail === 'string') return detail; if (Array.isArray(detail)) return detail.map((item) => item.msg || JSON.stringify(item)).join(' | '); if (detail && typeof detail === 'object') return detail.msg || JSON.stringify(detail); return '请求失败' }
+function normalizeErrorMessage(error) { return error?.message || String(error || '下载失败') }
+function buildRetryFailureMessage() { return `连接中断，已重试 ${DOWNLOAD_MAX_RETRIES} 次仍失败` }
+function retryText(task) { const retryCount = Number(task?.retry_count || 0); const maxRetries = Number(task?.max_retries ?? DOWNLOAD_MAX_RETRIES); if (!retryCount && task?.status !== 'retrying') return ''; return task?.status === 'retrying' ? `重试中 ${retryCount}/${maxRetries}` : `已重试 ${retryCount}/${maxRetries}` }
+function detailErrorText(task) { if (!task?.last_error) return ''; return task.last_error === task.error ? '' : `详情：${task.last_error}` }
+function sleep(ms) { return new Promise((resolve) => window.setTimeout(resolve, ms)) }
+function createAbortError() { const error = new Error('The operation was aborted.'); error.name = 'AbortError'; return error }
+function isAbortError(error) { return error?.name === 'AbortError' }
+function isRetryableDownloadError(error) { if (!error || isAbortError(error)) return false; if (error instanceof TypeError) return true; const message = normalizeErrorMessage(error); return RETRYABLE_DOWNLOAD_PATTERNS.some((pattern) => pattern.test(message)) }
+function resetLocalTaskProgress(task) { task.progress = 0; task.size_total = 0; task.size_downloaded = 0 }
 
 async function request(path, options = {}) {
   const response = await fetch(`${apiBase()}${path}`, options)
@@ -81,7 +111,7 @@ async function request(path, options = {}) {
 
 watch(() => state.hoveredSceneId, () => footprintLayer && footprintLayer.changed())
 watch(() => state.selectedScenes, () => footprintLayer && footprintLayer.changed(), { deep: true })
-watch(() => props.apiBase, async () => { await Promise.all([loadCollections(true), loadAuthStatus(true), loadServerTasks(true)]) })
+watch(() => props.apiBase, async () => { await Promise.all([loadCollections(true), loadAuthStatus(true), loadProxyStatus(true), loadServerTasks(true)]) })
 
 function initMap() {
   footprintLayer = new VectorLayer({
@@ -111,7 +141,8 @@ function renderFootprints() { footprintSource.clear(); state.searchResults.forEa
 
 async function loadCollections(silent = false) { try { const data = await request('/landsat/collections'); state.collections = data.collections || []; state.downloadRoot = data.download_dir || '' } catch (error) { if (!silent) toast(`加载配置失败：${error.message}`, 'error') } }
 async function loadAuthStatus(silent = false) { try { state.authStatus = await request('/landsat/auth/status') } catch (error) { if (!silent) toast(`读取账号状态失败：${error.message}`, 'error') } }
-async function loadServerTasks(silent = false) { try { const data = await request('/landsat/download_tasks'); state.serverTasks = (data.tasks || []).sort((a, b) => String(b.created_at).localeCompare(String(a.created_at))); if (state.serverTasks.some((task) => ['pending', 'downloading'].includes(task.status))) startServerPoll(); else stopServerPoll() } catch (error) { if (!silent) toast(`读取服务端任务失败：${error.message}`, 'error') } }
+async function loadProxyStatus(silent = false) { try { state.proxyStatus = await request('/landsat/proxy/status') } catch (error) { if (!silent) toast(`读取代理配置失败：${error.message}`, 'error') } }
+async function loadServerTasks(silent = false) { try { const data = await request('/landsat/download_tasks'); state.serverTasks = (data.tasks || []).sort((a, b) => String(b.created_at).localeCompare(String(a.created_at))); if (state.serverTasks.some((task) => ACTIVE_DOWNLOAD_STATUSES.includes(task.status))) startServerPoll(); else stopServerPoll() } catch (error) { if (!silent) toast(`读取服务端任务失败：${normalizeErrorMessage(error)}`, 'error') } }
 function startServerPoll() { if (serverPollTimer !== null) return; serverPollTimer = window.setInterval(() => loadServerTasks(true), 2000) }
 function stopServerPoll() { if (serverPollTimer !== null) { window.clearInterval(serverPollTimer); serverPollTimer = null } }
 
@@ -135,7 +166,7 @@ function toggleAll(checked) { const next = {}; state.searchResults.forEach((scen
 function openAssetModal(scene) { const next = {}; Object.keys(scene.assets || {}).forEach((key) => { next[key] = true }); state.modalScene = scene; state.modalAssets = next; state.modalOpen = true }
 function closeAssetModal() { state.modalOpen = false; state.modalScene = null; state.modalAssets = {} }
 function choosePreset(preset) { const scene = state.modalScene; if (!scene) return; const isL1 = scene.level === 'L1'; const keep = preset === 'all' ? null : new Set({ rgb: isL1 ? ['B4', 'B3', 'B2'] : ['red', 'green', 'blue'], vegetation: isL1 ? ['B5', 'B4', 'B3'] : ['nir08', 'red', 'green'] }[preset] || []); Object.keys(scene.assets || {}).forEach((key) => { state.modalAssets[key] = keep ? keep.has(key) : true }) }
-function buildItems(scene, assetKeys = null) { const assets = scene.assets || {}; return (assetKeys || Object.keys(assets)).filter((key) => assets[key]).map((key) => ({ scene_id: scene.id, band: key, filename: filenameFrom(assets[key].href, scene.id, key), url: assets[key].href })) }
+function buildItems(scene, assetKeys = null) { const assets = scene.assets || {}; return (assetKeys || Object.keys(assets)).filter((key) => assets[key]).map((key) => ({ scene_id: scene.id, level: scene.level, band: key, filename: filenameFrom(assets[key].href, scene.id, key), url: assets[key].href })) }
 async function confirmAssetDownload() { if (!state.modalScene) return; const assetKeys = Object.entries(state.modalAssets).filter(([, checked]) => checked).map(([key]) => key); if (!assetKeys.length) return toast('请至少选择一个资产', 'warn'); const items = buildItems(state.modalScene, assetKeys); closeAssetModal(); await enqueue(items) }
 async function downloadScene(scene) { await enqueue(buildItems(scene)) }
 async function downloadSelected() { if (!selectedScenes.value.length) return toast('请先勾选至少一景', 'warn'); await enqueue(selectedScenes.value.flatMap((scene) => buildItems(scene))) }
@@ -146,14 +177,17 @@ async function enqueue(items) {
     try { const data = await request('/landsat/download', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ items, mode: 'server' }) }); toast(`已创建 ${data.count || items.length} 个服务端任务`, 'ok'); await loadServerTasks(true) } catch (error) { toast(`创建服务端任务失败：${error.message}`, 'error') }
     return
   }
-  items.forEach((item) => { const id = `${Date.now()}_${Math.random().toString(16).slice(2, 8)}`; state.localTasks[id] = { ...item, id, status: 'pending', progress: 0, size_total: 0, size_downloaded: 0, error: '', createdAt: Date.now(), controller: null }; state.localQueue.push(id) })
+  items.forEach((item) => { const id = `${Date.now()}_${Math.random().toString(16).slice(2, 8)}`; state.localTasks[id] = { ...item, id, status: 'pending', progress: 0, size_total: 0, size_downloaded: 0, error: '', last_error: '', retry_count: 0, max_retries: DOWNLOAD_MAX_RETRIES, createdAt: Date.now(), controller: null }; state.localQueue.push(id) })
   toast(`已加入 ${items.length} 个浏览器下载任务`, 'ok')
   processLocalQueue()
 }
 
 function saveBlob(blob, filename) { const href = URL.createObjectURL(blob); const link = document.createElement('a'); link.href = href; link.download = filename; document.body.appendChild(link); link.click(); link.remove(); window.setTimeout(() => URL.revokeObjectURL(href), 5000) }
+async function waitForLocalRetry(task, delayMs) { const deadline = Date.now() + delayMs; while (Date.now() < deadline) { if (!task || task.status === 'cancelled') return false; await sleep(Math.min(250, deadline - Date.now())) } return task.status !== 'cancelled' }
+async function fetchLocalTaskBlob(task, signal) { const response = await fetch(`${apiBase()}/landsat/proxy_download?url=${encodeURIComponent(task.url)}&filename=${encodeURIComponent(task.filename)}`, { signal }); if (!response.ok) { const data = await response.json().catch(() => ({})); throw new Error(errorText(data.detail || `HTTP ${response.status}`)) } const total = Number(response.headers.get('content-length') || 0); task.size_total = total; if (response.body && response.body.getReader) { const reader = response.body.getReader(); const chunks = []; let downloaded = 0; try { while (true) { const { done, value } = await reader.read(); if (done) break; if (task.status === 'cancelled') { await reader.cancel().catch(() => {}); throw createAbortError() } chunks.push(value); downloaded += value.byteLength || value.length || 0; task.size_downloaded = downloaded; task.progress = total ? Math.round(downloaded / total * 100) : 0 } } catch (error) { await reader.cancel().catch(() => {}); throw error } const blob = new Blob(chunks); task.size_downloaded = blob.size; task.size_total = total || blob.size; return blob } const blob = await response.blob(); task.size_downloaded = blob.size; task.size_total = total || blob.size; return blob }
+async function downloadLocalTask(task) { if (!task || task.status === 'cancelled') return; for (let attemptIndex = 0; attemptIndex <= DOWNLOAD_MAX_RETRIES; attemptIndex += 1) { if (!task || task.status === 'cancelled') { task.status = 'cancelled'; return } resetLocalTaskProgress(task); task.status = 'downloading'; task.error = ''; task.last_error = ''; const controller = new AbortController(); task.controller = controller; try { const blob = await fetchLocalTaskBlob(task, controller.signal); if (task.status === 'cancelled') return; task.progress = 100; task.status = 'completed'; task.error = ''; task.last_error = ''; saveBlob(blob, task.filename); return } catch (error) { if (task.status === 'cancelled' || isAbortError(error)) { task.status = 'cancelled'; return } const rawError = normalizeErrorMessage(error); const retryable = isRetryableDownloadError(error); task.last_error = rawError; if (!retryable || attemptIndex >= DOWNLOAD_MAX_RETRIES) { task.status = 'failed'; if (retryable) resetLocalTaskProgress(task); task.error = retryable ? buildRetryFailureMessage() : rawError; return } task.retry_count = attemptIndex + 1; task.status = 'retrying'; task.error = ''; resetLocalTaskProgress(task); const shouldContinue = await waitForLocalRetry(task, DOWNLOAD_RETRY_DELAYS[attemptIndex]); if (!shouldContinue) { task.status = 'cancelled'; return } } finally { task.controller = null } } }
 // 浏览器模式顺序下载，避免多景并发时把内存和网络同时拉满。
-async function processLocalQueue() { if (state.localBusy || !state.localQueue.length) return; state.localBusy = true; while (state.localQueue.length) { const taskId = state.localQueue.shift(); const task = state.localTasks[taskId]; if (!task || task.status === 'cancelled') continue; task.status = 'downloading'; const controller = new AbortController(); task.controller = controller; try { const response = await fetch(`${apiBase()}/landsat/proxy_download?url=${encodeURIComponent(task.url)}&filename=${encodeURIComponent(task.filename)}`, { signal: controller.signal }); if (!response.ok) { const data = await response.json().catch(() => ({})); throw new Error(errorText(data.detail || `HTTP ${response.status}`)) } const total = Number(response.headers.get('content-length') || 0); task.size_total = total; if (response.body && response.body.getReader) { const reader = response.body.getReader(); const chunks = []; let downloaded = 0; while (true) { const { done, value } = await reader.read(); if (done) break; if (task.status === 'cancelled') { await reader.cancel().catch(() => {}); break } chunks.push(value); downloaded += value.length; task.size_downloaded = downloaded; task.progress = total ? Math.round(downloaded / total * 100) : 0 } if (task.status !== 'cancelled') { const blob = new Blob(chunks); task.size_downloaded = blob.size; task.size_total = total || blob.size; task.progress = 100; task.status = 'completed'; saveBlob(blob, task.filename) } } else { const blob = await response.blob(); if (task.status !== 'cancelled') { task.size_downloaded = blob.size; task.size_total = blob.size; task.progress = 100; task.status = 'completed'; saveBlob(blob, task.filename) } } } catch (error) { if (task.status === 'cancelled' || error.name === 'AbortError') task.status = 'cancelled'; else { task.status = 'failed'; task.error = error.message || '下载失败' } } finally { task.controller = null } } state.localBusy = false }
+async function processLocalQueue() { if (state.localBusy || !state.localQueue.length) return; state.localBusy = true; try { while (state.localQueue.length) { const taskId = state.localQueue.shift(); const task = state.localTasks[taskId]; if (!task || task.status === 'cancelled') continue; await downloadLocalTask(task) } } finally { state.localBusy = false; if (state.localQueue.length) window.setTimeout(() => processLocalQueue(), 0) } }
 function cancelLocal(taskId) { const task = state.localTasks[taskId]; if (!task) return; task.status = 'cancelled'; task.controller?.abort(); state.localQueue = state.localQueue.filter((item) => item !== taskId) }
 async function cancelServer(taskId) { try { await request(`/landsat/download_tasks/${encodeURIComponent(taskId)}`, { method: 'DELETE' }); await loadServerTasks(true) } catch (error) { toast(`取消失败：${error.message}`, 'error') } }
 function saveServer(task) { const link = document.createElement('a'); link.href = `${apiBase()}/landsat/download_tasks/${encodeURIComponent(task.id)}/file`; link.target = '_blank'; link.rel = 'noopener'; document.body.appendChild(link); link.click(); link.remove() }
@@ -163,16 +197,20 @@ function clearLocal() { Object.entries(state.localTasks).forEach(([id, task]) =>
 function openAuth() { state.authForm.username = state.authStatus.username || ''; state.authForm.password = ''; state.showAuthModal = true }
 function closeAuth() { state.showAuthModal = false; state.authForm.password = '' }
 async function saveAuth() { const username = state.authForm.username.trim(); const password = state.authForm.password; if (!username || !password) return toast('请填写完整账号和密码', 'warn'); state.authSaving = true; try { await request('/landsat/auth/earthdata', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username, password }) }); await loadAuthStatus(true); closeAuth(); toast('EarthData / EROS 账号已更新', 'ok') } catch (error) { toast(`账号验证失败：${error.message}`, 'error') } finally { state.authSaving = false } }
+function openProxy() { state.proxyForm = { enabled: !!state.proxyStatus.enabled, proxy_url: state.proxyStatus.proxy_url || '', no_proxy: state.proxyStatus.no_proxy || '' }; state.showProxyModal = true }
+function closeProxy() { state.showProxyModal = false }
+async function saveProxy() { const payload = { enabled: !!state.proxyForm.enabled, proxy_url: state.proxyForm.proxy_url.trim(), no_proxy: state.proxyForm.no_proxy.trim() }; if (payload.enabled && !payload.proxy_url) return toast('启用代理时请填写代理地址', 'warn'); state.proxySaving = true; try { await request('/landsat/proxy', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) }); await loadProxyStatus(true); closeProxy(); toast(payload.enabled ? '下载代理已更新' : '下载代理已关闭', 'ok') } catch (error) { toast(`保存代理失败：${error.message}`, 'error') } finally { state.proxySaving = false } }
+async function disableProxy() { state.proxyForm.enabled = false; state.proxyForm.proxy_url = ''; state.proxyForm.no_proxy = ''; await saveProxy() }
 
-onMounted(async () => { await nextTick(); initMap(); window.setTimeout(() => map && map.updateSize(), 320); await Promise.all([loadCollections(true), loadAuthStatus(true), loadServerTasks(true)]) })
-onBeforeUnmount(() => { stopServerPoll(); removeDraw(); if (map) map.setTarget(null) })
+onMounted(async () => { await nextTick(); initMap(); window.setTimeout(() => map && map.updateSize(), 320); await Promise.all([loadCollections(true), loadAuthStatus(true), loadProxyStatus(true), loadServerTasks(true)]) })
+onBeforeUnmount(() => { stopServerPoll(); removeDraw(); Object.values(state.localTasks).forEach((task) => { task.status = 'cancelled'; task.controller?.abort() }); if (map) map.setTarget(null) })
 </script>
 
 <template>
   <div class="landsat-download">
     <section class="grid">
       <article class="card">
-        <div class="head"><div><h3>检索条件</h3></div><button class="btn sub" type="button" @click="openAuth">{{ state.authStatus.configured ? `账号：${state.authStatus.username}` : '配置 EarthData' }}</button></div>
+        <div class="head"><div><h3>检索条件</h3></div><div class="row"><button class="btn sub" type="button" @click="openProxy">{{ state.proxyStatus.enabled ? '代理已启用' : '配置代理' }}</button><button class="btn sub" type="button" @click="openAuth">{{ state.authStatus.configured ? `账号：${state.authStatus.username}` : '配置 EarthData' }}</button></div></div>
         <div class="collections"><button v-for="collection in state.collections" :key="collection.level" class="collection-chip" :class="{ active: state.level === collection.level }" type="button" @click="state.level = collection.level"><strong>{{ collection.level }}</strong><span>{{ collection.title }}</span></button></div>
         <div class="fields">
           <label><span>开始日期</span><input v-model="state.startDate" type="date" /></label>
@@ -181,6 +219,7 @@ onBeforeUnmount(() => { stopServerPoll(); removeDraw(); if (map) map.setTarget(n
           <label><span>返回上限</span><input v-model.number="state.limit" type="number" min="1" max="100" /></label>
           <div><span>下载模式</span><div class="mode-switch"><button class="pill" :class="{ active: state.downloadMode === 'server' }" type="button" @click="state.downloadMode = 'server'">服务端</button><button class="pill" :class="{ active: state.downloadMode === 'local' }" type="button" @click="state.downloadMode = 'local'">浏览器</button></div></div>
         </div>
+        <p v-if="state.proxyStatus.enabled" class="root-hint">代理：{{ state.proxyStatus.proxy_url }}<template v-if="state.proxyStatus.no_proxy"> · 直连 {{ state.proxyStatus.no_proxy }}</template></p>
         <div class="bbox-box"><div><span>当前范围</span><strong>{{ bboxText() }}</strong></div><div class="row"><button class="btn" type="button" @click="drawBox">{{ state.drawActive ? '重新框选中...' : '绘制矩形' }}</button><button class="btn sub" type="button" @click="clearBox">清空</button></div></div>
         <button class="btn main" type="button" :disabled="state.searchLoading" @click="searchScenes">{{ state.searchLoading ? '检索中...' : '开始检索' }}</button>
       </article>
@@ -197,13 +236,14 @@ onBeforeUnmount(() => { stopServerPoll(); removeDraw(); if (map) map.setTarget(n
       </article>
       <article class="card span-all">
         <div class="task-columns">
-          <section><div class="head"><div><h3>浏览器下载</h3><p>{{ localActiveCount }} 个进行中</p></div><button class="btn sub" type="button" @click="clearLocal">清理已完成</button></div><div v-if="!localTaskList.length" class="empty small">暂无浏览器下载任务。</div><div v-else class="task-list"><article v-for="task in localTaskList" :key="task.id" class="task-card"><div class="between"><div><strong>{{ task.filename }}</strong><p>{{ task.scene_id }} / {{ task.band }}</p></div><span class="status" :class="statusClass(task.status)">{{ statusLabel(task.status) }}</span></div><div class="progress"><div class="fill" :style="{ width: `${task.progress}%` }"></div></div><div class="between"><span>{{ sizeText(task.size_downloaded, task.size_total) }}</span><button v-if="['pending', 'downloading'].includes(task.status)" class="btn sub tiny" type="button" @click="cancelLocal(task.id)">取消</button></div><p v-if="task.error" class="error">{{ task.error }}</p></article></div></section>
-          <section><div class="head"><div><h3>服务端下载</h3><p>{{ serverActiveCount }} 个进行中</p><p v-if="state.downloadRoot" class="root-hint">{{ state.downloadRoot }}</p></div><button class="btn sub" type="button" @click="clearServer">清理终态任务</button></div><div v-if="!state.serverTasks.length" class="empty small">暂无服务端下载任务。</div><div v-else class="task-list"><article v-for="task in state.serverTasks" :key="task.id" class="task-card"><div class="between"><div><strong>{{ task.filename }}</strong><p>{{ task.scene_id }} / {{ task.band }}</p></div><span class="status" :class="statusClass(task.status)">{{ statusLabel(task.status) }}</span></div><div class="progress"><div class="fill" :style="{ width: `${task.progress || 0}%` }"></div></div><div class="between"><span>{{ sizeText(task.size_downloaded || 0, task.size_total || 0) }}</span><div class="row"><button v-if="task.status === 'completed'" class="btn sub tiny" type="button" @click="saveServer(task)">保存到本地</button><button v-if="['pending', 'downloading'].includes(task.status)" class="btn sub tiny" type="button" @click="cancelServer(task.id)">取消</button></div></div><p v-if="task.error" class="error">{{ task.error }}</p></article></div></section>
+          <section><div class="head"><div><h3>浏览器下载</h3><p>{{ localActiveCount }} 个进行中</p></div><button class="btn sub" type="button" @click="clearLocal">清理已完成</button></div><div v-if="!localTaskList.length" class="empty small">暂无浏览器下载任务。</div><div v-else class="task-list"><article v-for="task in localTaskList" :key="task.id" class="task-card"><div class="between"><div><strong>{{ task.filename }}</strong><p>{{ task.scene_id }} / {{ task.level || '--' }} / {{ task.band }}</p><p v-if="retryText(task)">{{ retryText(task) }}</p></div><span class="status" :class="statusClass(task.status)">{{ statusLabel(task.status) }}</span></div><div class="progress"><div class="fill" :style="{ width: `${task.progress}%` }"></div></div><div class="between"><span>{{ sizeText(task.size_downloaded, task.size_total) }}</span><button v-if="ACTIVE_DOWNLOAD_STATUSES.includes(task.status)" class="btn sub tiny" type="button" @click="cancelLocal(task.id)">取消</button></div><p v-if="task.error" class="error">{{ task.error }}</p><p v-if="detailErrorText(task)" class="error error-detail">{{ detailErrorText(task) }}</p></article></div></section>
+          <section><div class="head"><div><h3>服务端下载</h3><p>{{ serverActiveCount }} 个进行中</p><p v-if="state.downloadRoot" class="root-hint">{{ state.downloadRoot }}</p></div><button class="btn sub" type="button" @click="clearServer">清理终态任务</button></div><div v-if="!state.serverTasks.length" class="empty small">暂无服务端下载任务。</div><div v-else class="task-list"><article v-for="task in state.serverTasks" :key="task.id" class="task-card"><div class="between"><div><strong>{{ task.filename }}</strong><p>{{ task.scene_id }} / {{ task.level || '--' }} / {{ task.band }}</p><p v-if="task.download_date">目录：{{ task.download_date }}/{{ task.level || '--' }}/{{ task.scene_id }}</p><p v-if="retryText(task)">{{ retryText(task) }}</p></div><span class="status" :class="statusClass(task.status)">{{ statusLabel(task.status) }}</span></div><div class="progress"><div class="fill" :style="{ width: `${task.progress || 0}%` }"></div></div><div class="between"><span>{{ sizeText(task.size_downloaded || 0, task.size_total || 0) }}</span><div class="row"><button v-if="task.status === 'completed'" class="btn sub tiny" type="button" @click="saveServer(task)">保存到本地</button><button v-if="ACTIVE_DOWNLOAD_STATUSES.includes(task.status)" class="btn sub tiny" type="button" @click="cancelServer(task.id)">取消</button></div></div><p v-if="task.error" class="error">{{ task.error }}</p><p v-if="detailErrorText(task)" class="error error-detail">{{ detailErrorText(task) }}</p></article></div></section>
         </div>
       </article>
     </section>
     <div v-if="state.modalOpen" class="mask" @click.self="closeAssetModal"><div class="modal"><div class="head"><div><h3>选择资产</h3><p>{{ state.modalScene?.id }}</p></div><button class="btn sub" type="button" @click="closeAssetModal">关闭</button></div><div class="row"><button class="btn sub" type="button" @click="choosePreset('rgb')">RGB</button><button class="btn sub" type="button" @click="choosePreset('vegetation')">植被组合</button><button class="btn sub" type="button" @click="choosePreset('all')">全选</button><span class="count">已选 {{ selectedModalAssetCount }} 项</span></div><div class="asset-grid"><label v-for="[key, asset] in sortedAssets(state.modalScene?.assets)" :key="key" class="asset-item"><input v-model="state.modalAssets[key]" type="checkbox" /><div><strong>{{ key }}</strong><p>{{ asset.label }}</p></div></label></div><div class="row end"><button class="btn" type="button" @click="confirmAssetDownload">加入下载</button></div></div></div>
     <div v-if="state.showAuthModal" class="mask" @click.self="closeAuth"><div class="modal auth-modal"><div class="head"><div><h3>EarthData / EROS</h3><p>仅在下载部分 USGS 资产时需要。</p></div><button class="btn sub" type="button" @click="closeAuth">关闭</button></div><div class="fields"><label class="full"><span>用户名</span><input v-model="state.authForm.username" type="text" placeholder="EarthData 用户名" /></label><label class="full"><span>密码</span><input v-model="state.authForm.password" type="password" placeholder="密码" /></label></div><div class="row end"><button class="btn" type="button" :disabled="state.authSaving" @click="saveAuth">{{ state.authSaving ? '验证中...' : '保存并验证' }}</button></div></div></div>
+    <div v-if="state.showProxyModal" class="mask" @click.self="closeProxy"><div class="modal auth-modal"><div class="head"><div><h3>下载代理</h3><p>用于 STAC 检索、EarthData 登录和影像下载请求。</p></div><button class="btn sub" type="button" @click="closeProxy">关闭</button></div><div class="fields"><label class="full proxy-toggle"><span>启用代理</span><input v-model="state.proxyForm.enabled" type="checkbox" /></label><label class="full"><span>代理地址</span><input v-model="state.proxyForm.proxy_url" type="text" placeholder="http://127.0.0.1:7890" :disabled="!state.proxyForm.enabled" /></label><label class="full"><span>直连列表（可选）</span><input v-model="state.proxyForm.no_proxy" type="text" placeholder="127.0.0.1,localhost,.microsoft.com" :disabled="!state.proxyForm.enabled" /></label></div><div class="row between"><button class="btn sub" type="button" :disabled="state.proxySaving || !state.proxyStatus.enabled" @click="disableProxy">关闭代理</button><button class="btn" type="button" :disabled="state.proxySaving" @click="saveProxy">{{ state.proxySaving ? '保存中...' : '保存配置' }}</button></div></div></div>
   </div>
 </template>
 
@@ -242,6 +282,8 @@ onBeforeUnmount(() => { stopServerPoll(); removeDraw(); if (map) map.setTarget(n
 .mode-switch { display: inline-flex; gap: 0.3rem; margin-top: 2px; }
 .pill { padding: 0.26rem 0.55rem; border: 1px solid var(--line); border-radius: 999px; background: var(--card); color: var(--muted); font-size: 0.7rem; cursor: pointer; transition: all 0.15s; }
 .pill.active { border-color: var(--pri); background: #e7f4f1; color: var(--pri-dark); font-weight: 600; }
+.proxy-toggle { flex-direction: row !important; justify-content: space-between; align-items: center; padding: 0.45rem 0.55rem; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); }
+.proxy-toggle input { width: auto !important; padding: 0; border: 0; background: transparent; accent-color: var(--pri); }
 
 /* ── BBox display ─────────────────────────────────────────── */
 .bbox-box { display: flex; justify-content: space-between; align-items: center; gap: 0.5rem; padding: 0.45rem 0.55rem; border-radius: 6px; background: var(--bg); border: 1px solid var(--line); margin-bottom: 0.6rem; }
@@ -289,10 +331,12 @@ onBeforeUnmount(() => { stopServerPoll(); removeDraw(); if (map) map.setTarget(n
 .fill { height: 100%; background: linear-gradient(90deg, var(--pri), #6fae7f); border-radius: inherit; transition: width 0.25s ease; }
 .status-pending { background: var(--bg); color: var(--muted); border-color: var(--line); }
 .status-downloading { background: #e7f4f1; color: var(--ok); border-color: #b9d9d0; }
+.status-retrying { background: #fffbf0; color: var(--warn); border-color: #f5e6c3; }
 .status-completed { background: #e7f4f1; color: var(--ok); border-color: #b9d9d0; }
 .status-failed { background: #fee2e2; color: var(--err); border-color: #e2c4c2; }
 .status-cancelled { background: var(--bg); color: var(--muted); border-color: var(--line); }
 .error { margin: 0.28rem 0 0; color: var(--err); font-size: 0.65rem; line-height: 1.4; }
+.error-detail { color: var(--muted); }
 
 /* ── Modals ───────────────────────────────────────────────── */
 .mask { position: fixed; inset: 0; z-index: 30; display: flex; align-items: center; justify-content: center; padding: 1rem; background: rgba(20, 30, 27, 0.42); }

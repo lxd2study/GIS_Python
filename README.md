@@ -125,8 +125,10 @@ npm run dev
 1. 在预处理页确认后端在线，设置输出目录。
 2. 如果是本地单景数据，选择 `L1` 或 `L2` 产品级别后上传波段、MTL、`QA_PIXEL`、可选的 `QA_RADSAT`。
 3. 如果是批量数据，进入批量处理页扫描数据目录，由节点自动传播场景和产品级别。
-4. 如需在线取数，先在 Landsat 下载页完成 AOI 检索与资产下载，再切回预处理或批处理页面。
+4. 如需在线取数，先在 Landsat 下载页完成 AOI 检索与资产下载；如果访问 STAC 或下载资产较慢，可先在页面右上角配置 HTTP/HTTPS 代理。
 5. 任务完成后在结果区查看产物路径、预览图和摘要信息。
+
+服务端下载默认会按 `output/landsat_downloads/YYYY-MM-DD/L1|L2/场景ID/文件` 自动归档，便于按日期和产品级别整理。
 
 ---
 
@@ -145,6 +147,8 @@ CACHE_DIR=./cache
 MAX_WORKERS=4
 GDAL_CACHEMAX=512
 GDAL_NUM_THREADS=ALL_CPUS
+LANDSAT_PROXY_URL=http://127.0.0.1:7890
+LANDSAT_NO_PROXY=127.0.0.1,localhost
 ```
 
 前端默认读取 `frontend-vue/.env`：

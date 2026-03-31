@@ -17,6 +17,7 @@ from ..core.models import (
     GraphSubmitRequest,
     LandsatAuthRequest,
     LandsatDownloadTaskCreateRequest,
+    LandsatProxyRequest,
     LandsatSearchRequest,
     TaskQueueItem,
 )
@@ -26,6 +27,7 @@ from ..services.batch_manager import BatchJobManager
 from ..services.landsat_download import LandsatDownloadService
 from ..services.templates import ProcessingTemplates
 from ..services.graph_executor import GraphExecutor
+from ..utils.file_utils import find_scene_support_files, infer_available_product_levels
 
 logger = logging.getLogger(__name__)
 RASTER_PREVIEW_EXTENSIONS = (".tif", ".tiff", ".img", ".png")
@@ -88,7 +90,7 @@ def _infer_product_level(name: str, filenames: Optional[List[str]] = None) -> st
 
     for filename in filenames or []:
         upper_name = filename.upper()
-        if any(token in upper_name for token in ("_SR_B", "_ST_B", "QA_PIXEL", "QA_RADSAT")):
+        if any(token in upper_name for token in ("_SR_B", "_ST_B", "_L2", "L2SP", "SURFACE_REFLECTANCE")):
             return "L2"
     return "L1"
 
@@ -428,6 +430,8 @@ def setup_routes(
                 "/landsat/search",
                 "/landsat/auth/status",
                 "/landsat/auth/earthdata",
+                "/landsat/proxy/status",
+                "/landsat/proxy",
                 "/landsat/proxy_download",
                 "/landsat/download",
                 "/landsat/download_tasks",
@@ -450,6 +454,10 @@ def setup_routes(
     def landsat_auth_status() -> Dict:
         return landsat_download_service.get_auth_status()
 
+    @app.get("/landsat/proxy/status")
+    def landsat_proxy_status() -> Dict:
+        return landsat_download_service.get_proxy_status()
+
     @app.post("/landsat/auth/earthdata")
     async def landsat_set_earthdata(request: LandsatAuthRequest) -> Dict:
         try:
@@ -461,6 +469,16 @@ def setup_routes(
         except Exception as exc:
             logger.error("EarthData 认证失败: %s", exc, exc_info=True)
             raise HTTPException(status_code=500, detail=f"认证失败: {exc}")
+
+    @app.post("/landsat/proxy")
+    def landsat_set_proxy(request: LandsatProxyRequest) -> Dict:
+        try:
+            return landsat_download_service.configure_proxy(request)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        except Exception as exc:
+            logger.error("Landsat 代理配置失败: %s", exc, exc_info=True)
+            raise HTTPException(status_code=500, detail=f"代理配置失败: {exc}")
 
     @app.post("/landsat/search")
     async def landsat_search(request: LandsatSearchRequest) -> Dict:
@@ -607,28 +625,37 @@ def setup_routes(
                         if shp_files:
                             has_shp = True
                             shp_file = str(shp_files[0])
-                    filenames = [child.name for child in scene_path.iterdir() if child.is_file()]
-                    product_level = _infer_product_level(entry.name, filenames)
-                    # 自动检测 MTL 元数据文件
-                    mtl_files = list(scene_path.glob("*MTL*.txt"))
-                    mtl_file = str(mtl_files[0]) if mtl_files else None
-                    qa_band = _find_first_matching_file(scene_path, ["*QA_PIXEL*.tif", "*QA_PIXEL*.TIF", "*BQA*.tif", "*BQA*.TIF"])
-                    qa_radsat_band = _find_first_matching_file(scene_path, ["*QA_RADSAT*.tif", "*QA_RADSAT*.TIF"])
+                    available_product_levels = infer_available_product_levels(scene_path)
+                    if available_product_levels:
+                        product_level = "L2" if "L2" in available_product_levels else available_product_levels[0]
+                    else:
+                        filenames = [child.name for child in scene_path.iterdir() if child.is_file()]
+                        product_level = _infer_product_level(entry.name, filenames)
+                        available_product_levels = [product_level]
+
+                    product_files = {
+                        level: find_scene_support_files(scene_path, product_level=level)
+                        for level in available_product_levels
+                    }
+                    scene_files = product_files.get(product_level, {})
                     scenes.append({
+                        "id": str(scene_path),
                         "name": entry.name,
                         "path": str(scene_path),
                         "has_shp": has_shp,
                         "shp_file": shp_file,
-                        "mtl_file": mtl_file,
-                        "qa_band": qa_band,
-                        "qa_radsat_band": qa_radsat_band,
+                        "mtl_file": scene_files.get("mtl_file"),
+                        "qa_band": scene_files.get("qa_band"),
+                        "qa_radsat_band": scene_files.get("qa_radsat_band"),
                         "product_level": product_level,
+                        "available_product_levels": available_product_levels,
+                        "product_files": product_files,
                     })
         except PermissionError:
             raise HTTPException(status_code=403, detail=f"无权限访问目录: {target}")
         except OSError as exc:
             raise HTTPException(status_code=500, detail=f"读取目录失败: {exc}")
-        scenes.sort(key=lambda s: s["name"].lower())
+        scenes.sort(key=lambda s: (s["name"].lower(), s["path"].lower()))
         return {"scenes": scenes, "total": len(scenes), "root": str(target)}
 
     @app.post("/preview_raster")

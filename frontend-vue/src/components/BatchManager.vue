@@ -142,7 +142,7 @@
                   </div>
                   <div class="scene-list">
                     <label v-for="scene in state.editingParams.scenes" :key="scene.path" class="scene-item">
-                      <input type="checkbox" :value="scene.name" v-model="state.editingParams.selectedScenes" />
+                      <input type="checkbox" :value="getSceneSelectionKey(scene)" v-model="state.editingParams.selectedScenes" />
                       <div class="scene-item-info">
                         <span class="scene-name">{{ scene.name }}</span>
                         <span class="shp-badge" :class="scene.has_shp ? 'has' : 'none'">
@@ -214,7 +214,7 @@
                   </div>
                   <div class="scene-list">
                     <label v-for="scene in state.editingParams.scenes" :key="scene.path" class="scene-item">
-                      <input type="checkbox" :value="scene.name" v-model="state.editingParams.selectedScenes" />
+                      <input type="checkbox" :value="getSceneSelectionKey(scene)" v-model="state.editingParams.selectedScenes" />
                       <div class="scene-item-info">
                         <span class="scene-name">{{ scene.name }}</span>
                         <span class="shp-badge" :class="scene.has_shp ? 'has' : 'none'">
@@ -545,10 +545,53 @@ const compositeGroups = [
   ]},
 ]
 
+function getSceneSelectionKey(scene) {
+  return scene?.id || scene?.path || scene?.name || ''
+}
+
+function getAllSceneSelectionKeys(scenes = []) {
+  return scenes
+    .map(scene => getSceneSelectionKey(scene))
+    .filter(Boolean)
+}
+
+function normalizeSceneSelections(selectedScenes, scenes = []) {
+  const selected = new Set(Array.isArray(selectedScenes) ? selectedScenes : [])
+  if (!selected.size || !scenes.length) return []
+
+  const normalized = new Set()
+  for (const scene of scenes) {
+    const key = getSceneSelectionKey(scene)
+    if (!key) continue
+    if (selected.has(key) || selected.has(scene.path) || selected.has(scene.name)) {
+      normalized.add(key)
+    }
+  }
+  return Array.from(normalized)
+}
+
+function syncSceneSelections(params, { defaultToAll = false } = {}) {
+  const scenes = params?.scenes || []
+  if (!scenes.length) return
+
+  if (Array.isArray(params.selectedScenes)) {
+    const normalized = normalizeSceneSelections(params.selectedScenes, scenes)
+    params.selectedScenes =
+      normalized.length || params.selectedScenes.length === 0
+        ? normalized
+        : (defaultToAll ? getAllSceneSelectionKeys(scenes) : [])
+    return
+  }
+
+  if (defaultToAll) {
+    params.selectedScenes = getAllSceneSelectionKeys(scenes)
+  }
+}
+
 // ─── 场景列表操作 ─────────────────────────────────────────
 function selectAllScenes() {
   if (state.editingParams.scenes) {
-    state.editingParams.selectedScenes = state.editingParams.scenes.map(s => s.name)
+    state.editingParams.selectedScenes = getAllSceneSelectionKeys(state.editingParams.scenes)
   }
 }
 function selectNoneScenes() {
@@ -645,6 +688,9 @@ function onDrop(event) {
 function onNodeClick({ node }) {
   state.selectedNode = node
   state.editingParams = JSON.parse(JSON.stringify(node.data))
+  if (node.type === 'datadir') {
+    syncSceneSelections(state.editingParams, { defaultToAll: true })
+  }
 
   // InputNode：若上游连接了 DataDirNode，直接注入其场景列表
   if (node.type === 'input') {
@@ -654,11 +700,22 @@ function onNodeClick({ node }) {
       : null
     if (dataDirNode?.data.scenes?.length) {
       state.editingParams.scenes = dataDirNode.data.scenes
-      state.editingParams.selectedScenes =
-        node.data.selectedScenes?.length
-          ? node.data.selectedScenes
-          : dataDirNode.data.scenes.map(s => s.name)
+      if (Array.isArray(node.data.selectedScenes)) {
+        state.editingParams.selectedScenes = normalizeSceneSelections(node.data.selectedScenes, dataDirNode.data.scenes)
+      } else {
+        state.editingParams.selectedScenes = Array.isArray(dataDirNode.data.selectedScenes)
+          ? normalizeSceneSelections(dataDirNode.data.selectedScenes, dataDirNode.data.scenes)
+          : getAllSceneSelectionKeys(dataDirNode.data.scenes)
+      }
+      if (
+        !state.editingParams.selectedScenes.length
+        && !Array.isArray(node.data.selectedScenes)
+        && !Array.isArray(dataDirNode.data.selectedScenes)
+      ) {
+        state.editingParams.selectedScenes = getAllSceneSelectionKeys(dataDirNode.data.scenes)
+      }
     }
+    syncSceneSelections(state.editingParams, { defaultToAll: true })
   }
 
   state.showSidePanel = true
@@ -690,6 +747,7 @@ async function saveNodeParams() {
   if (!state.selectedNode) return
   const node = state.nodes.find(n => n.id === state.selectedNode.id)
   if (node) {
+    syncSceneSelections(state.editingParams)
     Object.assign(node.data, state.editingParams)
     // DataDirNode 保存后自动扫描并传递到 InputNode
     if (node.type === 'datadir' && node.data.root_dir) {
@@ -702,7 +760,7 @@ async function saveNodeParams() {
         ? state.nodes.find(n => n.id === upstreamEdge.source && n.type === 'datadir')
         : null
       if (dataDirNode) {
-        dataDirNode.data.selectedScenes = state.editingParams.selectedScenes || []
+        dataDirNode.data.selectedScenes = [...(node.data.selectedScenes || [])]
       }
     }
   }
@@ -713,18 +771,38 @@ async function scanAndPropagateScenes(dataDirNodeId) {
   const dataDirNode = state.nodes.find(n => n.id === dataDirNodeId)
   if (!dataDirNode?.data.root_dir) return
   try {
+    const previousDataDirSelections = Array.isArray(dataDirNode.data.selectedScenes)
+      ? [...dataDirNode.data.selectedScenes]
+      : null
     const resp = await fetch(`${props.apiBase}/filesystem/scan_scenes?path=${encodeURIComponent(dataDirNode.data.root_dir)}`)
     if (!resp.ok) return
     const data = await resp.json()
     dataDirNode.data.scenes = data.scenes
-    dataDirNode.data.selectedScenes = data.scenes.map(s => s.name) // 默认全选
+    dataDirNode.data.selectedScenes = Array.isArray(previousDataDirSelections)
+      ? (() => {
+          const normalized = normalizeSceneSelections(previousDataDirSelections, data.scenes)
+          return normalized.length || previousDataDirSelections.length === 0
+            ? normalized
+            : getAllSceneSelectionKeys(data.scenes)
+        })()
+      : getAllSceneSelectionKeys(data.scenes)
     // 找到 DataDirNode 的直接下游 InputNode
     const edge = state.edges.find(e => e.source === dataDirNodeId)
     if (edge) {
       const inputNode = state.nodes.find(n => n.id === edge.target && n.type === 'input')
       if (inputNode) {
+        const previousInputSelections = Array.isArray(inputNode.data.selectedScenes)
+          ? [...inputNode.data.selectedScenes]
+          : null
         inputNode.data.scenes = data.scenes
-        inputNode.data.selectedScenes = data.scenes.map(s => s.name)
+        inputNode.data.selectedScenes = Array.isArray(previousInputSelections)
+          ? (() => {
+              const normalized = normalizeSceneSelections(previousInputSelections, data.scenes)
+              return normalized.length || previousInputSelections.length === 0
+                ? normalized
+                : [...dataDirNode.data.selectedScenes]
+            })()
+          : [...dataDirNode.data.selectedScenes]
         const levels = [...new Set(data.scenes.map(s => s.product_level).filter(Boolean))]
         if (levels.length === 1) inputNode.data.product_level = levels[0]
       }
