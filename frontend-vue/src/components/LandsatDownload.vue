@@ -15,6 +15,13 @@ import { fromLonLat, transformExtent } from 'ol/proj'
 const DOWNLOAD_MAX_RETRIES = 3
 const DOWNLOAD_RETRY_DELAYS = [2000, 5000, 10000]
 const ACTIVE_DOWNLOAD_STATUSES = ['pending', 'downloading', 'retrying']
+const TERMINAL_DOWNLOAD_STATUSES = ['completed', 'failed', 'cancelled']
+const HISTORY_STATUS_FILTERS = [
+  { value: 'all', label: '全部历史' },
+  { value: 'failed', label: '仅失败' },
+  { value: 'completed', label: '仅完成' },
+  { value: 'cancelled', label: '仅取消' },
+]
 const RETRYABLE_DOWNLOAD_PATTERNS = [
   /peer closed connection/i,
   /incomplete message body/i,
@@ -28,6 +35,10 @@ const RETRYABLE_DOWNLOAD_PATTERNS = [
   /连接中断/,
   /服务器断线/,
 ]
+
+function createTaskPanelState() {
+  return { keyword: '', historyStatus: 'all', historyOpen: false, expandedGroups: {} }
+}
 
 const props = defineProps({ apiBase: { type: String, required: true } })
 const emit = defineEmits(['toast'])
@@ -62,7 +73,11 @@ const state = reactive({
   serverTasks: [],
   localTasks: {},
   localQueue: [],
-  localBusy: false
+  localBusy: false,
+  taskPanels: {
+    local: createTaskPanelState(),
+    server: createTaskPanelState(),
+  }
 })
 
 const aoiSource = new VectorSource()
@@ -78,6 +93,8 @@ const localTaskList = computed(() => Object.values(state.localTasks).sort((a, b)
 const localActiveCount = computed(() => localTaskList.value.filter((task) => ACTIVE_DOWNLOAD_STATUSES.includes(task.status)).length)
 const serverActiveCount = computed(() => state.serverTasks.filter((task) => ACTIVE_DOWNLOAD_STATUSES.includes(task.status)).length)
 const selectedModalAssetCount = computed(() => Object.values(state.modalAssets).filter(Boolean).length)
+const localPanel = computed(() => buildTaskPanelData(localTaskList.value, state.taskPanels.local))
+const serverPanel = computed(() => buildTaskPanelData(state.serverTasks, state.taskPanels.server))
 
 function offsetDay(days) { const d = new Date(); d.setDate(d.getDate() + days); return d.toISOString().slice(0, 10) }
 function apiBase() { return (props.apiBase || '').trim().replace(/\/+$/, '') || 'http://127.0.0.1:5001' }
@@ -101,6 +118,63 @@ function createAbortError() { const error = new Error('The operation was aborted
 function isAbortError(error) { return error?.name === 'AbortError' }
 function isRetryableDownloadError(error) { if (!error || isAbortError(error)) return false; if (error instanceof TypeError) return true; const message = normalizeErrorMessage(error); return RETRYABLE_DOWNLOAD_PATTERNS.some((pattern) => pattern.test(message)) }
 function resetLocalTaskProgress(task) { task.progress = 0; task.size_total = 0; task.size_downloaded = 0 }
+function normalizeTaskKeyword(value) { return String(value || '').trim().toLowerCase() }
+function taskMatchesKeyword(task, keyword) {
+  if (!keyword) return true
+  return [task.scene_id, task.filename, task.band].some((value) => normalizeTaskKeyword(value).includes(keyword))
+}
+function buildTaskPanelData(tasks, panelState) {
+  const keyword = normalizeTaskKeyword(panelState.keyword)
+  const activeTasks = tasks.filter((task) => ACTIVE_DOWNLOAD_STATUSES.includes(task.status) && taskMatchesKeyword(task, keyword))
+  const historyTasks = tasks.filter((task) => TERMINAL_DOWNLOAD_STATUSES.includes(task.status) && taskMatchesKeyword(task, keyword) && (panelState.historyStatus === 'all' || task.status === panelState.historyStatus))
+  const activeGroups = buildSceneTaskGroups(activeTasks)
+  const historyGroups = buildSceneTaskGroups(historyTasks)
+  return {
+    activeGroups,
+    historyGroups,
+    activeTaskCount: activeTasks.length,
+    historyTaskCount: historyTasks.length,
+    activeGroupCount: activeGroups.length,
+    historyGroupCount: historyGroups.length,
+  }
+}
+function buildSceneTaskGroups(tasks) {
+  const groups = []
+  const byScene = new Map()
+  tasks.forEach((task) => {
+    const sceneId = task.scene_id || '--'
+    let group = byScene.get(sceneId)
+    if (!group) {
+      group = { sceneId, tasks: [], levels: new Set(), fileCount: 0, activeCount: 0, failedCount: 0 }
+      byScene.set(sceneId, group)
+      groups.push(group)
+    }
+    group.tasks.push(task)
+    group.fileCount += 1
+    if (task.level) group.levels.add(task.level)
+    if (ACTIVE_DOWNLOAD_STATUSES.includes(task.status)) group.activeCount += 1
+    if (task.status === 'failed') group.failedCount += 1
+  })
+  return groups.map((group) => ({
+    ...group,
+    levels: Array.from(group.levels).sort((a, b) => a.localeCompare(b, 'en')),
+  }))
+}
+function panelGroupKey(kind, sceneId) { return `${kind}:${sceneId}` }
+function isGroupExpanded(panelKey, kind, sceneId) {
+  const value = state.taskPanels[panelKey].expandedGroups[panelGroupKey(kind, sceneId)]
+  return value === undefined ? kind === 'active' : value
+}
+function toggleGroup(panelKey, kind, sceneId) {
+  const key = panelGroupKey(kind, sceneId)
+  state.taskPanels[panelKey].expandedGroups[key] = !isGroupExpanded(panelKey, kind, sceneId)
+}
+function toggleHistory(panelKey) { state.taskPanels[panelKey].historyOpen = !state.taskPanels[panelKey].historyOpen }
+function activeEmptyText(panelKey) { return normalizeTaskKeyword(state.taskPanels[panelKey].keyword) ? '没有匹配的进行中任务。' : '暂无进行中任务。' }
+function historyEmptyText(panelKey) {
+  const panelState = state.taskPanels[panelKey]
+  return normalizeTaskKeyword(panelState.keyword) || panelState.historyStatus !== 'all' ? '没有匹配的历史任务。' : '暂无历史任务。'
+}
 
 async function request(path, options = {}) {
   const response = await fetch(`${apiBase()}${path}`, options)
@@ -236,8 +310,242 @@ onBeforeUnmount(() => { stopServerPoll(); removeDraw(); Object.values(state.loca
       </article>
       <article class="card span-all">
         <div class="task-columns">
-          <section><div class="head"><div><h3>浏览器下载</h3><p>{{ localActiveCount }} 个进行中</p></div><button class="btn sub" type="button" @click="clearLocal">清理已完成</button></div><div v-if="!localTaskList.length" class="empty small">暂无浏览器下载任务。</div><div v-else class="task-list"><article v-for="task in localTaskList" :key="task.id" class="task-card"><div class="between"><div><strong>{{ task.filename }}</strong><p>{{ task.scene_id }} / {{ task.level || '--' }} / {{ task.band }}</p><p v-if="retryText(task)">{{ retryText(task) }}</p></div><span class="status" :class="statusClass(task.status)">{{ statusLabel(task.status) }}</span></div><div class="progress"><div class="fill" :style="{ width: `${task.progress}%` }"></div></div><div class="between"><span>{{ sizeText(task.size_downloaded, task.size_total) }}</span><button v-if="ACTIVE_DOWNLOAD_STATUSES.includes(task.status)" class="btn sub tiny" type="button" @click="cancelLocal(task.id)">取消</button></div><p v-if="task.error" class="error">{{ task.error }}</p><p v-if="detailErrorText(task)" class="error error-detail">{{ detailErrorText(task) }}</p></article></div></section>
-          <section><div class="head"><div><h3>服务端下载</h3><p>{{ serverActiveCount }} 个进行中</p><p v-if="state.downloadRoot" class="root-hint">{{ state.downloadRoot }}</p></div><button class="btn sub" type="button" @click="clearServer">清理终态任务</button></div><div v-if="!state.serverTasks.length" class="empty small">暂无服务端下载任务。</div><div v-else class="task-list"><article v-for="task in state.serverTasks" :key="task.id" class="task-card"><div class="between"><div><strong>{{ task.filename }}</strong><p>{{ task.scene_id }} / {{ task.level || '--' }} / {{ task.band }}</p><p v-if="task.download_date">目录：{{ task.download_date }}/{{ task.level || '--' }}/{{ task.scene_id }}</p><p v-if="retryText(task)">{{ retryText(task) }}</p></div><span class="status" :class="statusClass(task.status)">{{ statusLabel(task.status) }}</span></div><div class="progress"><div class="fill" :style="{ width: `${task.progress || 0}%` }"></div></div><div class="between"><span>{{ sizeText(task.size_downloaded || 0, task.size_total || 0) }}</span><div class="row"><button v-if="task.status === 'completed'" class="btn sub tiny" type="button" @click="saveServer(task)">保存到本地</button><button v-if="ACTIVE_DOWNLOAD_STATUSES.includes(task.status)" class="btn sub tiny" type="button" @click="cancelServer(task.id)">取消</button></div></div><p v-if="task.error" class="error">{{ task.error }}</p><p v-if="detailErrorText(task)" class="error error-detail">{{ detailErrorText(task) }}</p></article></div></section>
+          <section class="task-column">
+            <div class="task-column-top">
+              <div class="head task-head">
+                <div class="task-head-copy">
+                  <h3>浏览器下载</h3>
+                  <p>{{ localActiveCount }} 个进行中 · {{ localTaskList.length }} 个总任务</p>
+                </div>
+                <button class="btn sub" type="button" @click="clearLocal">清理终态任务</button>
+              </div>
+              <p class="task-column-hint placeholder" aria-hidden="true">下载根目录占位</p>
+            </div>
+            <div class="task-toolbar">
+              <input v-model.trim="state.taskPanels.local.keyword" type="text" placeholder="筛选 scene / 文件 / band" />
+              <select v-model="state.taskPanels.local.historyStatus">
+                <option v-for="option in HISTORY_STATUS_FILTERS" :key="option.value" :value="option.value">{{ option.label }}</option>
+              </select>
+            </div>
+            <article class="task-section">
+              <div class="task-section-head">
+                <div>
+                  <h4>进行中</h4>
+                  <p>{{ localPanel.activeGroupCount }} 景，{{ localPanel.activeTaskCount }} 个任务</p>
+                </div>
+              </div>
+              <div v-if="!localPanel.activeGroups.length" class="empty small">{{ activeEmptyText('local') }}</div>
+              <div v-else class="task-groups">
+                <article v-for="group in localPanel.activeGroups" :key="`local-active-${group.sceneId}`" class="task-group">
+                  <button class="task-group-toggle" type="button" @click="toggleGroup('local', 'active', group.sceneId)">
+                    <div class="task-group-main">
+                      <div class="task-group-title">
+                        <strong>{{ group.sceneId }}</strong>
+                        <div class="task-group-levels">
+                          <span v-for="level in group.levels" :key="level" class="badge" :class="`level-${level.toLowerCase()}`">{{ level }}</span>
+                        </div>
+                      </div>
+                      <div class="task-group-stats">
+                        <span>{{ group.fileCount }} 文件</span>
+                        <span>{{ group.activeCount }} 进行中</span>
+                        <span v-if="group.failedCount">{{ group.failedCount }} 失败</span>
+                      </div>
+                    </div>
+                    <span class="task-toggle-label">{{ isGroupExpanded('local', 'active', group.sceneId) ? '收起' : '展开' }}</span>
+                  </button>
+                  <div v-if="isGroupExpanded('local', 'active', group.sceneId)" class="task-group-body">
+                    <article v-for="task in group.tasks" :key="task.id" class="task-card compact">
+                      <div class="between">
+                        <div>
+                          <strong>{{ task.filename }}</strong>
+                          <p>{{ task.scene_id }} / {{ task.level || '--' }} / {{ task.band }}</p>
+                          <p v-if="retryText(task)">{{ retryText(task) }}</p>
+                        </div>
+                        <span class="status" :class="statusClass(task.status)">{{ statusLabel(task.status) }}</span>
+                      </div>
+                      <div class="progress"><div class="fill" :style="{ width: `${task.progress}%` }"></div></div>
+                      <div class="between">
+                        <span>{{ sizeText(task.size_downloaded, task.size_total) }}</span>
+                        <button v-if="ACTIVE_DOWNLOAD_STATUSES.includes(task.status)" class="btn sub tiny" type="button" @click="cancelLocal(task.id)">取消</button>
+                      </div>
+                      <p v-if="task.error" class="error">{{ task.error }}</p>
+                      <p v-if="detailErrorText(task)" class="error error-detail">{{ detailErrorText(task) }}</p>
+                    </article>
+                  </div>
+                </article>
+              </div>
+            </article>
+            <article class="task-section history-section">
+              <div class="task-section-head">
+                <div>
+                  <h4>历史</h4>
+                  <p>{{ localPanel.historyGroupCount }} 景，{{ localPanel.historyTaskCount }} 个任务</p>
+                </div>
+                <button class="btn sub tiny" type="button" @click="toggleHistory('local')">{{ state.taskPanels.local.historyOpen ? '收起历史' : '展开历史' }}</button>
+              </div>
+              <div v-if="!localPanel.historyGroups.length" class="empty small">{{ historyEmptyText('local') }}</div>
+              <div v-else-if="!state.taskPanels.local.historyOpen" class="task-collapsed-hint">历史区已折叠，当前共 {{ localPanel.historyGroupCount }} 景 / {{ localPanel.historyTaskCount }} 个任务。</div>
+              <div v-else class="task-history-scroll">
+                <div class="task-groups">
+                  <article v-for="group in localPanel.historyGroups" :key="`local-history-${group.sceneId}`" class="task-group">
+                    <button class="task-group-toggle" type="button" @click="toggleGroup('local', 'history', group.sceneId)">
+                      <div class="task-group-main">
+                        <div class="task-group-title">
+                          <strong>{{ group.sceneId }}</strong>
+                          <div class="task-group-levels">
+                            <span v-for="level in group.levels" :key="level" class="badge" :class="`level-${level.toLowerCase()}`">{{ level }}</span>
+                          </div>
+                        </div>
+                        <div class="task-group-stats">
+                          <span>{{ group.fileCount }} 文件</span>
+                          <span v-if="group.failedCount">{{ group.failedCount }} 失败</span>
+                        </div>
+                      </div>
+                      <span class="task-toggle-label">{{ isGroupExpanded('local', 'history', group.sceneId) ? '收起' : '展开' }}</span>
+                    </button>
+                    <div v-if="isGroupExpanded('local', 'history', group.sceneId)" class="task-group-body">
+                      <article v-for="task in group.tasks" :key="task.id" class="task-card compact">
+                        <div class="between">
+                          <div>
+                            <strong>{{ task.filename }}</strong>
+                            <p>{{ task.scene_id }} / {{ task.level || '--' }} / {{ task.band }}</p>
+                            <p v-if="retryText(task)">{{ retryText(task) }}</p>
+                          </div>
+                          <span class="status" :class="statusClass(task.status)">{{ statusLabel(task.status) }}</span>
+                        </div>
+                        <div class="progress"><div class="fill" :style="{ width: `${task.progress}%` }"></div></div>
+                        <div class="between"><span>{{ sizeText(task.size_downloaded, task.size_total) }}</span></div>
+                        <p v-if="task.error" class="error">{{ task.error }}</p>
+                        <p v-if="detailErrorText(task)" class="error error-detail">{{ detailErrorText(task) }}</p>
+                      </article>
+                    </div>
+                  </article>
+                </div>
+              </div>
+            </article>
+          </section>
+          <section class="task-column">
+            <div class="task-column-top">
+              <div class="head task-head">
+                <div class="task-head-copy">
+                  <h3>服务端下载</h3>
+                  <p>{{ serverActiveCount }} 个进行中 · {{ state.serverTasks.length }} 个总任务</p>
+                </div>
+                <button class="btn sub" type="button" @click="clearServer">清理终态任务</button>
+              </div>
+              <p class="task-column-hint" :class="{ placeholder: !state.downloadRoot }" :title="state.downloadRoot || ''">{{ state.downloadRoot || '下载根目录未设置' }}</p>
+            </div>
+            <div class="task-toolbar">
+              <input v-model.trim="state.taskPanels.server.keyword" type="text" placeholder="筛选 scene / 文件 / band" />
+              <select v-model="state.taskPanels.server.historyStatus">
+                <option v-for="option in HISTORY_STATUS_FILTERS" :key="option.value" :value="option.value">{{ option.label }}</option>
+              </select>
+            </div>
+            <article class="task-section">
+              <div class="task-section-head">
+                <div>
+                  <h4>进行中</h4>
+                  <p>{{ serverPanel.activeGroupCount }} 景，{{ serverPanel.activeTaskCount }} 个任务</p>
+                </div>
+              </div>
+              <div v-if="!serverPanel.activeGroups.length" class="empty small">{{ activeEmptyText('server') }}</div>
+              <div v-else class="task-groups">
+                <article v-for="group in serverPanel.activeGroups" :key="`server-active-${group.sceneId}`" class="task-group">
+                  <button class="task-group-toggle" type="button" @click="toggleGroup('server', 'active', group.sceneId)">
+                    <div class="task-group-main">
+                      <div class="task-group-title">
+                        <strong>{{ group.sceneId }}</strong>
+                        <div class="task-group-levels">
+                          <span v-for="level in group.levels" :key="level" class="badge" :class="`level-${level.toLowerCase()}`">{{ level }}</span>
+                        </div>
+                      </div>
+                      <div class="task-group-stats">
+                        <span>{{ group.fileCount }} 文件</span>
+                        <span>{{ group.activeCount }} 进行中</span>
+                        <span v-if="group.failedCount">{{ group.failedCount }} 失败</span>
+                      </div>
+                    </div>
+                    <span class="task-toggle-label">{{ isGroupExpanded('server', 'active', group.sceneId) ? '收起' : '展开' }}</span>
+                  </button>
+                  <div v-if="isGroupExpanded('server', 'active', group.sceneId)" class="task-group-body">
+                    <article v-for="task in group.tasks" :key="task.id" class="task-card compact">
+                      <div class="between">
+                        <div>
+                          <strong>{{ task.filename }}</strong>
+                          <p>{{ task.scene_id }} / {{ task.level || '--' }} / {{ task.band }}</p>
+                          <p v-if="task.download_date">目录：{{ task.download_date }}/{{ task.level || '--' }}/{{ task.scene_id }}</p>
+                          <p v-if="retryText(task)">{{ retryText(task) }}</p>
+                        </div>
+                        <span class="status" :class="statusClass(task.status)">{{ statusLabel(task.status) }}</span>
+                      </div>
+                      <div class="progress"><div class="fill" :style="{ width: `${task.progress || 0}%` }"></div></div>
+                      <div class="between">
+                        <span>{{ sizeText(task.size_downloaded || 0, task.size_total || 0) }}</span>
+                        <div class="row">
+                          <button v-if="task.status === 'completed'" class="btn sub tiny" type="button" @click="saveServer(task)">保存到本地</button>
+                          <button v-if="ACTIVE_DOWNLOAD_STATUSES.includes(task.status)" class="btn sub tiny" type="button" @click="cancelServer(task.id)">取消</button>
+                        </div>
+                      </div>
+                      <p v-if="task.error" class="error">{{ task.error }}</p>
+                      <p v-if="detailErrorText(task)" class="error error-detail">{{ detailErrorText(task) }}</p>
+                    </article>
+                  </div>
+                </article>
+              </div>
+            </article>
+            <article class="task-section history-section">
+              <div class="task-section-head">
+                <div>
+                  <h4>历史</h4>
+                  <p>{{ serverPanel.historyGroupCount }} 景，{{ serverPanel.historyTaskCount }} 个任务</p>
+                </div>
+                <button class="btn sub tiny" type="button" @click="toggleHistory('server')">{{ state.taskPanels.server.historyOpen ? '收起历史' : '展开历史' }}</button>
+              </div>
+              <div v-if="!serverPanel.historyGroups.length" class="empty small">{{ historyEmptyText('server') }}</div>
+              <div v-else-if="!state.taskPanels.server.historyOpen" class="task-collapsed-hint">历史区已折叠，当前共 {{ serverPanel.historyGroupCount }} 景 / {{ serverPanel.historyTaskCount }} 个任务。</div>
+              <div v-else class="task-history-scroll">
+                <div class="task-groups">
+                  <article v-for="group in serverPanel.historyGroups" :key="`server-history-${group.sceneId}`" class="task-group">
+                    <button class="task-group-toggle" type="button" @click="toggleGroup('server', 'history', group.sceneId)">
+                      <div class="task-group-main">
+                        <div class="task-group-title">
+                          <strong>{{ group.sceneId }}</strong>
+                          <div class="task-group-levels">
+                            <span v-for="level in group.levels" :key="level" class="badge" :class="`level-${level.toLowerCase()}`">{{ level }}</span>
+                          </div>
+                        </div>
+                        <div class="task-group-stats">
+                          <span>{{ group.fileCount }} 文件</span>
+                          <span v-if="group.failedCount">{{ group.failedCount }} 失败</span>
+                        </div>
+                      </div>
+                      <span class="task-toggle-label">{{ isGroupExpanded('server', 'history', group.sceneId) ? '收起' : '展开' }}</span>
+                    </button>
+                    <div v-if="isGroupExpanded('server', 'history', group.sceneId)" class="task-group-body">
+                      <article v-for="task in group.tasks" :key="task.id" class="task-card compact">
+                        <div class="between">
+                          <div>
+                            <strong>{{ task.filename }}</strong>
+                            <p>{{ task.scene_id }} / {{ task.level || '--' }} / {{ task.band }}</p>
+                            <p v-if="task.download_date">目录：{{ task.download_date }}/{{ task.level || '--' }}/{{ task.scene_id }}</p>
+                            <p v-if="retryText(task)">{{ retryText(task) }}</p>
+                          </div>
+                          <span class="status" :class="statusClass(task.status)">{{ statusLabel(task.status) }}</span>
+                        </div>
+                        <div class="progress"><div class="fill" :style="{ width: `${task.progress || 0}%` }"></div></div>
+                        <div class="between">
+                          <span>{{ sizeText(task.size_downloaded || 0, task.size_total || 0) }}</span>
+                          <button v-if="task.status === 'completed'" class="btn sub tiny" type="button" @click="saveServer(task)">保存到本地</button>
+                        </div>
+                        <p v-if="task.error" class="error">{{ task.error }}</p>
+                        <p v-if="detailErrorText(task)" class="error error-detail">{{ detailErrorText(task) }}</p>
+                      </article>
+                    </div>
+                  </article>
+                </div>
+              </div>
+            </article>
+          </section>
         </div>
       </article>
     </section>
@@ -322,9 +630,35 @@ onBeforeUnmount(() => { stopServerPoll(); removeDraw(); Object.values(state.loca
 .between small { font-size: 0.65rem; color: var(--muted); }
 
 /* ── Task panel ───────────────────────────────────────────── */
-.task-columns { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0.75rem; }
-.task-list { display: flex; flex-direction: column; gap: 0.4rem; margin-top: 0.5rem; }
+.task-columns { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0.75rem; align-items: start; }
+.task-column { display: flex; flex-direction: column; gap: 0.75rem; min-width: 0; }
+.task-column-top { display: flex; flex-direction: column; gap: 0.3rem; min-width: 0; }
+.task-head { margin-bottom: 0; }
+.task-head-copy { min-width: 0; }
+.task-column-hint { margin: 0; min-height: 1rem; color: var(--muted); font-size: 0.65rem; font-family: var(--mono); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.task-column-hint.placeholder { visibility: hidden; }
+.task-toolbar { display: flex; gap: 0.45rem; flex-wrap: wrap; }
+.task-toolbar input, .task-toolbar select { flex: 1 1 180px; min-width: 0; padding: 0.32rem 0.4rem; border: 1px solid #cdd8d4; border-radius: 6px; background: #fff; color: var(--text); font-size: 0.76rem; font-family: inherit; }
+.task-section { border: 1px solid var(--line); border-radius: 8px; background: #fbfcfb; padding: 0.55rem 0.6rem; }
+.history-section { background: #f6faf8; }
+.task-section-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 0.45rem; flex-wrap: wrap; margin-bottom: 0.45rem; }
+.task-section-head h4 { margin: 0; font-size: 0.78rem; font-family: var(--mono); color: var(--text); }
+.task-section-head p { margin: 2px 0 0; color: var(--muted); font-size: 0.68rem; }
+.task-collapsed-hint { padding: 0.55rem 0.6rem; border: 1px dashed var(--line); border-radius: 6px; background: rgba(255, 255, 255, 0.65); color: var(--muted); font-size: 0.72rem; }
+.task-history-scroll { max-height: 420px; overflow: auto; padding-right: 0.15rem; }
+.task-groups { display: flex; flex-direction: column; gap: 0.45rem; }
+.task-group { border: 1px solid var(--line); border-radius: 8px; background: var(--card); overflow: hidden; }
+.task-group-toggle { width: 100%; display: flex; justify-content: space-between; align-items: flex-start; gap: 0.5rem; padding: 0.52rem 0.6rem; border: 0; background: transparent; cursor: pointer; text-align: left; }
+.task-group-main { display: flex; flex: 1; justify-content: space-between; align-items: flex-start; gap: 0.75rem; flex-wrap: wrap; min-width: 0; }
+.task-group-title { display: flex; flex-direction: column; gap: 0.3rem; min-width: 0; }
+.task-group-title strong { font-size: 0.73rem; color: var(--text); display: block; font-family: var(--mono); word-break: break-all; }
+.task-group-levels { display: flex; gap: 0.25rem; flex-wrap: wrap; }
+.task-group-stats { display: flex; gap: 0.35rem; flex-wrap: wrap; justify-content: flex-end; }
+.task-group-stats span { padding: 2px 8px; border-radius: 999px; border: 1px solid var(--line); background: var(--bg); color: var(--muted); font-size: 0.64rem; white-space: nowrap; }
+.task-toggle-label { padding-top: 2px; color: #355049; font-size: 0.64rem; font-weight: 600; white-space: nowrap; }
+.task-group-body { display: flex; flex-direction: column; gap: 0.35rem; padding: 0 0.55rem 0.55rem 0.9rem; }
 .task-card { padding: 0.5rem 0.6rem; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); }
+.task-card.compact { background: #fff; }
 .task-card strong { font-size: 0.73rem; color: var(--text); display: block; }
 .task-card p { color: var(--muted); font-size: 0.65rem; margin: 1px 0; }
 .progress { height: 6px; margin: 0.35rem 0 0.28rem; border-radius: 999px; background: var(--line); overflow: hidden; }
