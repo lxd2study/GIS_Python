@@ -1,5 +1,6 @@
 """API route definitions."""
 
+import json
 import logging
 import os
 import threading
@@ -8,6 +9,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from osgeo import gdal, ogr, osr
 
 from ..core.config import settings
 from ..core.constants import BAND_INFO, COMPOSITE_MAP
@@ -15,7 +17,11 @@ from ..core.processor import Landsat8Processor
 from ..core.models import (
     BatchSubmitRequest,
     GraphSubmitRequest,
+    ImageryDownloadItem,
+    ImageryDownloadTaskCreateRequest,
+    ImagerySearchRequest,
     LandsatAuthRequest,
+    LandsatDownloadDirRequest,
     LandsatDownloadTaskCreateRequest,
     LandsatProxyRequest,
     LandsatSearchRequest,
@@ -391,6 +397,175 @@ def _optional_allowed_file(path_value: Optional[str], access_label: str) -> Opti
         return None
 
 
+def _detect_vector_upload_kind(files: List[UploadFile]) -> str:
+    suffixes = {Path(upload.filename or "").suffix.lower() for upload in files if upload.filename}
+    if any(suffix in {".geojson", ".json"} for suffix in suffixes):
+        return "geojson"
+    if ".shp" in suffixes:
+        return "shapefile"
+    raise ValueError("请上传 .geojson/.json，或包含 .shp 的 Shapefile 配套文件")
+
+
+def _transform_geometry_to_wgs84(geometry: ogr.Geometry, source_srs: Optional[osr.SpatialReference]) -> ogr.Geometry:
+    cloned = geometry.Clone()
+    if source_srs is None:
+        return cloned
+
+    target_srs = osr.SpatialReference()
+    target_srs.ImportFromEPSG(4326)
+    if source_srs.IsSame(target_srs):
+        return cloned
+
+    source = source_srs.Clone()
+    axis_order = getattr(osr, "OAMS_TRADITIONAL_GIS_ORDER", None)
+    if axis_order is not None and hasattr(source, "SetAxisMappingStrategy") and hasattr(target_srs, "SetAxisMappingStrategy"):
+        if hasattr(source, "GetAxisMappingStrategy") and source.GetAxisMappingStrategy() != axis_order:
+            source.SetAxisMappingStrategy(axis_order)
+        target_srs.SetAxisMappingStrategy(axis_order)
+
+    try:
+        transform = osr.CoordinateTransformation(source, target_srs)
+        cloned.Transform(transform)
+    except Exception as exc:
+        raise ValueError(f"矢量坐标转换到 EPSG:4326 失败: {exc}") from exc
+    return cloned
+
+
+def _vector_dataset_payload(vector_path: str, *, label: str) -> Dict:
+    previous_restore_shx = gdal.GetThreadLocalConfigOption("SHAPE_RESTORE_SHX")
+    gdal.SetThreadLocalConfigOption("SHAPE_RESTORE_SHX", "YES")
+    try:
+        datasource = ogr.Open(vector_path)
+    finally:
+        gdal.SetThreadLocalConfigOption("SHAPE_RESTORE_SHX", previous_restore_shx)
+
+    if datasource is None:
+        raise ValueError(
+            "无法解析矢量文件，请检查 GeoJSON 或 Shapefile 是否完整。"
+            "Shapefile 缺少 .shx 时系统会自动尝试恢复，若仍失败请重新导出并补齐配套文件。"
+        )
+
+    layer = datasource.GetLayer(0)
+    if layer is None:
+        raise ValueError("矢量文件中未找到可用图层")
+
+    source_srs = layer.GetSpatialRef()
+    features = []
+    min_x = min_y = max_x = max_y = None
+    layer.ResetReading()
+
+    for feature in layer:
+        geometry = feature.GetGeometryRef()
+        if geometry is None or geometry.IsEmpty():
+            continue
+
+        geometry_wgs84 = _transform_geometry_to_wgs84(geometry, source_srs)
+        envelope = geometry_wgs84.GetEnvelope()
+        x_min, x_max, y_min, y_max = envelope[0], envelope[1], envelope[2], envelope[3]
+        min_x = x_min if min_x is None else min(min_x, x_min)
+        max_x = x_max if max_x is None else max(max_x, x_max)
+        min_y = y_min if min_y is None else min(min_y, y_min)
+        max_y = y_max if max_y is None else max(max_y, y_max)
+
+        features.append(
+            {
+                "type": "Feature",
+                "properties": dict(feature.items()),
+                "geometry": json.loads(geometry_wgs84.ExportToJson()),
+            }
+        )
+
+    if not features or None in {min_x, min_y, max_x, max_y}:
+        raise ValueError("矢量文件中没有可用几何，无法生成选区")
+
+    return {
+        "label": label,
+        "feature_count": len(features),
+        "bbox": [round(min_x, 6), round(min_y, 6), round(max_x, 6), round(max_y, 6)],
+        "geojson": {
+            "type": "FeatureCollection",
+            "features": features,
+        },
+    }
+
+
+async def _parse_vector_upload(files: List[UploadFile], file_manager: FileManager) -> Dict:
+    if not files:
+        raise ValueError("请至少上传一个矢量文件")
+
+    upload_kind = _detect_vector_upload_kind(files)
+    temp_dir = file_manager.create_temp_dir(prefix="imagery_aoi_")
+    try:
+        if upload_kind == "geojson":
+            geojson_file = next(
+                (upload for upload in files if Path(upload.filename or "").suffix.lower() in {".geojson", ".json"}),
+                None,
+            )
+            if geojson_file is None:
+                raise ValueError("未找到 GeoJSON 文件")
+            target_path = os.path.join(temp_dir, geojson_file.filename or "aoi.geojson")
+            await _save_upload(geojson_file, target_path)
+            payload = _vector_dataset_payload(target_path, label=geojson_file.filename or "AOI GeoJSON")
+            payload["source_type"] = "geojson"
+            return payload
+
+        shape_path = file_manager.save_shapefiles(files, temp_dir)
+        if not shape_path:
+            raise ValueError("Shapefile 解析需要至少包含 .shp 文件")
+        payload = _vector_dataset_payload(shape_path, label=Path(shape_path).name)
+        payload["source_type"] = "shapefile"
+        return payload
+    finally:
+        file_manager.cleanup_temp_dir(temp_dir)
+
+
+def _landsat_collection_payload(collection: Dict) -> Dict:
+    payload = dict(collection)
+    payload["level"] = collection.get("product")
+    return payload
+
+
+def _landsat_scene_payload(scene: Dict) -> Dict:
+    payload = dict(scene)
+    payload["level"] = scene.get("product")
+    return payload
+
+
+def _landsat_task_payload(task: Dict) -> Dict:
+    payload = dict(task)
+    payload["level"] = task.get("product")
+    return payload
+
+
+def _build_imagery_search_request_from_landsat(request: LandsatSearchRequest) -> ImagerySearchRequest:
+    return ImagerySearchRequest(
+        sensor="landsat",
+        product=request.level,
+        bbox=request.bbox,
+        start_date=request.start_date,
+        end_date=request.end_date,
+        max_cloud_cover=request.max_cloud_cover,
+        limit=request.limit,
+    )
+
+
+def _build_imagery_download_request_from_landsat(
+    request: LandsatDownloadTaskCreateRequest,
+) -> ImageryDownloadTaskCreateRequest:
+    items = [
+        ImageryDownloadItem(
+            sensor="landsat",
+            product=item.level,
+            scene_id=item.scene_id,
+            band=item.band,
+            filename=item.filename,
+            url=item.url,
+        )
+        for item in request.items
+    ]
+    return ImageryDownloadTaskCreateRequest(items=items, mode=request.mode)
+
+
 def setup_routes(
     app: FastAPI,
     progress_manager: ProgressManager,
@@ -432,13 +607,27 @@ def setup_routes(
                 "/batch/job/{job_id}/resume",
                 "/batch/job/{job_id}/cancel",
             ],
-            "landsat_download_endpoints": [
+            "imagery_download_endpoints": [
+                "/imagery/collections",
+                "/imagery/search",
+                "/imagery/aoi/parse",
+                "/imagery/auth/status",
+                "/imagery/auth/earthdata",
+                "/imagery/proxy/status",
+                "/imagery/proxy",
+                "/imagery/download_dir",
+                "/imagery/proxy_download",
+                "/imagery/download",
+                "/imagery/download_tasks",
+            ],
+            "landsat_download_compat_endpoints": [
                 "/landsat/collections",
                 "/landsat/search",
                 "/landsat/auth/status",
                 "/landsat/auth/earthdata",
                 "/landsat/proxy/status",
                 "/landsat/proxy",
+                "/landsat/download_dir",
                 "/landsat/proxy_download",
                 "/landsat/download",
                 "/landsat/download_tasks",
@@ -453,9 +642,156 @@ def setup_routes(
             "version": "3.0.0",
         }
 
+    def _download_dir_payload() -> Dict:
+        payload = landsat_download_service.get_download_dir_status()
+        payload["allowed_download_roots"] = PATH_ACCESS.allowed_roots_payload()
+        return payload
+
+    @app.get("/imagery/collections")
+    def imagery_collections() -> Dict:
+        payload = landsat_download_service.list_collections()
+        payload.update(_download_dir_payload())
+        return payload
+
+    @app.get("/imagery/auth/status")
+    def imagery_auth_status() -> Dict:
+        return landsat_download_service.get_auth_status()
+
+    @app.get("/imagery/proxy/status")
+    def imagery_proxy_status() -> Dict:
+        return landsat_download_service.get_proxy_status()
+
+    @app.post("/imagery/auth/earthdata")
+    async def imagery_set_earthdata(request: LandsatAuthRequest) -> Dict:
+        try:
+            return await landsat_download_service.configure_earthdata(request)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        except PermissionError as exc:
+            raise HTTPException(status_code=401, detail=str(exc))
+        except Exception as exc:
+            logger.error("EarthData 认证失败: %s", exc, exc_info=True)
+            raise HTTPException(status_code=500, detail=f"认证失败: {exc}")
+
+    @app.post("/imagery/proxy")
+    def imagery_set_proxy(request: LandsatProxyRequest) -> Dict:
+        try:
+            return landsat_download_service.configure_proxy(request)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        except Exception as exc:
+            logger.error("影像下载代理配置失败: %s", exc, exc_info=True)
+            raise HTTPException(status_code=500, detail=f"代理配置失败: {exc}")
+
+    @app.get("/imagery/download_dir")
+    def imagery_download_dir_status() -> Dict:
+        return _download_dir_payload()
+
+    @app.post("/imagery/download_dir")
+    def imagery_set_download_dir(request: LandsatDownloadDirRequest) -> Dict:
+        raw_download_dir = request.download_dir.strip()
+        try:
+            target_dir = None
+            if raw_download_dir:
+                target_dir = PATH_ACCESS.require_directory(
+                    raw_download_dir,
+                    access_label="写入影像下载目录",
+                    must_exist=False,
+                    allow_create=True,
+                )
+            payload = landsat_download_service.configure_download_dir(target_dir)
+            payload["allowed_download_roots"] = PATH_ACCESS.allowed_roots_payload()
+            return payload
+        except PathAccessError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=str(exc))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        except Exception as exc:
+            logger.error("影像下载目录配置失败: %s", exc, exc_info=True)
+            raise HTTPException(status_code=500, detail=f"下载目录配置失败: {exc}")
+
+    @app.post("/imagery/search")
+    async def imagery_search(request: ImagerySearchRequest) -> Dict:
+        try:
+            return await landsat_download_service.search(request)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        except Exception as exc:
+            logger.error("影像搜索失败: %s", exc, exc_info=True)
+            raise HTTPException(status_code=500, detail=f"搜索失败: {exc}")
+
+    @app.post("/imagery/aoi/parse")
+    async def imagery_parse_aoi(files: List[UploadFile] = File(..., description="GeoJSON 或 Shapefile 配套文件")) -> Dict:
+        try:
+            return await _parse_vector_upload(files, file_manager)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        except Exception as exc:
+            logger.error("解析 AOI 矢量文件失败: %s", exc, exc_info=True)
+            raise HTTPException(status_code=500, detail=f"解析 AOI 失败: {exc}")
+
+    @app.get("/imagery/proxy_download")
+    async def imagery_proxy_download(url: str, filename: str = "imagery_asset.bin"):
+        try:
+            return await landsat_download_service.create_proxy_download_response(url, filename)
+        except PermissionError as exc:
+            raise HTTPException(status_code=401, detail=str(exc))
+        except Exception as exc:
+            logger.error("影像代理下载失败: %s", exc, exc_info=True)
+            raise HTTPException(status_code=500, detail=f"代理下载失败: {exc}")
+
+    @app.post("/imagery/download")
+    async def imagery_create_download(request: ImageryDownloadTaskCreateRequest) -> Dict:
+        try:
+            return await landsat_download_service.create_download_tasks(request)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        except Exception as exc:
+            logger.error("创建影像下载任务失败: %s", exc, exc_info=True)
+            raise HTTPException(status_code=500, detail=f"创建下载任务失败: {exc}")
+
+    @app.get("/imagery/download_tasks")
+    def imagery_list_download_tasks() -> Dict:
+        return landsat_download_service.list_download_tasks()
+
+    @app.get("/imagery/download_tasks/{task_id}")
+    def imagery_get_download_task(task_id: str) -> Dict:
+        task = landsat_download_service.get_download_task(task_id)
+        if not task:
+            raise HTTPException(status_code=404, detail=f"下载任务不存在: {task_id}")
+        return task
+
+    @app.delete("/imagery/download_tasks/completed")
+    def imagery_clear_completed_download_tasks() -> Dict:
+        return landsat_download_service.clear_completed_tasks()
+
+    @app.delete("/imagery/download_tasks/{task_id}")
+    def imagery_cancel_download_task(task_id: str) -> Dict:
+        try:
+            return landsat_download_service.cancel_download_task(task_id)
+        except KeyError:
+            raise HTTPException(status_code=404, detail=f"下载任务不存在: {task_id}")
+
+    @app.get("/imagery/download_tasks/{task_id}/file")
+    async def imagery_download_task_file(task_id: str):
+        try:
+            return await landsat_download_service.build_task_file_response(task_id)
+        except KeyError:
+            raise HTTPException(status_code=404, detail=f"下载任务不存在: {task_id}")
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=f"文件不存在: {exc}")
+        except Exception as exc:
+            logger.error("读取影像下载结果失败: %s", exc, exc_info=True)
+            raise HTTPException(status_code=500, detail=f"读取下载结果失败: {exc}")
+
     @app.get("/landsat/collections")
     def landsat_collections() -> Dict:
-        return landsat_download_service.list_collections()
+        payload = landsat_download_service.list_collections(sensor="landsat")
+        payload.update(_download_dir_payload())
+        payload["collections"] = [_landsat_collection_payload(collection) for collection in payload["collections"]]
+        return payload
 
     @app.get("/landsat/auth/status")
     def landsat_auth_status() -> Dict:
@@ -487,10 +823,41 @@ def setup_routes(
             logger.error("Landsat 代理配置失败: %s", exc, exc_info=True)
             raise HTTPException(status_code=500, detail=f"代理配置失败: {exc}")
 
+    @app.get("/landsat/download_dir")
+    def landsat_download_dir_status() -> Dict:
+        return _download_dir_payload()
+
+    @app.post("/landsat/download_dir")
+    def landsat_set_download_dir(request: LandsatDownloadDirRequest) -> Dict:
+        raw_download_dir = request.download_dir.strip()
+        try:
+            target_dir = None
+            if raw_download_dir:
+                target_dir = PATH_ACCESS.require_directory(
+                    raw_download_dir,
+                    access_label="写入 Landsat 下载目录",
+                    must_exist=False,
+                    allow_create=True,
+                )
+            payload = landsat_download_service.configure_download_dir(target_dir)
+            payload["allowed_download_roots"] = PATH_ACCESS.allowed_roots_payload()
+            return payload
+        except PathAccessError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=str(exc))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        except Exception as exc:
+            logger.error("Landsat 下载目录配置失败: %s", exc, exc_info=True)
+            raise HTTPException(status_code=500, detail=f"下载目录配置失败: {exc}")
+
     @app.post("/landsat/search")
     async def landsat_search(request: LandsatSearchRequest) -> Dict:
         try:
-            return await landsat_download_service.search(request)
+            result = await landsat_download_service.search(_build_imagery_search_request_from_landsat(request))
+            result["items"] = [_landsat_scene_payload(item) for item in result["items"]]
+            return result
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
         except Exception as exc:
             logger.error("Landsat 搜索失败: %s", exc, exc_info=True)
             raise HTTPException(status_code=500, detail=f"搜索失败: {exc}")
@@ -516,37 +883,42 @@ def setup_routes(
     @app.post("/landsat/download")
     async def landsat_create_download(request: LandsatDownloadTaskCreateRequest) -> Dict:
         try:
-            return await landsat_download_service.create_download_tasks(request)
+            imagery_request = _build_imagery_download_request_from_landsat(request)
+            return await landsat_download_service.create_download_tasks(imagery_request)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
         except Exception as exc:
             logger.error("创建 Landsat 下载任务失败: %s", exc, exc_info=True)
             raise HTTPException(status_code=500, detail=f"创建下载任务失败: {exc}")
 
     @app.get("/landsat/download_tasks")
     def landsat_list_download_tasks() -> Dict:
-        return landsat_download_service.list_download_tasks()
+        payload = landsat_download_service.list_download_tasks(sensor="landsat")
+        payload["tasks"] = [_landsat_task_payload(task) for task in payload["tasks"]]
+        return payload
 
     @app.get("/landsat/download_tasks/{task_id}")
     def landsat_get_download_task(task_id: str) -> Dict:
-        task = landsat_download_service.get_download_task(task_id)
+        task = landsat_download_service.get_download_task(task_id, sensor="landsat")
         if not task:
             raise HTTPException(status_code=404, detail=f"下载任务不存在: {task_id}")
-        return task
+        return _landsat_task_payload(task)
 
     @app.delete("/landsat/download_tasks/completed")
     def landsat_clear_completed_download_tasks() -> Dict:
-        return landsat_download_service.clear_completed_tasks()
+        return landsat_download_service.clear_completed_tasks(sensor="landsat")
 
     @app.delete("/landsat/download_tasks/{task_id}")
     def landsat_cancel_download_task(task_id: str) -> Dict:
         try:
-            return landsat_download_service.cancel_download_task(task_id)
+            return landsat_download_service.cancel_download_task(task_id, sensor="landsat")
         except KeyError:
             raise HTTPException(status_code=404, detail=f"下载任务不存在: {task_id}")
 
     @app.get("/landsat/download_tasks/{task_id}/file")
     async def landsat_download_task_file(task_id: str):
         try:
-            return await landsat_download_service.build_task_file_response(task_id)
+            return await landsat_download_service.build_task_file_response(task_id, sensor="landsat")
         except KeyError:
             raise HTTPException(status_code=404, detail=f"下载任务不存在: {task_id}")
         except ValueError as exc:

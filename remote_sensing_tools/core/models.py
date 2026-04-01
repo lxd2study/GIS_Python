@@ -236,6 +236,35 @@ class BatchStatusResponse(BaseModel):
     jobs: List[BatchJob]
 
 
+class ImagerySearchRequest(BaseModel):
+    """通用影像场景检索请求。"""
+    sensor: str = Field("landsat", min_length=1, description="传感器类型，例如 landsat、sentinel-2")
+    product: str = Field("L2", min_length=1, description="产品级别，例如 L1、L2、L2A")
+    bbox: List[float] = Field(..., min_length=4, max_length=4, description="[west, south, east, north]")
+    start_date: str = Field(..., description="开始日期 YYYY-MM-DD")
+    end_date: str = Field(..., description="结束日期 YYYY-MM-DD")
+    max_cloud_cover: int = Field(100, ge=0, le=100, description="最大云量百分比")
+    limit: int = Field(20, ge=1, le=100, description="最大返回景数")
+
+
+class ImageryDownloadItem(BaseModel):
+    """单个通用影像资产下载项。"""
+    sensor: str = Field(..., min_length=1, description="传感器类型")
+    product: Optional[str] = Field(None, description="产品级别")
+    scene_id: str = Field(..., description="场景 ID")
+    band: str = Field(..., description="资产键")
+    filename: str = Field(..., description="建议保存文件名")
+    url: str = Field(..., description="资产 URL")
+    collection: Optional[str] = Field(None, description="来源 STAC collection")
+    auth_required: Optional[bool] = Field(None, description="是否需要额外认证")
+
+
+class ImageryDownloadTaskCreateRequest(BaseModel):
+    """批量创建通用影像下载任务请求。"""
+    items: List[ImageryDownloadItem] = Field(..., description="待下载资产列表")
+    mode: str = Field("server", pattern="^(local|server)$", description="下载模式")
+
+
 class LandsatSearchRequest(BaseModel):
     """Landsat 场景检索请求。"""
     bbox: List[float] = Field(..., min_length=4, max_length=4, description="[west, south, east, north]")
@@ -272,3 +301,8 @@ class LandsatProxyRequest(BaseModel):
     enabled: bool = Field(True, description="是否启用代理")
     proxy_url: str = Field("", description="代理地址，例如 http://127.0.0.1:7890")
     no_proxy: str = Field("", description="直连地址列表，使用逗号分隔")
+
+
+class LandsatDownloadDirRequest(BaseModel):
+    """Landsat 服务端下载目录配置请求。"""
+    download_dir: str = Field("", description="服务端下载根目录。留空时恢复默认目录")

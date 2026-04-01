@@ -7,6 +7,7 @@ import VectorLayer from 'ol/layer/Vector'
 import VectorSource from 'ol/source/Vector'
 import XYZ from 'ol/source/XYZ'
 import Draw, { createBox } from 'ol/interaction/Draw'
+import GeoJSON from 'ol/format/GeoJSON'
 import Feature from 'ol/Feature'
 import { fromExtent as polygonFromExtent } from 'ol/geom/Polygon'
 import { Fill, Stroke, Style } from 'ol/style'
@@ -14,6 +15,7 @@ import { fromLonLat, transformExtent } from 'ol/proj'
 
 const DOWNLOAD_MAX_RETRIES = 3
 const DOWNLOAD_RETRY_DELAYS = [2000, 5000, 10000]
+const SERVER_ACTIVE_POLL_MS = 2000
 const ACTIVE_DOWNLOAD_STATUSES = ['pending', 'downloading', 'retrying']
 const TERMINAL_DOWNLOAD_STATUSES = ['completed', 'failed', 'cancelled']
 const HISTORY_STATUS_FILTERS = [
@@ -35,6 +37,28 @@ const RETRYABLE_DOWNLOAD_PATTERNS = [
   /连接中断/,
   /服务器断线/,
 ]
+const SENSOR_LABELS = {
+  landsat: 'Landsat',
+  'sentinel-2': 'Sentinel-2',
+}
+const PRODUCT_PRESETS = {
+  landsat: {
+    L1: {
+      rgb: ['B4', 'B3', 'B2'],
+      vegetation: ['B5', 'B4', 'B3'],
+    },
+    L2: {
+      rgb: ['red', 'green', 'blue'],
+      vegetation: ['nir08', 'red', 'green'],
+    },
+  },
+  'sentinel-2': {
+    L2A: {
+      rgb: ['B04', 'B03', 'B02'],
+      vegetation: ['B08', 'B04', 'B03'],
+    },
+  },
+}
 
 function createTaskPanelState() {
   return { keyword: '', historyStatus: 'all', historyOpen: false, expandedGroups: {} }
@@ -43,18 +67,27 @@ function createTaskPanelState() {
 const props = defineProps({ apiBase: { type: String, required: true } })
 const emit = defineEmits(['toast'])
 const mapTarget = ref(null)
+const aoiFileInput = ref(null)
+const geoJsonFormat = new GeoJSON()
 
 const state = reactive({
   collections: [],
   downloadRoot: '',
+  defaultDownloadRoot: '',
+  allowedDownloadRoots: [],
   authStatus: { configured: false, username: '' },
   proxyStatus: { enabled: false, configured: false, proxy_url: '', no_proxy: '' },
-  level: 'L2',
+  sensor: 'landsat',
+  product: 'L2',
   startDate: offsetDay(-90),
   endDate: offsetDay(0),
   maxCloudCover: 20,
   limit: 20,
   bbox: null,
+  aoiLabel: '',
+  aoiFeatureCount: 0,
+  aoiSourceType: '',
+  aoiParsing: false,
   searchLoading: false,
   searchResults: [],
   selectedScenes: {},
@@ -65,12 +98,19 @@ const state = reactive({
   modalScene: null,
   modalAssets: {},
   showAuthModal: false,
+  showDownloadDirModal: false,
   showProxyModal: false,
   authForm: { username: '', password: '' },
+  downloadDirForm: '',
   authSaving: false,
+  downloadDirSaving: false,
   proxyForm: { enabled: false, proxy_url: '', no_proxy: '' },
   proxySaving: false,
   serverTasks: [],
+  serverSync: {
+    polling: false,
+    refreshing: false,
+  },
   localTasks: {},
   localQueue: [],
   localBusy: false,
@@ -86,6 +126,8 @@ let map = null
 let drawInteraction = null
 let footprintLayer = null
 let serverPollTimer = null
+let serverPollInFlight = false
+let serverTasksRequestPromise = null
 
 const selectedScenes = computed(() => state.searchResults.filter((scene) => state.selectedScenes[scene.id]))
 const selectedSceneCount = computed(() => selectedScenes.value.length)
@@ -93,9 +135,20 @@ const localTaskList = computed(() => Object.values(state.localTasks).sort((a, b)
 const localActiveCount = computed(() => localTaskList.value.filter((task) => ACTIVE_DOWNLOAD_STATUSES.includes(task.status)).length)
 const serverActiveCount = computed(() => state.serverTasks.filter((task) => ACTIVE_DOWNLOAD_STATUSES.includes(task.status)).length)
 const selectedModalAssetCount = computed(() => Object.values(state.modalAssets).filter(Boolean).length)
+const sensorOptions = computed(() => {
+  const seen = new Set()
+  return state.collections
+    .filter((collection) => {
+      if (seen.has(collection.sensor)) return false
+      seen.add(collection.sensor)
+      return true
+    })
+    .map((collection) => ({ sensor: collection.sensor, title: collection.sensor_title || SENSOR_LABELS[collection.sensor] || collection.sensor }))
+})
+const productOptions = computed(() => state.collections.filter((collection) => collection.sensor === state.sensor))
+const activeCollection = computed(() => productOptions.value.find((collection) => collection.product === state.product) || null)
 const localPanel = computed(() => buildTaskPanelData(localTaskList.value, state.taskPanels.local))
 const serverPanel = computed(() => buildTaskPanelData(state.serverTasks, state.taskPanels.server))
-
 function offsetDay(days) { const d = new Date(); d.setDate(d.getDate() + days); return d.toISOString().slice(0, 10) }
 function apiBase() { return (props.apiBase || '').trim().replace(/\/+$/, '') || 'http://127.0.0.1:5001' }
 function toast(message, type = 'idle') { emit('toast', { message, type }) }
@@ -104,8 +157,37 @@ function statusClass(status) { return `status-${status || 'pending'}` }
 function sceneDate(value) { return value ? String(value).slice(0, 10) : '未知日期' }
 function cloudText(value) { return value === null || value === undefined ? '--' : `${Number(value).toFixed(1)}%` }
 function bboxText() { return state.bbox ? state.bbox.map((value) => Number(value).toFixed(4)).join(', ') : '尚未绘制' }
+function aoiStatusText() { return state.aoiLabel ? `${state.aoiLabel}${state.aoiFeatureCount ? ` · ${state.aoiFeatureCount} 要素` : ''}` : '当前未导入矢量选区' }
 function pathRow(scene) { return `P${String(scene?.path ?? '--').padStart(3, '0')} / R${String(scene?.row ?? '--').padStart(3, '0')}` }
 function sizeText(done, total = 0) { const f = (v) => !v ? '0 B' : v >= 1073741824 ? `${(v / 1073741824).toFixed(1)} GB` : v >= 1048576 ? `${(v / 1048576).toFixed(1)} MB` : v >= 1024 ? `${(v / 1024).toFixed(0)} KB` : `${v} B`; return total > 0 ? `${f(done)} / ${f(total)}` : f(done) }
+function taskHasKnownTotal(task) { return Number(task?.size_total || 0) > 0 }
+function taskProgressLabel(task) {
+  if (!task) return '--'
+  if (task.status === 'completed') return '100%'
+  if (taskHasKnownTotal(task)) return `${Math.max(0, Math.min(100, Number(task.progress || 0)))}%`
+  if (ACTIVE_DOWNLOAD_STATUSES.includes(task.status) && Number(task?.size_downloaded || 0) > 0) return '大小未知'
+  return '0%'
+}
+function isIndeterminateProgress(task) {
+  return ACTIVE_DOWNLOAD_STATUSES.includes(task?.status) && !taskHasKnownTotal(task) && Number(task?.size_downloaded || 0) > 0
+}
+function sensorLabel(sensor) {
+  const matched = state.collections.find((collection) => collection.sensor === sensor)
+  return matched?.sensor_title || SENSOR_LABELS[sensor] || sensor || '--'
+}
+function taskSensor(task) { return task?.sensor || 'landsat' }
+function taskProduct(task) { return task?.product || task?.level || '--' }
+function productBadgeClass(product) { return `level-${String(product || 'default').toLowerCase().replace(/[^a-z0-9]+/g, '') || 'default'}` }
+function hasPathRow(scene) { return scene?.path !== null && scene?.path !== undefined && scene?.row !== null && scene?.row !== undefined }
+function sceneMetaLine(scene) { return [sceneDate(scene?.datetime), sensorLabel(scene?.sensor)].filter(Boolean).join(' · ') }
+function sceneDetailLine(scene) { return hasPathRow(scene) ? `${pathRow(scene)} · ${scene.collection}` : (scene.collection || '未提供 collection') }
+function sceneThumbFallback(scene) { return scene?.sensor === 'sentinel-2' ? 'S2' : 'L8' }
+function taskSummaryLine(task) { return `${sensorLabel(taskSensor(task))} / ${taskProduct(task)} / ${task.scene_id || '--'}` }
+function taskTargetDir(task) {
+  if (task?.target_dir) return task.target_dir
+  const sceneId = task?.scene_id || 'unknown_scene'
+  return [task?.download_date || '--', taskSensor(task), taskProduct(task), sceneId].join('/')
+}
 function sortedAssets(assets) { return Object.entries(assets || {}).sort((a, b) => a[0].localeCompare(b[0], 'en')) }
 function filenameFrom(url, sceneId, band) { const name = (url || '').split('?')[0].split('/').pop(); return name || `${sceneId}_${band}.tif` }
 function errorText(detail) { if (typeof detail === 'string') return detail; if (Array.isArray(detail)) return detail.map((item) => item.msg || JSON.stringify(item)).join(' | '); if (detail && typeof detail === 'object') return detail.msg || JSON.stringify(detail); return '请求失败' }
@@ -119,14 +201,18 @@ function isAbortError(error) { return error?.name === 'AbortError' }
 function isRetryableDownloadError(error) { if (!error || isAbortError(error)) return false; if (error instanceof TypeError) return true; const message = normalizeErrorMessage(error); return RETRYABLE_DOWNLOAD_PATTERNS.some((pattern) => pattern.test(message)) }
 function resetLocalTaskProgress(task) { task.progress = 0; task.size_total = 0; task.size_downloaded = 0 }
 function normalizeTaskKeyword(value) { return String(value || '').trim().toLowerCase() }
+function normalizeHistoryStatus(value) {
+  return HISTORY_STATUS_FILTERS.some((option) => option.value === value) ? value : 'all'
+}
 function taskMatchesKeyword(task, keyword) {
   if (!keyword) return true
-  return [task.scene_id, task.filename, task.band].some((value) => normalizeTaskKeyword(value).includes(keyword))
+  return [task.scene_id, task.filename, task.band, task.product, task.sensor].some((value) => normalizeTaskKeyword(value).includes(keyword))
 }
 function buildTaskPanelData(tasks, panelState) {
   const keyword = normalizeTaskKeyword(panelState.keyword)
+  const historyStatus = normalizeHistoryStatus(panelState.historyStatus)
   const activeTasks = tasks.filter((task) => ACTIVE_DOWNLOAD_STATUSES.includes(task.status) && taskMatchesKeyword(task, keyword))
-  const historyTasks = tasks.filter((task) => TERMINAL_DOWNLOAD_STATUSES.includes(task.status) && taskMatchesKeyword(task, keyword) && (panelState.historyStatus === 'all' || task.status === panelState.historyStatus))
+  const historyTasks = tasks.filter((task) => TERMINAL_DOWNLOAD_STATUSES.includes(task.status) && taskMatchesKeyword(task, keyword) && (historyStatus === 'all' || task.status === historyStatus))
   const activeGroups = buildSceneTaskGroups(activeTasks)
   const historyGroups = buildSceneTaskGroups(historyTasks)
   return {
@@ -145,19 +231,29 @@ function buildSceneTaskGroups(tasks) {
     const sceneId = task.scene_id || '--'
     let group = byScene.get(sceneId)
     if (!group) {
-      group = { sceneId, tasks: [], levels: new Set(), fileCount: 0, activeCount: 0, failedCount: 0 }
+      group = { sceneId, tasks: [], variants: [], variantLookup: {}, fileCount: 0, activeCount: 0, failedCount: 0 }
       byScene.set(sceneId, group)
       groups.push(group)
     }
     group.tasks.push(task)
     group.fileCount += 1
-    if (task.level) group.levels.add(task.level)
+    const sensor = taskSensor(task)
+    const product = taskProduct(task)
+    const variantKey = `${sensor}:${product}`
+    if (!group.variantLookup[variantKey]) {
+      group.variantLookup[variantKey] = true
+      group.variants.push({ sensor, product })
+    }
     if (ACTIVE_DOWNLOAD_STATUSES.includes(task.status)) group.activeCount += 1
     if (task.status === 'failed') group.failedCount += 1
   })
   return groups.map((group) => ({
-    ...group,
-    levels: Array.from(group.levels).sort((a, b) => a.localeCompare(b, 'en')),
+    sceneId: group.sceneId,
+    tasks: group.tasks,
+    variants: group.variants.sort((a, b) => `${a.sensor}:${a.product}`.localeCompare(`${b.sensor}:${b.product}`, 'en')),
+    fileCount: group.fileCount,
+    activeCount: group.activeCount,
+    failedCount: group.failedCount,
   }))
 }
 function panelGroupKey(kind, sceneId) { return `${kind}:${sceneId}` }
@@ -173,7 +269,7 @@ function toggleHistory(panelKey) { state.taskPanels[panelKey].historyOpen = !sta
 function activeEmptyText(panelKey) { return normalizeTaskKeyword(state.taskPanels[panelKey].keyword) ? '没有匹配的进行中任务。' : '暂无进行中任务。' }
 function historyEmptyText(panelKey) {
   const panelState = state.taskPanels[panelKey]
-  return normalizeTaskKeyword(panelState.keyword) || panelState.historyStatus !== 'all' ? '没有匹配的历史任务。' : '暂无历史任务。'
+  return normalizeTaskKeyword(panelState.keyword) || normalizeHistoryStatus(panelState.historyStatus) !== 'all' ? '没有匹配的历史任务。' : '暂无历史任务。'
 }
 
 async function request(path, options = {}) {
@@ -183,9 +279,40 @@ async function request(path, options = {}) {
   return data
 }
 
+function resetSearchState() {
+  state.searchResults = []
+  state.selectedScenes = {}
+  state.hoveredSceneId = ''
+  closeAssetModal()
+  renderFootprints()
+}
+
+function syncCollectionSelection() {
+  if (!state.collections.length) return
+  const availableProducts = state.collections.filter((collection) => collection.sensor === state.sensor)
+  if (!availableProducts.length) {
+    state.sensor = state.collections[0].sensor
+    state.product = state.collections[0].product
+    return
+  }
+  if (!availableProducts.some((collection) => collection.product === state.product)) {
+    state.product = availableProducts[0].product
+  }
+}
+
 watch(() => state.hoveredSceneId, () => footprintLayer && footprintLayer.changed())
 watch(() => state.selectedScenes, () => footprintLayer && footprintLayer.changed(), { deep: true })
-watch(() => props.apiBase, async () => { await Promise.all([loadCollections(true), loadAuthStatus(true), loadProxyStatus(true), loadServerTasks(true)]) })
+watch(() => props.apiBase, async () => {
+  stopServerPoll()
+  await Promise.all([loadCollections(true), loadAuthStatus(true), loadProxyStatus(true), loadServerTasks(true)])
+})
+watch(() => state.sensor, (next, prev) => {
+  syncCollectionSelection()
+  if (prev !== undefined && next !== prev) resetSearchState()
+})
+watch(() => state.product, (next, prev) => {
+  if (prev !== undefined && next !== prev) resetSearchState()
+})
 
 function initMap() {
   footprintLayer = new VectorLayer({
@@ -207,26 +334,120 @@ function initMap() {
 }
 
 function removeDraw() { if (map && drawInteraction) map.removeInteraction(drawInteraction); drawInteraction = null; state.drawActive = false }
+function fitAoiSource() {
+  if (!map || aoiSource.isEmpty()) return
+  map.getView().fit(aoiSource.getExtent(), { padding: [48, 48, 48, 48], duration: 250, maxZoom: 11 })
+}
+function applyAoiGeoJson(geojson, bbox, options = {}) {
+  aoiSource.clear()
+  const features = geoJsonFormat.readFeatures(geojson, { dataProjection: 'EPSG:4326', featureProjection: 'EPSG:3857' })
+  if (features.length) aoiSource.addFeatures(features)
+  state.bbox = Array.isArray(bbox) && bbox.length === 4 ? bbox.map((value) => Number(value)) : null
+  state.aoiLabel = options.label || ''
+  state.aoiFeatureCount = Number(options.featureCount || features.length || 0)
+  state.aoiSourceType = options.sourceType || ''
+  removeDraw()
+  fitAoiSource()
+}
 // 用 OpenLayers 的 box geometryFunction 生成矩形 AOI，直接得到后端需要的 bbox。
-function drawBox() { if (!map) return; removeDraw(); drawInteraction = new Draw({ source: aoiSource, type: 'Circle', geometryFunction: createBox() }); drawInteraction.on('drawstart', () => aoiSource.clear()); drawInteraction.on('drawend', (event) => { state.bbox = transformExtent(event.feature.getGeometry().getExtent(), 'EPSG:3857', 'EPSG:4326').map((value) => Number(value.toFixed(4))); removeDraw(); toast('检索范围已更新', 'ok') }); map.addInteraction(drawInteraction); state.drawActive = true }
-function clearBox() { aoiSource.clear(); state.bbox = null; removeDraw() }
+function drawBox() { if (!map) return; removeDraw(); drawInteraction = new Draw({ source: aoiSource, type: 'Circle', geometryFunction: createBox() }); drawInteraction.on('drawstart', () => aoiSource.clear()); drawInteraction.on('drawend', (event) => { state.bbox = transformExtent(event.feature.getGeometry().getExtent(), 'EPSG:3857', 'EPSG:4326').map((value) => Number(value.toFixed(4))); state.aoiLabel = '矩形框选'; state.aoiFeatureCount = 1; state.aoiSourceType = 'bbox'; removeDraw(); toast('检索范围已更新', 'ok') }); map.addInteraction(drawInteraction); state.drawActive = true }
+function clearBox() { aoiSource.clear(); state.bbox = null; state.aoiLabel = ''; state.aoiFeatureCount = 0; state.aoiSourceType = ''; removeDraw(); if (aoiFileInput.value) aoiFileInput.value.value = '' }
 function locateScene(scene) { if (!map || !scene?.bbox) return; map.getView().fit(transformExtent(scene.bbox, 'EPSG:4326', 'EPSG:3857'), { padding: [48, 48, 48, 48], duration: 250, maxZoom: 10 }) }
 function renderFootprints() { footprintSource.clear(); state.searchResults.forEach((scene) => { if (!scene.bbox || scene.bbox.length !== 4) return; const feature = new Feature(polygonFromExtent(transformExtent(scene.bbox, 'EPSG:4326', 'EPSG:3857'))); feature.set('sceneId', scene.id); footprintSource.addFeature(feature) }); footprintLayer && footprintLayer.changed() }
+function triggerAoiUpload() { aoiFileInput.value?.click() }
+async function handleAoiUpload(event) {
+  const files = Array.from(event?.target?.files || [])
+  if (!files.length) return
 
-async function loadCollections(silent = false) { try { const data = await request('/landsat/collections'); state.collections = data.collections || []; state.downloadRoot = data.download_dir || '' } catch (error) { if (!silent) toast(`加载配置失败：${error.message}`, 'error') } }
-async function loadAuthStatus(silent = false) { try { state.authStatus = await request('/landsat/auth/status') } catch (error) { if (!silent) toast(`读取账号状态失败：${error.message}`, 'error') } }
-async function loadProxyStatus(silent = false) { try { state.proxyStatus = await request('/landsat/proxy/status') } catch (error) { if (!silent) toast(`读取代理配置失败：${error.message}`, 'error') } }
-async function loadServerTasks(silent = false) { try { const data = await request('/landsat/download_tasks'); state.serverTasks = (data.tasks || []).sort((a, b) => String(b.created_at).localeCompare(String(a.created_at))); if (state.serverTasks.some((task) => ACTIVE_DOWNLOAD_STATUSES.includes(task.status))) startServerPoll(); else stopServerPoll() } catch (error) { if (!silent) toast(`读取服务端任务失败：${normalizeErrorMessage(error)}`, 'error') } }
-function startServerPoll() { if (serverPollTimer !== null) return; serverPollTimer = window.setInterval(() => loadServerTasks(true), 2000) }
-function stopServerPoll() { if (serverPollTimer !== null) { window.clearInterval(serverPollTimer); serverPollTimer = null } }
+  const formData = new FormData()
+  files.forEach((file) => formData.append('files', file))
+  state.aoiParsing = true
+  try {
+    const data = await request('/imagery/aoi/parse', { method: 'POST', body: formData })
+    applyAoiGeoJson(data.geojson, data.bbox, { label: data.label, featureCount: data.feature_count, sourceType: data.source_type })
+    toast(`已加载选区：${data.label || 'AOI'}，共 ${data.feature_count || 0} 个要素`, 'ok')
+  } catch (error) {
+    toast(`解析矢量选区失败：${error.message}`, 'error')
+  } finally {
+    state.aoiParsing = false
+    if (event?.target) event.target.value = ''
+  }
+}
+
+async function loadCollections(silent = false) {
+  try {
+    const data = await request('/imagery/collections')
+    state.collections = data.collections || []
+    state.downloadRoot = data.download_dir || ''
+    state.defaultDownloadRoot = data.default_download_dir || data.download_dir || ''
+    state.allowedDownloadRoots = data.allowed_download_roots || []
+    syncCollectionSelection()
+  } catch (error) {
+    if (!silent) toast(`加载配置失败：${error.message}`, 'error')
+  }
+}
+async function loadAuthStatus(silent = false) { try { state.authStatus = await request('/imagery/auth/status') } catch (error) { if (!silent) toast(`读取账号状态失败：${error.message}`, 'error') } }
+async function loadProxyStatus(silent = false) { try { state.proxyStatus = await request('/imagery/proxy/status') } catch (error) { if (!silent) toast(`读取代理配置失败：${error.message}`, 'error') } }
+function hasActiveServerTasks(tasks = state.serverTasks) {
+  return tasks.some((task) => ACTIVE_DOWNLOAD_STATUSES.includes(task.status))
+}
+function scheduleServerPoll(delay = SERVER_ACTIVE_POLL_MS) {
+  if (!state.serverSync.polling) return
+  if (serverPollTimer !== null) window.clearTimeout(serverPollTimer)
+  serverPollTimer = window.setTimeout(() => { void pollServerTasks() }, delay)
+}
+function stopServerPoll() {
+  state.serverSync.polling = false
+  if (serverPollTimer !== null) {
+    window.clearTimeout(serverPollTimer)
+    serverPollTimer = null
+  }
+}
+function syncServerPollingState() {
+  if (!hasActiveServerTasks()) {
+    stopServerPoll()
+    return
+  }
+  state.serverSync.polling = true
+  scheduleServerPoll()
+}
+async function loadServerTasks(silent = false) {
+  if (serverTasksRequestPromise) return serverTasksRequestPromise
+  serverTasksRequestPromise = (async () => {
+    state.serverSync.refreshing = true
+    try {
+      const data = await request('/imagery/download_tasks')
+      state.serverTasks = (data.tasks || []).sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)))
+    } catch (error) {
+      if (!silent) toast(`读取服务端任务失败：${normalizeErrorMessage(error)}`, 'error')
+    } finally {
+      state.serverSync.refreshing = false
+      syncServerPollingState()
+      serverTasksRequestPromise = null
+    }
+  })()
+  return serverTasksRequestPromise
+}
+async function pollServerTasks() {
+  if (serverPollInFlight) return
+  serverPollInFlight = true
+  try {
+    await loadServerTasks(true)
+  } finally {
+    serverPollInFlight = false
+  }
+}
+function handleVisibilityChange() {
+  if (document.visibilityState === 'visible' && !state.serverSync.refreshing) void loadServerTasks(true)
+}
 
 async function searchScenes() {
-  if (!state.bbox) return toast('请先在地图上绘制矩形范围', 'warn')
+  if (!state.bbox) return toast('请先绘制矩形或上传 GeoJSON / Shapefile 选区', 'warn')
   if (!state.startDate || !state.endDate) return toast('请填写完整日期范围', 'warn')
   if (state.startDate > state.endDate) return toast('开始日期不能晚于结束日期', 'warn')
   state.searchLoading = true
   try {
-    const data = await request('/landsat/search', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ bbox: state.bbox, start_date: state.startDate, end_date: state.endDate, max_cloud_cover: Number(state.maxCloudCover), level: state.level, limit: Number(state.limit) }) })
+    const data = await request('/imagery/search', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ sensor: state.sensor, product: state.product, bbox: state.bbox, start_date: state.startDate, end_date: state.endDate, max_cloud_cover: Number(state.maxCloudCover), limit: Number(state.limit) }) })
     state.searchResults = data.items || []
     state.selectedScenes = {}
     state.hoveredSceneId = ''
@@ -239,8 +460,8 @@ function setScene(sceneId, checked) { state.selectedScenes[sceneId] = checked }
 function toggleAll(checked) { const next = {}; state.searchResults.forEach((scene) => { next[scene.id] = checked }); state.selectedScenes = next }
 function openAssetModal(scene) { const next = {}; Object.keys(scene.assets || {}).forEach((key) => { next[key] = true }); state.modalScene = scene; state.modalAssets = next; state.modalOpen = true }
 function closeAssetModal() { state.modalOpen = false; state.modalScene = null; state.modalAssets = {} }
-function choosePreset(preset) { const scene = state.modalScene; if (!scene) return; const isL1 = scene.level === 'L1'; const keep = preset === 'all' ? null : new Set({ rgb: isL1 ? ['B4', 'B3', 'B2'] : ['red', 'green', 'blue'], vegetation: isL1 ? ['B5', 'B4', 'B3'] : ['nir08', 'red', 'green'] }[preset] || []); Object.keys(scene.assets || {}).forEach((key) => { state.modalAssets[key] = keep ? keep.has(key) : true }) }
-function buildItems(scene, assetKeys = null) { const assets = scene.assets || {}; return (assetKeys || Object.keys(assets)).filter((key) => assets[key]).map((key) => ({ scene_id: scene.id, level: scene.level, band: key, filename: filenameFrom(assets[key].href, scene.id, key), url: assets[key].href })) }
+function choosePreset(preset) { const scene = state.modalScene; if (!scene) return; const keep = preset === 'all' ? null : new Set(PRODUCT_PRESETS[scene.sensor]?.[scene.product]?.[preset] || []); Object.keys(scene.assets || {}).forEach((key) => { state.modalAssets[key] = keep ? keep.has(key) : true }) }
+function buildItems(scene, assetKeys = null) { const assets = scene.assets || {}; return (assetKeys || Object.keys(assets)).filter((key) => assets[key]).map((key) => ({ sensor: scene.sensor, product: scene.product, collection: scene.collection, auth_required: scene.auth_required, scene_id: scene.id, band: key, filename: filenameFrom(assets[key].href, scene.id, key), url: assets[key].href })) }
 async function confirmAssetDownload() { if (!state.modalScene) return; const assetKeys = Object.entries(state.modalAssets).filter(([, checked]) => checked).map(([key]) => key); if (!assetKeys.length) return toast('请至少选择一个资产', 'warn'); const items = buildItems(state.modalScene, assetKeys); closeAssetModal(); await enqueue(items) }
 async function downloadScene(scene) { await enqueue(buildItems(scene)) }
 async function downloadSelected() { if (!selectedScenes.value.length) return toast('请先勾选至少一景', 'warn'); await enqueue(selectedScenes.value.flatMap((scene) => buildItems(scene))) }
@@ -248,7 +469,7 @@ async function downloadSelected() { if (!selectedScenes.value.length) return toa
 async function enqueue(items) {
   if (!items.length) return toast('没有可加入的下载项', 'warn')
   if (state.downloadMode === 'server') {
-    try { const data = await request('/landsat/download', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ items, mode: 'server' }) }); toast(`已创建 ${data.count || items.length} 个服务端任务`, 'ok'); await loadServerTasks(true) } catch (error) { toast(`创建服务端任务失败：${error.message}`, 'error') }
+    try { const data = await request('/imagery/download', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ items, mode: 'server' }) }); toast(`已创建 ${data.count || items.length} 个服务端任务`, 'ok'); await loadServerTasks(true) } catch (error) { toast(`创建服务端任务失败：${error.message}`, 'error') }
     return
   }
   items.forEach((item) => { const id = `${Date.now()}_${Math.random().toString(16).slice(2, 8)}`; state.localTasks[id] = { ...item, id, status: 'pending', progress: 0, size_total: 0, size_downloaded: 0, error: '', last_error: '', retry_count: 0, max_retries: DOWNLOAD_MAX_RETRIES, createdAt: Date.now(), controller: null }; state.localQueue.push(id) })
@@ -258,34 +479,66 @@ async function enqueue(items) {
 
 function saveBlob(blob, filename) { const href = URL.createObjectURL(blob); const link = document.createElement('a'); link.href = href; link.download = filename; document.body.appendChild(link); link.click(); link.remove(); window.setTimeout(() => URL.revokeObjectURL(href), 5000) }
 async function waitForLocalRetry(task, delayMs) { const deadline = Date.now() + delayMs; while (Date.now() < deadline) { if (!task || task.status === 'cancelled') return false; await sleep(Math.min(250, deadline - Date.now())) } return task.status !== 'cancelled' }
-async function fetchLocalTaskBlob(task, signal) { const response = await fetch(`${apiBase()}/landsat/proxy_download?url=${encodeURIComponent(task.url)}&filename=${encodeURIComponent(task.filename)}`, { signal }); if (!response.ok) { const data = await response.json().catch(() => ({})); throw new Error(errorText(data.detail || `HTTP ${response.status}`)) } const total = Number(response.headers.get('content-length') || 0); task.size_total = total; if (response.body && response.body.getReader) { const reader = response.body.getReader(); const chunks = []; let downloaded = 0; try { while (true) { const { done, value } = await reader.read(); if (done) break; if (task.status === 'cancelled') { await reader.cancel().catch(() => {}); throw createAbortError() } chunks.push(value); downloaded += value.byteLength || value.length || 0; task.size_downloaded = downloaded; task.progress = total ? Math.round(downloaded / total * 100) : 0 } } catch (error) { await reader.cancel().catch(() => {}); throw error } const blob = new Blob(chunks); task.size_downloaded = blob.size; task.size_total = total || blob.size; return blob } const blob = await response.blob(); task.size_downloaded = blob.size; task.size_total = total || blob.size; return blob }
+async function fetchLocalTaskBlob(task, signal) { const response = await fetch(`${apiBase()}/imagery/proxy_download?url=${encodeURIComponent(task.url)}&filename=${encodeURIComponent(task.filename)}`, { signal }); if (!response.ok) { const data = await response.json().catch(() => ({})); throw new Error(errorText(data.detail || `HTTP ${response.status}`)) } const total = Number(response.headers.get('content-length') || 0); task.size_total = total; if (response.body && response.body.getReader) { const reader = response.body.getReader(); const chunks = []; let downloaded = 0; try { while (true) { const { done, value } = await reader.read(); if (done) break; if (task.status === 'cancelled') { await reader.cancel().catch(() => {}); throw createAbortError() } chunks.push(value); downloaded += value.byteLength || value.length || 0; task.size_downloaded = downloaded; task.progress = total ? Math.round(downloaded / total * 100) : 0 } } catch (error) { await reader.cancel().catch(() => {}); throw error } const blob = new Blob(chunks); task.size_downloaded = blob.size; task.size_total = total || blob.size; return blob } const blob = await response.blob(); task.size_downloaded = blob.size; task.size_total = total || blob.size; return blob }
 async function downloadLocalTask(task) { if (!task || task.status === 'cancelled') return; for (let attemptIndex = 0; attemptIndex <= DOWNLOAD_MAX_RETRIES; attemptIndex += 1) { if (!task || task.status === 'cancelled') { task.status = 'cancelled'; return } resetLocalTaskProgress(task); task.status = 'downloading'; task.error = ''; task.last_error = ''; const controller = new AbortController(); task.controller = controller; try { const blob = await fetchLocalTaskBlob(task, controller.signal); if (task.status === 'cancelled') return; task.progress = 100; task.status = 'completed'; task.error = ''; task.last_error = ''; saveBlob(blob, task.filename); return } catch (error) { if (task.status === 'cancelled' || isAbortError(error)) { task.status = 'cancelled'; return } const rawError = normalizeErrorMessage(error); const retryable = isRetryableDownloadError(error); task.last_error = rawError; if (!retryable || attemptIndex >= DOWNLOAD_MAX_RETRIES) { task.status = 'failed'; if (retryable) resetLocalTaskProgress(task); task.error = retryable ? buildRetryFailureMessage() : rawError; return } task.retry_count = attemptIndex + 1; task.status = 'retrying'; task.error = ''; resetLocalTaskProgress(task); const shouldContinue = await waitForLocalRetry(task, DOWNLOAD_RETRY_DELAYS[attemptIndex]); if (!shouldContinue) { task.status = 'cancelled'; return } } finally { task.controller = null } } }
 // 浏览器模式顺序下载，避免多景并发时把内存和网络同时拉满。
 async function processLocalQueue() { if (state.localBusy || !state.localQueue.length) return; state.localBusy = true; try { while (state.localQueue.length) { const taskId = state.localQueue.shift(); const task = state.localTasks[taskId]; if (!task || task.status === 'cancelled') continue; await downloadLocalTask(task) } } finally { state.localBusy = false; if (state.localQueue.length) window.setTimeout(() => processLocalQueue(), 0) } }
 function cancelLocal(taskId) { const task = state.localTasks[taskId]; if (!task) return; task.status = 'cancelled'; task.controller?.abort(); state.localQueue = state.localQueue.filter((item) => item !== taskId) }
-async function cancelServer(taskId) { try { await request(`/landsat/download_tasks/${encodeURIComponent(taskId)}`, { method: 'DELETE' }); await loadServerTasks(true) } catch (error) { toast(`取消失败：${error.message}`, 'error') } }
-function saveServer(task) { const link = document.createElement('a'); link.href = `${apiBase()}/landsat/download_tasks/${encodeURIComponent(task.id)}/file`; link.target = '_blank'; link.rel = 'noopener'; document.body.appendChild(link); link.click(); link.remove() }
-async function clearServer() { try { await request('/landsat/download_tasks/completed', { method: 'DELETE' }); await loadServerTasks(true) } catch (error) { toast(`清理失败：${error.message}`, 'error') } }
+async function cancelServer(taskId) { try { await request(`/imagery/download_tasks/${encodeURIComponent(taskId)}`, { method: 'DELETE' }); await loadServerTasks(true) } catch (error) { toast(`取消失败：${error.message}`, 'error') } }
+function saveServer(task) { const link = document.createElement('a'); link.href = `${apiBase()}/imagery/download_tasks/${encodeURIComponent(task.id)}/file`; link.target = '_blank'; link.rel = 'noopener'; document.body.appendChild(link); link.click(); link.remove() }
+async function clearServer() { try { await request('/imagery/download_tasks/completed', { method: 'DELETE' }); await loadServerTasks(true) } catch (error) { toast(`清理失败：${error.message}`, 'error') } }
 function clearLocal() { Object.entries(state.localTasks).forEach(([id, task]) => { if (['completed', 'failed', 'cancelled'].includes(task.status)) delete state.localTasks[id] }) }
 
 function openAuth() { state.authForm.username = state.authStatus.username || ''; state.authForm.password = ''; state.showAuthModal = true }
 function closeAuth() { state.showAuthModal = false; state.authForm.password = '' }
-async function saveAuth() { const username = state.authForm.username.trim(); const password = state.authForm.password; if (!username || !password) return toast('请填写完整账号和密码', 'warn'); state.authSaving = true; try { await request('/landsat/auth/earthdata', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username, password }) }); await loadAuthStatus(true); closeAuth(); toast('EarthData / EROS 账号已更新', 'ok') } catch (error) { toast(`账号验证失败：${error.message}`, 'error') } finally { state.authSaving = false } }
+async function saveAuth() { const username = state.authForm.username.trim(); const password = state.authForm.password; if (!username || !password) return toast('请填写完整账号和密码', 'warn'); state.authSaving = true; try { await request('/imagery/auth/earthdata', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username, password }) }); await loadAuthStatus(true); closeAuth(); toast('EarthData / EROS 账号已更新', 'ok') } catch (error) { toast(`账号验证失败：${error.message}`, 'error') } finally { state.authSaving = false } }
+function openDownloadDir() { state.downloadDirForm = state.downloadRoot || state.defaultDownloadRoot || ''; state.showDownloadDirModal = true }
+function closeDownloadDir() { state.showDownloadDirModal = false }
+function pickDownloadRoot(path) { state.downloadDirForm = path || '' }
+async function saveDownloadDir(useDefault = false) {
+  const payload = { download_dir: useDefault ? '' : state.downloadDirForm.trim() }
+  state.downloadDirSaving = true
+  try {
+    const data = await request('/imagery/download_dir', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) })
+    state.downloadRoot = data.download_dir || ''
+    state.defaultDownloadRoot = data.default_download_dir || state.defaultDownloadRoot
+    state.allowedDownloadRoots = data.allowed_download_roots || state.allowedDownloadRoots
+    closeDownloadDir()
+    toast(useDefault ? '服务端下载目录已恢复默认' : '服务端下载目录已更新', 'ok')
+  } catch (error) {
+    toast(`保存下载目录失败：${error.message}`, 'error')
+  } finally {
+    state.downloadDirSaving = false
+  }
+}
 function openProxy() { state.proxyForm = { enabled: !!state.proxyStatus.enabled, proxy_url: state.proxyStatus.proxy_url || '', no_proxy: state.proxyStatus.no_proxy || '' }; state.showProxyModal = true }
 function closeProxy() { state.showProxyModal = false }
-async function saveProxy() { const payload = { enabled: !!state.proxyForm.enabled, proxy_url: state.proxyForm.proxy_url.trim(), no_proxy: state.proxyForm.no_proxy.trim() }; if (payload.enabled && !payload.proxy_url) return toast('启用代理时请填写代理地址', 'warn'); state.proxySaving = true; try { await request('/landsat/proxy', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) }); await loadProxyStatus(true); closeProxy(); toast(payload.enabled ? '下载代理已更新' : '下载代理已关闭', 'ok') } catch (error) { toast(`保存代理失败：${error.message}`, 'error') } finally { state.proxySaving = false } }
+async function saveProxy() { const payload = { enabled: !!state.proxyForm.enabled, proxy_url: state.proxyForm.proxy_url.trim(), no_proxy: state.proxyForm.no_proxy.trim() }; if (payload.enabled && !payload.proxy_url) return toast('启用代理时请填写代理地址', 'warn'); state.proxySaving = true; try { await request('/imagery/proxy', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) }); await loadProxyStatus(true); closeProxy(); toast(payload.enabled ? '下载代理已更新' : '下载代理已关闭', 'ok') } catch (error) { toast(`保存代理失败：${error.message}`, 'error') } finally { state.proxySaving = false } }
 async function disableProxy() { state.proxyForm.enabled = false; state.proxyForm.proxy_url = ''; state.proxyForm.no_proxy = ''; await saveProxy() }
 
-onMounted(async () => { await nextTick(); initMap(); window.setTimeout(() => map && map.updateSize(), 320); await Promise.all([loadCollections(true), loadAuthStatus(true), loadProxyStatus(true), loadServerTasks(true)]) })
-onBeforeUnmount(() => { stopServerPoll(); removeDraw(); Object.values(state.localTasks).forEach((task) => { task.status = 'cancelled'; task.controller?.abort() }); if (map) map.setTarget(null) })
+onMounted(async () => {
+  await nextTick()
+  initMap()
+  document.addEventListener('visibilitychange', handleVisibilityChange)
+  window.setTimeout(() => map && map.updateSize(), 320)
+  await Promise.all([loadCollections(true), loadAuthStatus(true), loadProxyStatus(true), loadServerTasks(true)])
+})
+onBeforeUnmount(() => {
+  document.removeEventListener('visibilitychange', handleVisibilityChange)
+  stopServerPoll()
+  removeDraw()
+  Object.values(state.localTasks).forEach((task) => { task.status = 'cancelled'; task.controller?.abort() })
+  if (map) map.setTarget(null)
+})
 </script>
 
 <template>
   <div class="landsat-download">
     <section class="grid">
       <article class="card">
-        <div class="head"><div><h3>检索条件</h3></div><div class="row"><button class="btn sub" type="button" @click="openProxy">{{ state.proxyStatus.enabled ? '代理已启用' : '配置代理' }}</button><button class="btn sub" type="button" @click="openAuth">{{ state.authStatus.configured ? `账号：${state.authStatus.username}` : '配置 EarthData' }}</button></div></div>
-        <div class="collections"><button v-for="collection in state.collections" :key="collection.level" class="collection-chip" :class="{ active: state.level === collection.level }" type="button" @click="state.level = collection.level"><strong>{{ collection.level }}</strong><span>{{ collection.title }}</span></button></div>
+        <div class="head"><div><h3>检索条件</h3></div><div class="row"><button class="btn sub" type="button" @click="openDownloadDir">下载目录</button><button class="btn sub" type="button" @click="openProxy">{{ state.proxyStatus.enabled ? '代理已启用' : '配置代理' }}</button><button class="btn sub" type="button" @click="openAuth">{{ state.authStatus.configured ? `账号：${state.authStatus.username}` : '配置 EarthData' }}</button></div></div>
+        <div class="sensor-switch"><button v-for="sensor in sensorOptions" :key="sensor.sensor" class="pill sensor-pill" :class="{ active: state.sensor === sensor.sensor }" type="button" @click="state.sensor = sensor.sensor">{{ sensor.title }}</button></div>
+        <div class="collections"><button v-for="collection in productOptions" :key="`${collection.sensor}:${collection.product}`" class="collection-chip" :class="{ active: state.product === collection.product }" type="button" @click="state.product = collection.product"><strong>{{ collection.product }}</strong><span>{{ collection.title }}</span></button></div>
         <div class="fields">
           <label><span>开始日期</span><input v-model="state.startDate" type="date" /></label>
           <label><span>结束日期</span><input v-model="state.endDate" type="date" /></label>
@@ -293,17 +546,20 @@ onBeforeUnmount(() => { stopServerPoll(); removeDraw(); Object.values(state.loca
           <label><span>返回上限</span><input v-model.number="state.limit" type="number" min="1" max="100" /></label>
           <div><span>下载模式</span><div class="mode-switch"><button class="pill" :class="{ active: state.downloadMode === 'server' }" type="button" @click="state.downloadMode = 'server'">服务端</button><button class="pill" :class="{ active: state.downloadMode === 'local' }" type="button" @click="state.downloadMode = 'local'">浏览器</button></div></div>
         </div>
-        <p v-if="state.proxyStatus.enabled" class="root-hint">代理：{{ state.proxyStatus.proxy_url }}<template v-if="state.proxyStatus.no_proxy"> · 直连 {{ state.proxyStatus.no_proxy }}</template></p>
-        <div class="bbox-box"><div><span>当前范围</span><strong>{{ bboxText() }}</strong></div><div class="row"><button class="btn" type="button" @click="drawBox">{{ state.drawActive ? '重新框选中...' : '绘制矩形' }}</button><button class="btn sub" type="button" @click="clearBox">清空</button></div></div>
+        <p v-if="activeCollection" class="root-hint">当前产品：{{ sensorLabel(state.sensor) }} / {{ state.product }}</p>
+        <p v-if="activeCollection?.auth_required" class="root-hint">需要 EarthData / EROS 认证</p>
+        <div class="bbox-box"><div><span>当前范围</span><strong>{{ bboxText() }}</strong><p class="aoi-hint">{{ aoiStatusText() }}</p></div><div class="row"><button class="btn" type="button" @click="drawBox">{{ state.drawActive ? '重新框选中...' : '绘制矩形' }}</button><button class="btn sub" type="button" :disabled="state.aoiParsing" @click="triggerAoiUpload">{{ state.aoiParsing ? '解析中...' : '上传矢量' }}</button><button class="btn sub" type="button" @click="clearBox">清空</button></div></div>
+        <input ref="aoiFileInput" class="hidden-file-input" type="file" multiple accept=".geojson,.json,.shp,.dbf,.shx,.prj,.cpg,.sbn,.sbx" @change="handleAoiUpload" />
+        <p class="root-hint">支持 GeoJSON / Shapefile，Shapefile 建议同时选择 `.dbf`、`.shx`、`.prj`。</p>
         <button class="btn main" type="button" :disabled="state.searchLoading" @click="searchScenes">{{ state.searchLoading ? '检索中...' : '开始检索' }}</button>
       </article>
       <article class="card"><div class="head"><div><h3>地图范围</h3><p>{{ state.searchResults.length }} 景，{{ selectedSceneCount }} 已选</p></div></div><div ref="mapTarget" class="map"></div></article>
       <article class="card span-all">
         <div class="head"><div><h3>检索结果</h3></div><div class="row"><button class="btn sub" type="button" @click="toggleAll(true)">全选</button><button class="btn sub" type="button" @click="toggleAll(false)">清空</button><button class="btn" type="button" @click="downloadSelected">下载所选景全部资产</button></div></div>
-        <div v-if="!state.searchResults.length" class="empty">还没有检索结果。先画框，再点击“开始检索”。</div>
+        <div v-if="!state.searchResults.length" class="empty">还没有检索结果。先画框或上传矢量选区，再点击“开始检索”。</div>
         <div v-else class="scene-grid">
-          <article v-for="scene in state.searchResults" :key="scene.id" class="scene-card" :class="{ selected: state.selectedScenes[scene.id] }" @mouseenter="state.hoveredSceneId = scene.id" @mouseleave="state.hoveredSceneId = ''">
-            <div class="scene-top"><div class="thumb"><img v-if="scene.thumbnail" :src="scene.thumbnail" :alt="scene.id" loading="lazy" /><span v-else>L8</span></div><div class="scene-text"><div class="between"><h4>{{ scene.id }}</h4><span class="badge" :class="`level-${scene.level?.toLowerCase()}`">{{ scene.level }}</span></div><p>{{ sceneDate(scene.datetime) }} · {{ pathRow(scene) }}</p><p>云量 {{ cloudText(scene.cloud_cover) }} · {{ Object.keys(scene.assets || {}).length }} 个资产</p></div><label class="checker"><input :checked="!!state.selectedScenes[scene.id]" type="checkbox" @change="setScene(scene.id, $event.target.checked)" /><span>{{ state.selectedScenes[scene.id] ? '已选' : '选择' }}</span></label></div>
+          <article v-for="scene in state.searchResults" :key="`${scene.sensor}:${scene.id}`" class="scene-card" :class="{ selected: state.selectedScenes[scene.id] }" @mouseenter="state.hoveredSceneId = scene.id" @mouseleave="state.hoveredSceneId = ''">
+            <div class="scene-top"><div class="thumb"><img v-if="scene.thumbnail" :src="scene.thumbnail" :alt="scene.id" loading="lazy" /><span v-else>{{ sceneThumbFallback(scene) }}</span></div><div class="scene-text"><div class="between"><h4>{{ scene.id }}</h4><span class="badge" :class="productBadgeClass(scene.product)">{{ scene.product }}</span></div><p>{{ sceneMetaLine(scene) }}</p><p>{{ sceneDetailLine(scene) }}</p><p>云量 {{ cloudText(scene.cloud_cover) }} · {{ Object.keys(scene.assets || {}).length }} 个资产</p></div><label class="checker"><input :checked="!!state.selectedScenes[scene.id]" type="checkbox" @change="setScene(scene.id, $event.target.checked)" /><span>{{ state.selectedScenes[scene.id] ? '已选' : '选择' }}</span></label></div>
             <div class="row"><button class="btn sub" type="button" @click="locateScene(scene)">定位</button><button class="btn sub" type="button" @click="openAssetModal(scene)">选资产</button><button class="btn" type="button" @click="downloadScene(scene)">全部资产</button></div>
           </article>
         </div>
@@ -315,11 +571,11 @@ onBeforeUnmount(() => { stopServerPoll(); removeDraw(); Object.values(state.loca
               <div class="head task-head">
                 <div class="task-head-copy">
                   <h3>浏览器下载</h3>
-                  <p>{{ localActiveCount }} 个进行中 · {{ localTaskList.length }} 个总任务</p>
+                  <p>{{ localActiveCount }} 个应用内传输中 · {{ localTaskList.length }} 个总任务</p>
                 </div>
                 <button class="btn sub" type="button" @click="clearLocal">清理终态任务</button>
               </div>
-              <p class="task-column-hint placeholder" aria-hidden="true">下载根目录占位</p>
+              <p class="task-column-hint">交给浏览器保存后，任务会记为已完成；浏览器自己的保存进度无法继续读取。</p>
             </div>
             <div class="task-toolbar">
               <input v-model.trim="state.taskPanels.local.keyword" type="text" placeholder="筛选 scene / 文件 / band" />
@@ -342,7 +598,7 @@ onBeforeUnmount(() => { stopServerPoll(); removeDraw(); Object.values(state.loca
                       <div class="task-group-title">
                         <strong>{{ group.sceneId }}</strong>
                         <div class="task-group-levels">
-                          <span v-for="level in group.levels" :key="level" class="badge" :class="`level-${level.toLowerCase()}`">{{ level }}</span>
+                          <span v-for="variant in group.variants" :key="`${variant.sensor}:${variant.product}`" class="badge" :class="productBadgeClass(variant.product)">{{ sensorLabel(variant.sensor) }} / {{ variant.product }}</span>
                         </div>
                       </div>
                       <div class="task-group-stats">
@@ -358,14 +614,16 @@ onBeforeUnmount(() => { stopServerPoll(); removeDraw(); Object.values(state.loca
                       <div class="between">
                         <div>
                           <strong>{{ task.filename }}</strong>
-                          <p>{{ task.scene_id }} / {{ task.level || '--' }} / {{ task.band }}</p>
+                          <p>{{ taskSummaryLine(task) }}</p>
+                          <p>资产：{{ task.band }}</p>
                           <p v-if="retryText(task)">{{ retryText(task) }}</p>
                         </div>
                         <span class="status" :class="statusClass(task.status)">{{ statusLabel(task.status) }}</span>
                       </div>
-                      <div class="progress"><div class="fill" :style="{ width: `${task.progress}%` }"></div></div>
+                      <div class="progress" :class="{ indeterminate: isIndeterminateProgress(task) }"><div class="fill" :style="{ width: `${isIndeterminateProgress(task) ? 36 : task.progress}%` }"></div></div>
                       <div class="between">
                         <span>{{ sizeText(task.size_downloaded, task.size_total) }}</span>
+                        <span class="progress-text">{{ taskProgressLabel(task) }}</span>
                         <button v-if="ACTIVE_DOWNLOAD_STATUSES.includes(task.status)" class="btn sub tiny" type="button" @click="cancelLocal(task.id)">取消</button>
                       </div>
                       <p v-if="task.error" class="error">{{ task.error }}</p>
@@ -393,7 +651,7 @@ onBeforeUnmount(() => { stopServerPoll(); removeDraw(); Object.values(state.loca
                         <div class="task-group-title">
                           <strong>{{ group.sceneId }}</strong>
                           <div class="task-group-levels">
-                            <span v-for="level in group.levels" :key="level" class="badge" :class="`level-${level.toLowerCase()}`">{{ level }}</span>
+                            <span v-for="variant in group.variants" :key="`${variant.sensor}:${variant.product}`" class="badge" :class="productBadgeClass(variant.product)">{{ sensorLabel(variant.sensor) }} / {{ variant.product }}</span>
                           </div>
                         </div>
                         <div class="task-group-stats">
@@ -408,13 +666,14 @@ onBeforeUnmount(() => { stopServerPoll(); removeDraw(); Object.values(state.loca
                         <div class="between">
                           <div>
                             <strong>{{ task.filename }}</strong>
-                            <p>{{ task.scene_id }} / {{ task.level || '--' }} / {{ task.band }}</p>
+                            <p>{{ taskSummaryLine(task) }}</p>
+                            <p>资产：{{ task.band }}</p>
                             <p v-if="retryText(task)">{{ retryText(task) }}</p>
                           </div>
                           <span class="status" :class="statusClass(task.status)">{{ statusLabel(task.status) }}</span>
                         </div>
-                        <div class="progress"><div class="fill" :style="{ width: `${task.progress}%` }"></div></div>
-                        <div class="between"><span>{{ sizeText(task.size_downloaded, task.size_total) }}</span></div>
+                        <div class="progress" :class="{ indeterminate: isIndeterminateProgress(task) }"><div class="fill" :style="{ width: `${isIndeterminateProgress(task) ? 36 : task.progress}%` }"></div></div>
+                        <div class="between"><span>{{ sizeText(task.size_downloaded, task.size_total) }}</span><span class="progress-text">{{ taskProgressLabel(task) }}</span></div>
                         <p v-if="task.error" class="error">{{ task.error }}</p>
                         <p v-if="detailErrorText(task)" class="error error-detail">{{ detailErrorText(task) }}</p>
                       </article>
@@ -456,7 +715,7 @@ onBeforeUnmount(() => { stopServerPoll(); removeDraw(); Object.values(state.loca
                       <div class="task-group-title">
                         <strong>{{ group.sceneId }}</strong>
                         <div class="task-group-levels">
-                          <span v-for="level in group.levels" :key="level" class="badge" :class="`level-${level.toLowerCase()}`">{{ level }}</span>
+                          <span v-for="variant in group.variants" :key="`${variant.sensor}:${variant.product}`" class="badge" :class="productBadgeClass(variant.product)">{{ sensorLabel(variant.sensor) }} / {{ variant.product }}</span>
                         </div>
                       </div>
                       <div class="task-group-stats">
@@ -472,15 +731,17 @@ onBeforeUnmount(() => { stopServerPoll(); removeDraw(); Object.values(state.loca
                       <div class="between">
                         <div>
                           <strong>{{ task.filename }}</strong>
-                          <p>{{ task.scene_id }} / {{ task.level || '--' }} / {{ task.band }}</p>
-                          <p v-if="task.download_date">目录：{{ task.download_date }}/{{ task.level || '--' }}/{{ task.scene_id }}</p>
+                          <p>{{ taskSummaryLine(task) }}</p>
+                          <p>资产：{{ task.band }}</p>
+                          <p v-if="task.download_date">目录：{{ taskTargetDir(task) }}</p>
                           <p v-if="retryText(task)">{{ retryText(task) }}</p>
                         </div>
                         <span class="status" :class="statusClass(task.status)">{{ statusLabel(task.status) }}</span>
                       </div>
-                      <div class="progress"><div class="fill" :style="{ width: `${task.progress || 0}%` }"></div></div>
+                      <div class="progress" :class="{ indeterminate: isIndeterminateProgress(task) }"><div class="fill" :style="{ width: `${isIndeterminateProgress(task) ? 36 : (task.progress || 0)}%` }"></div></div>
                       <div class="between">
                         <span>{{ sizeText(task.size_downloaded || 0, task.size_total || 0) }}</span>
+                        <span class="progress-text">{{ taskProgressLabel(task) }}</span>
                         <div class="row">
                           <button v-if="task.status === 'completed'" class="btn sub tiny" type="button" @click="saveServer(task)">保存到本地</button>
                           <button v-if="ACTIVE_DOWNLOAD_STATUSES.includes(task.status)" class="btn sub tiny" type="button" @click="cancelServer(task.id)">取消</button>
@@ -511,7 +772,7 @@ onBeforeUnmount(() => { stopServerPoll(); removeDraw(); Object.values(state.loca
                         <div class="task-group-title">
                           <strong>{{ group.sceneId }}</strong>
                           <div class="task-group-levels">
-                            <span v-for="level in group.levels" :key="level" class="badge" :class="`level-${level.toLowerCase()}`">{{ level }}</span>
+                            <span v-for="variant in group.variants" :key="`${variant.sensor}:${variant.product}`" class="badge" :class="productBadgeClass(variant.product)">{{ sensorLabel(variant.sensor) }} / {{ variant.product }}</span>
                           </div>
                         </div>
                         <div class="task-group-stats">
@@ -526,15 +787,17 @@ onBeforeUnmount(() => { stopServerPoll(); removeDraw(); Object.values(state.loca
                         <div class="between">
                           <div>
                             <strong>{{ task.filename }}</strong>
-                            <p>{{ task.scene_id }} / {{ task.level || '--' }} / {{ task.band }}</p>
-                            <p v-if="task.download_date">目录：{{ task.download_date }}/{{ task.level || '--' }}/{{ task.scene_id }}</p>
+                            <p>{{ taskSummaryLine(task) }}</p>
+                            <p>资产：{{ task.band }}</p>
+                            <p v-if="task.download_date">目录：{{ taskTargetDir(task) }}</p>
                             <p v-if="retryText(task)">{{ retryText(task) }}</p>
                           </div>
                           <span class="status" :class="statusClass(task.status)">{{ statusLabel(task.status) }}</span>
                         </div>
-                        <div class="progress"><div class="fill" :style="{ width: `${task.progress || 0}%` }"></div></div>
+                        <div class="progress" :class="{ indeterminate: isIndeterminateProgress(task) }"><div class="fill" :style="{ width: `${isIndeterminateProgress(task) ? 36 : (task.progress || 0)}%` }"></div></div>
                         <div class="between">
                           <span>{{ sizeText(task.size_downloaded || 0, task.size_total || 0) }}</span>
+                          <span class="progress-text">{{ taskProgressLabel(task) }}</span>
                           <button v-if="task.status === 'completed'" class="btn sub tiny" type="button" @click="saveServer(task)">保存到本地</button>
                         </div>
                         <p v-if="task.error" class="error">{{ task.error }}</p>
@@ -549,8 +812,9 @@ onBeforeUnmount(() => { stopServerPoll(); removeDraw(); Object.values(state.loca
         </div>
       </article>
     </section>
-    <div v-if="state.modalOpen" class="mask" @click.self="closeAssetModal"><div class="modal"><div class="head"><div><h3>选择资产</h3><p>{{ state.modalScene?.id }}</p></div><button class="btn sub" type="button" @click="closeAssetModal">关闭</button></div><div class="row"><button class="btn sub" type="button" @click="choosePreset('rgb')">RGB</button><button class="btn sub" type="button" @click="choosePreset('vegetation')">植被组合</button><button class="btn sub" type="button" @click="choosePreset('all')">全选</button><span class="count">已选 {{ selectedModalAssetCount }} 项</span></div><div class="asset-grid"><label v-for="[key, asset] in sortedAssets(state.modalScene?.assets)" :key="key" class="asset-item"><input v-model="state.modalAssets[key]" type="checkbox" /><div><strong>{{ key }}</strong><p>{{ asset.label }}</p></div></label></div><div class="row end"><button class="btn" type="button" @click="confirmAssetDownload">加入下载</button></div></div></div>
-    <div v-if="state.showAuthModal" class="mask" @click.self="closeAuth"><div class="modal auth-modal"><div class="head"><div><h3>EarthData / EROS</h3><p>仅在下载部分 USGS 资产时需要。</p></div><button class="btn sub" type="button" @click="closeAuth">关闭</button></div><div class="fields"><label class="full"><span>用户名</span><input v-model="state.authForm.username" type="text" placeholder="EarthData 用户名" /></label><label class="full"><span>密码</span><input v-model="state.authForm.password" type="password" placeholder="密码" /></label></div><div class="row end"><button class="btn" type="button" :disabled="state.authSaving" @click="saveAuth">{{ state.authSaving ? '验证中...' : '保存并验证' }}</button></div></div></div>
+    <div v-if="state.modalOpen" class="mask" @click.self="closeAssetModal"><div class="modal"><div class="head"><div><h3>选择资产</h3><p>{{ state.modalScene?.id }} · {{ sensorLabel(state.modalScene?.sensor) }} / {{ state.modalScene?.product }}</p></div><button class="btn sub" type="button" @click="closeAssetModal">关闭</button></div><div class="row"><button class="btn sub" type="button" @click="choosePreset('rgb')">RGB</button><button class="btn sub" type="button" @click="choosePreset('vegetation')">植被组合</button><button class="btn sub" type="button" @click="choosePreset('all')">全选</button><span class="count">已选 {{ selectedModalAssetCount }} 项</span></div><div class="asset-grid"><label v-for="[key, asset] in sortedAssets(state.modalScene?.assets)" :key="key" class="asset-item"><input v-model="state.modalAssets[key]" type="checkbox" /><div><strong>{{ key }}</strong><p>{{ asset.label }}</p></div></label></div><div class="row end"><button class="btn" type="button" @click="confirmAssetDownload">加入下载</button></div></div></div>
+    <div v-if="state.showAuthModal" class="mask" @click.self="closeAuth"><div class="modal auth-modal"><div class="head"><div><h3>EarthData / EROS</h3><p>当前主要用于 Landsat L1 / USGS 资产下载。</p></div><button class="btn sub" type="button" @click="closeAuth">关闭</button></div><div class="fields"><label class="full"><span>用户名</span><input v-model="state.authForm.username" type="text" placeholder="EarthData 用户名" /></label><label class="full"><span>密码</span><input v-model="state.authForm.password" type="password" placeholder="密码" /></label></div><div class="row end"><button class="btn" type="button" :disabled="state.authSaving" @click="saveAuth">{{ state.authSaving ? '验证中...' : '保存并验证' }}</button></div></div></div>
+    <div v-if="state.showDownloadDirModal" class="mask" @click.self="closeDownloadDir"><div class="modal auth-modal"><div class="head"><div><h3>服务端下载目录</h3><p>服务端任务会保存到该目录下的 YYYY-MM-DD/sensor/product/场景ID。</p></div><button class="btn sub" type="button" @click="closeDownloadDir">关闭</button></div><div class="fields"><label class="full"><span>下载根目录</span><input v-model="state.downloadDirForm" type="text" :placeholder="state.defaultDownloadRoot || '请输入服务端目录路径'" /></label><div class="full"><span>允许的根目录</span><div class="download-root-list"><button v-for="root in state.allowedDownloadRoots" :key="root.path" class="btn sub tiny" type="button" @click="pickDownloadRoot(root.path)">{{ root.name }}</button></div></div><div class="full root-note"><span>默认目录</span><strong>{{ state.defaultDownloadRoot || '--' }}</strong></div></div><div class="row between"><button class="btn sub" type="button" :disabled="state.downloadDirSaving" @click="saveDownloadDir(true)">恢复默认</button><button class="btn" type="button" :disabled="state.downloadDirSaving" @click="saveDownloadDir(false)">{{ state.downloadDirSaving ? '保存中...' : '保存目录' }}</button></div></div></div>
     <div v-if="state.showProxyModal" class="mask" @click.self="closeProxy"><div class="modal auth-modal"><div class="head"><div><h3>下载代理</h3><p>用于 STAC 检索、EarthData 登录和影像下载请求。</p></div><button class="btn sub" type="button" @click="closeProxy">关闭</button></div><div class="fields"><label class="full proxy-toggle"><span>启用代理</span><input v-model="state.proxyForm.enabled" type="checkbox" /></label><label class="full"><span>代理地址</span><input v-model="state.proxyForm.proxy_url" type="text" placeholder="http://127.0.0.1:7890" :disabled="!state.proxyForm.enabled" /></label><label class="full"><span>直连列表（可选）</span><input v-model="state.proxyForm.no_proxy" type="text" placeholder="127.0.0.1,localhost,.microsoft.com" :disabled="!state.proxyForm.enabled" /></label></div><div class="row between"><button class="btn sub" type="button" :disabled="state.proxySaving || !state.proxyStatus.enabled" @click="disableProxy">关闭代理</button><button class="btn" type="button" :disabled="state.proxySaving" @click="saveProxy">{{ state.proxySaving ? '保存中...' : '保存配置' }}</button></div></div></div>
   </div>
 </template>
@@ -573,6 +837,8 @@ onBeforeUnmount(() => { stopServerPoll(); removeDraw(); Object.values(state.loca
 .end { justify-content: flex-end; }
 
 /* ── Collection chips ─────────────────────────────────────── */
+.sensor-switch { display: flex; gap: 0.35rem; flex-wrap: wrap; margin-bottom: 0.5rem; }
+.sensor-pill { display: inline-flex; align-items: center; justify-content: center; min-width: 120px; }
 .collections { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0.4rem; margin-bottom: 0.6rem; }
 .collection-chip { display: flex; flex-direction: column; gap: 2px; padding: 0.45rem 0.55rem; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); color: var(--text); text-align: left; cursor: pointer; transition: all 0.15s; }
 .collection-chip strong { font-size: 0.82rem; font-weight: 700; font-family: var(--mono); }
@@ -587,6 +853,9 @@ onBeforeUnmount(() => { stopServerPoll(); removeDraw(); Object.values(state.loca
 .fields input { padding: 0.32rem 0.4rem; border: 1px solid #cdd8d4; border-radius: 6px; background: #fff; color: var(--text); font-size: 0.78rem; font-family: inherit; width: 100%; }
 .fields input[type='range'] { padding: 0; accent-color: var(--pri); }
 .full { grid-column: 1 / -1; }
+.download-root-list { display: flex; gap: 0.35rem; flex-wrap: wrap; margin-top: 0.1rem; }
+.root-note { padding: 0.45rem 0.55rem; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); }
+.root-note strong { color: var(--text); font-family: var(--mono); font-size: 0.72rem; word-break: break-all; }
 .mode-switch { display: inline-flex; gap: 0.3rem; margin-top: 2px; }
 .pill { padding: 0.26rem 0.55rem; border: 1px solid var(--line); border-radius: 999px; background: var(--card); color: var(--muted); font-size: 0.7rem; cursor: pointer; transition: all 0.15s; }
 .pill.active { border-color: var(--pri); background: #e7f4f1; color: var(--pri-dark); font-weight: 600; }
@@ -597,6 +866,8 @@ onBeforeUnmount(() => { stopServerPoll(); removeDraw(); Object.values(state.loca
 .bbox-box { display: flex; justify-content: space-between; align-items: center; gap: 0.5rem; padding: 0.45rem 0.55rem; border-radius: 6px; background: var(--bg); border: 1px solid var(--line); margin-bottom: 0.6rem; }
 .bbox-box span { font-size: 0.7rem; color: var(--muted); }
 .bbox-box strong { display: block; margin-top: 2px; color: var(--text); font-family: var(--mono); font-size: 0.68rem; word-break: break-word; }
+.aoi-hint { margin: 0.22rem 0 0; color: #4e6f67; font-size: 0.67rem; line-height: 1.45; word-break: break-word; }
+.hidden-file-input { display: none; }
 
 /* ── Buttons ──────────────────────────────────────────────── */
 .btn { border: 1px solid transparent; border-radius: 6px; cursor: pointer; padding: 0.32rem 0.6rem; font-size: 0.76rem; font-weight: 600; font-family: inherit; transition: all 0.15s; white-space: nowrap; }
@@ -627,6 +898,8 @@ onBeforeUnmount(() => { stopServerPoll(); removeDraw(); Object.values(state.loca
 .badge, .status { display: inline-flex; align-items: center; justify-content: center; padding: 2px 8px; border-radius: 999px; font-size: 0.62rem; font-weight: 700; border: 1px solid; }
 .level-l1 { background: #fffbf0; color: var(--warn); border-color: #f5e6c3; }
 .level-l2 { background: #e7f4f1; color: var(--ok); border-color: #b9d9d0; }
+.level-l2a { background: #eef3ff; color: #355cb3; border-color: #c7d5f8; }
+.level-default { background: var(--bg); color: var(--muted); border-color: var(--line); }
 .between small { font-size: 0.65rem; color: var(--muted); }
 
 /* ── Task panel ───────────────────────────────────────────── */
@@ -663,6 +936,8 @@ onBeforeUnmount(() => { stopServerPoll(); removeDraw(); Object.values(state.loca
 .task-card p { color: var(--muted); font-size: 0.65rem; margin: 1px 0; }
 .progress { height: 6px; margin: 0.35rem 0 0.28rem; border-radius: 999px; background: var(--line); overflow: hidden; }
 .fill { height: 100%; background: linear-gradient(90deg, var(--pri), #6fae7f); border-radius: inherit; transition: width 0.25s ease; }
+.progress.indeterminate .fill { width: 36%; animation: progress-slide 1.15s ease-in-out infinite; }
+.progress-text { margin-left: auto; color: #355049; font-size: 0.65rem; font-weight: 700; white-space: nowrap; }
 .status-pending { background: var(--bg); color: var(--muted); border-color: var(--line); }
 .status-downloading { background: #e7f4f1; color: var(--ok); border-color: #b9d9d0; }
 .status-retrying { background: #fffbf0; color: var(--warn); border-color: #f5e6c3; }
@@ -671,6 +946,10 @@ onBeforeUnmount(() => { stopServerPoll(); removeDraw(); Object.values(state.loca
 .status-cancelled { background: var(--bg); color: var(--muted); border-color: var(--line); }
 .error { margin: 0.28rem 0 0; color: var(--err); font-size: 0.65rem; line-height: 1.4; }
 .error-detail { color: var(--muted); }
+@keyframes progress-slide {
+  0% { transform: translateX(-120%); }
+  100% { transform: translateX(320%); }
+}
 
 /* ── Modals ───────────────────────────────────────────────── */
 .mask { position: fixed; inset: 0; z-index: 30; display: flex; align-items: center; justify-content: center; padding: 1rem; background: rgba(20, 30, 27, 0.42); }

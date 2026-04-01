@@ -1,4 +1,4 @@
-"""Landsat scene search and download service."""
+"""Imagery scene search and download service with Landsat compatibility wrappers."""
 
 from __future__ import annotations
 
@@ -21,10 +21,10 @@ from fastapi.responses import StreamingResponse
 
 from ..core.config import settings
 from ..core.models import (
+    ImageryDownloadTaskCreateRequest,
+    ImagerySearchRequest,
     LandsatAuthRequest,
-    LandsatDownloadTaskCreateRequest,
     LandsatProxyRequest,
-    LandsatSearchRequest,
 )
 
 logger = logging.getLogger(__name__)
@@ -47,30 +47,56 @@ class DownloadTaskCancelled(Exception):
 
 
 class LandsatDownloadService:
-    """Encapsulates Landsat search, auth and download task management."""
+    """Encapsulates imagery search, auth and download task management."""
 
     EROS_LOGIN_URL = "https://ers.cr.usgs.gov/login"
 
-    STAC_CONFIGS = {
-        "L2": {
-            "url": "https://planetarycomputer.microsoft.com/api/stac/v1",
-            "collection": "landsat-c2-l2",
-            "sign": True,
-            "title": "Collection 2 Level-2",
-            "description": "已完成大气校正与表面反射率处理，适合直接分析。",
-            "auth_required": False,
+    SENSOR_TITLES = {
+        "landsat": "Landsat",
+        "sentinel-2": "Sentinel-2",
+    }
+
+    PRODUCT_CONFIGS = {
+        "landsat": {
+            "title": "Landsat",
+            "products": {
+                "L2": {
+                    "url": "https://planetarycomputer.microsoft.com/api/stac/v1",
+                    "collection": "landsat-c2-l2",
+                    "sign": True,
+                    "title": "Collection 2 Level-2",
+                    "description": "已完成大气校正与表面反射率处理，适合直接分析。",
+                    "auth_required": False,
+                    "platform_tokens": ("landsat-8",),
+                },
+                "L1": {
+                    "url": "https://landsatlook.usgs.gov/stac-server",
+                    "collection": "landsat-c2l1",
+                    "sign": False,
+                    "title": "Collection 2 Level-1",
+                    "description": "原始级产品，适合保留完整原始数据链路。",
+                    "auth_required": True,
+                    "platform_tokens": ("landsat-8",),
+                },
+            },
         },
-        "L1": {
-            "url": "https://landsatlook.usgs.gov/stac-server",
-            "collection": "landsat-c2l1",
-            "sign": False,
-            "title": "Collection 2 Level-1",
-            "description": "原始级产品，适合保留完整原始数据链路。",
-            "auth_required": True,
+        "sentinel-2": {
+            "title": "Sentinel-2",
+            "products": {
+                "L2A": {
+                    "url": "https://planetarycomputer.microsoft.com/api/stac/v1",
+                    "collection": "sentinel-2-l2a",
+                    "sign": True,
+                    "title": "Level-2A",
+                    "description": "地表反射率产品，适合直接分析与波段下载。",
+                    "auth_required": False,
+                    "platform_tokens": ("sentinel-2a", "sentinel-2b", "sentinel-2c", "sentinel-2"),
+                },
+            },
         },
     }
 
-    BAND_DISPLAY = {
+    LANDSAT_ASSET_DISPLAY = {
         "coastal": "B1 - 海岸/气溶胶",
         "blue": "B2 - 蓝",
         "green": "B3 - 绿",
@@ -99,6 +125,25 @@ class LandsatDownloadService:
         "mtl.txt": "MTL.txt - 元数据文件",
     }
 
+    SENTINEL_ASSET_DISPLAY = {
+        "B01": "B01 - 气溶胶",
+        "B02": "B02 - 蓝",
+        "B03": "B03 - 绿",
+        "B04": "B04 - 红",
+        "B05": "B05 - 红边 1",
+        "B06": "B06 - 红边 2",
+        "B07": "B07 - 红边 3",
+        "B08": "B08 - 近红外",
+        "B8A": "B8A - 窄近红外",
+        "B09": "B09 - 水汽",
+        "B11": "B11 - SWIR1",
+        "B12": "B12 - SWIR2",
+        "AOT": "AOT - 气溶胶光学厚度",
+        "WVP": "WVP - 水汽",
+        "SCL": "SCL - 场景分类",
+        "visual": "visual - 真彩色快速浏览",
+    }
+
     SKIP_ASSETS = {
         "rendered_preview",
         "tilejson",
@@ -109,6 +154,10 @@ class LandsatDownloadService:
         "ang",
         "ANG.txt",
         "MTL.json",
+        "granule-metadata",
+        "product-metadata",
+        "inspire-metadata",
+        "metadata",
     }
     EXTRA_ASSETS = {"MTL.txt", "mtl.txt"}
     THUMB_KEYS = ("rendered_preview", "thumbnail", "reduced_resolution_browse")
@@ -124,7 +173,8 @@ class LandsatDownloadService:
         no_proxy: Optional[str] = None,
         max_concurrent_downloads: int = 3,
     ) -> None:
-        self.download_dir = Path(download_dir or settings.LANDSAT_DOWNLOAD_DIR)
+        self._default_download_dir = Path(download_dir or settings.LANDSAT_DOWNLOAD_DIR).resolve(strict=False)
+        self.download_dir = self._default_download_dir
         self.download_dir.mkdir(parents=True, exist_ok=True)
 
         self.http_timeout = http_timeout or settings.HTTP_TIMEOUT
@@ -167,59 +217,185 @@ class LandsatDownloadService:
     def _format_timestamp(timestamp: datetime) -> str:
         return timestamp.isoformat().replace("+00:00", "Z")
 
-    def list_collections(self) -> Dict:
-        """Return frontend-facing collection metadata."""
+    def list_collections(self, sensor: Optional[str] = None) -> Dict:
+        """Return frontend-facing imagery collection metadata."""
+        normalized_sensor = None
+        if sensor:
+            normalized_sensor = str(sensor).strip().lower()
+            if normalized_sensor not in self.PRODUCT_CONFIGS:
+                raise ValueError(f"不支持的影像类型: {sensor}")
+
         collections = []
-        for level, info in self.STAC_CONFIGS.items():
-            collections.append(
-                {
-                    "level": level,
+        sensors = []
+        for sensor_key, sensor_info in self.PRODUCT_CONFIGS.items():
+            if normalized_sensor and sensor_key != normalized_sensor:
+                continue
+
+            products = []
+            for product_key, info in sensor_info["products"].items():
+                entry = {
+                    "sensor": sensor_key,
+                    "sensor_title": sensor_info["title"],
+                    "product": product_key,
                     "title": info["title"],
                     "description": info["description"],
                     "collection": info["collection"],
                     "stac_url": info["url"],
                     "auth_required": info["auth_required"],
                 }
+                collections.append(entry)
+                products.append(dict(entry))
+
+            sensors.append(
+                {
+                    "sensor": sensor_key,
+                    "title": sensor_info["title"],
+                    "products": products,
+                }
             )
 
         return {
             "collections": collections,
+            "sensors": sensors,
             "download_dir": str(self.download_dir),
         }
 
+    def get_download_dir_status(self) -> Dict:
+        with self._lock:
+            current_dir = self.download_dir
+            default_dir = self._default_download_dir
+        return {
+            "download_dir": str(current_dir),
+            "default_download_dir": str(default_dir),
+        }
+
+    def configure_download_dir(self, download_dir: Optional[Path] = None) -> Dict:
+        next_dir = Path(download_dir or self._default_download_dir).resolve(strict=False)
+        next_dir.mkdir(parents=True, exist_ok=True)
+        with self._lock:
+            self.download_dir = next_dir
+        return self.get_download_dir_status()
+
     @classmethod
-    def _normalize_level(
+    def _get_product_config(cls, *, sensor: str, product: str) -> Dict:
+        sensor_key = cls._normalize_sensor(explicit_sensor=sensor)
+        sensor_info = cls.PRODUCT_CONFIGS.get(sensor_key)
+        if not sensor_info:
+            raise ValueError(f"不支持的影像类型: {sensor}")
+
+        requested_product = str(product or "").strip().upper()
+        product_key = requested_product or cls._normalize_product(sensor=sensor_key, explicit_product=product)
+        product_info = sensor_info["products"].get(product_key)
+        if not product_info:
+            raise ValueError(f"不支持的产品级别: {sensor_key}/{product}")
+
+        return {
+            "sensor": sensor_key,
+            "sensor_title": sensor_info["title"],
+            "product": product_key,
+            **product_info,
+        }
+
+    @classmethod
+    def _normalize_sensor(
         cls,
         *,
+        explicit_sensor: Optional[str] = None,
+        scene_id: str = "",
+        filename: str = "",
+        url: str = "",
+        collection: str = "",
+    ) -> str:
+        candidates = []
+        if explicit_sensor:
+            candidates.append(explicit_sensor)
+        candidates.extend([collection, scene_id, filename, url])
+
+        for candidate in candidates:
+            normalized = str(candidate or "").strip().lower()
+            if not normalized:
+                continue
+            if "sentinel" in normalized or re.search(r"(^|[^a-z0-9])s2[a-c]?([^a-z0-9]|$)", normalized):
+                return "sentinel-2"
+            if "landsat" in normalized or re.search(
+                r"(^|[^a-z0-9])(lc08|lc09|lo08|lo09|le07|lt05)([^a-z0-9]|$)",
+                normalized,
+            ):
+                return "landsat"
+        return "landsat"
+
+    @classmethod
+    def _normalize_product(
+        cls,
+        *,
+        sensor: str = "",
+        explicit_product: Optional[str] = None,
         explicit_level: Optional[str] = None,
         scene_id: str = "",
         filename: str = "",
         url: str = "",
+        collection: str = "",
     ) -> str:
+        sensor_key = cls._normalize_sensor(
+            explicit_sensor=sensor,
+            scene_id=scene_id,
+            filename=filename,
+            url=url,
+            collection=collection,
+        )
         candidates = []
+        if explicit_product:
+            candidates.append(explicit_product)
         if explicit_level:
             candidates.append(explicit_level)
-        candidates.extend([scene_id, filename, url])
+        candidates.extend([collection, scene_id, filename, url])
 
         for candidate in candidates:
             normalized = str(candidate or "").upper()
+            if not normalized:
+                continue
+            if sensor_key == "sentinel-2":
+                if "L2A" in normalized or "SENTINEL-2-L2A" in normalized:
+                    return "L2A"
+                continue
+
             if "L2SP" in normalized or "_L2" in normalized or "LANDSAT-C2-L2" in normalized:
                 return "L2"
             if any(token in normalized for token in ("L1TP", "L1GT", "L1GS", "_L1", "LANDSAT-C2L1")):
                 return "L1"
-        return "L2"
+
+        return "L2A" if sensor_key == "sentinel-2" else "L2"
 
     @classmethod
-    def _build_server_target_dir(cls, base_dir: Path, task: Dict) -> Path:
-        level = cls._normalize_level(
+    def _safe_scene_id(cls, scene_id: str) -> str:
+        safe_scene_id = re.sub(r'[\\/:*?"<>|]+', "_", (scene_id or "").strip())
+        return safe_scene_id or "unknown_scene"
+
+    @classmethod
+    def _build_task_target_relative_dir(cls, task: Dict) -> Path:
+        sensor = cls._normalize_sensor(
+            explicit_sensor=task.get("sensor"),
+            scene_id=task.get("scene_id", ""),
+            filename=task.get("filename", ""),
+            url=task.get("url", ""),
+            collection=task.get("collection", ""),
+        )
+        product = cls._normalize_product(
+            sensor=sensor,
+            explicit_product=task.get("product"),
             explicit_level=task.get("level"),
             scene_id=task.get("scene_id", ""),
             filename=task.get("filename", ""),
             url=task.get("url", ""),
+            collection=task.get("collection", ""),
         )
         date_folder = task.get("download_date") or cls._local_today_folder()
-        scene_id = task.get("scene_id") or "unknown_scene"
-        return base_dir / date_folder / level / scene_id
+        scene_id = cls._safe_scene_id(task.get("scene_id") or "unknown_scene")
+        return Path(date_folder) / sensor / product / scene_id
+
+    @classmethod
+    def _build_server_target_dir(cls, base_dir: Path, task: Dict) -> Path:
+        return base_dir / cls._build_task_target_relative_dir(task)
 
     def get_auth_status(self) -> Dict:
         configured = bool(self._eros_username and self._eros_password)
@@ -265,10 +441,9 @@ class LandsatDownloadService:
         )
         return self.get_proxy_status()
 
-    async def search(self, request: LandsatSearchRequest) -> Dict:
+    async def search(self, request: ImagerySearchRequest) -> Dict:
         self._apply_proxy_env()
-        level = request.level.upper()
-        config = self.STAC_CONFIGS.get(level, self.STAC_CONFIGS["L2"])
+        config = self._get_product_config(sensor=request.sensor, product=request.product)
         catalog_kwargs = {"modifier": planetary_computer.sign_inplace} if config["sign"] else {}
         catalog = pystac_client.Client.open(config["url"], **catalog_kwargs)
         raw_search = catalog.search(
@@ -280,23 +455,31 @@ class LandsatDownloadService:
 
         items = []
         for item in raw_search.items():
-            platform = str(item.properties.get("platform", "")).lower().replace("_", "-")
-            if "landsat-8" not in platform:
+            if not self._matches_platform(item, config):
                 continue
 
-            cloud_cover = item.properties.get("eo:cloud_cover")
+            cloud_cover = self._item_cloud_cover(item)
             if cloud_cover is not None and request.max_cloud_cover < 100 and cloud_cover > request.max_cloud_cover:
+                continue
+
+            assets = self._parse_assets(item, config)
+            if not assets:
                 continue
 
             items.append(
                 {
                     "id": item.id,
-                    "level": level,
+                    "sensor": config["sensor"],
+                    "sensor_title": config["sensor_title"],
+                    "product": config["product"],
+                    "collection": config["collection"],
+                    "title": config["title"],
+                    "auth_required": config["auth_required"],
                     "datetime": item.datetime.isoformat() if item.datetime else None,
                     "cloud_cover": round(cloud_cover, 1) if cloud_cover is not None else None,
                     "bbox": item.bbox,
                     "thumbnail": self._pick_thumbnail(item),
-                    "assets": self._parse_assets(item, config),
+                    "assets": assets,
                     "path": item.properties.get("landsat:wrs_path"),
                     "row": item.properties.get("landsat:wrs_row"),
                 }
@@ -317,7 +500,7 @@ class LandsatDownloadService:
             on_retry=self._sleep_before_retry,
         )
 
-        safe_filename = filename.replace('"', "_") or "landsat_asset.bin"
+        safe_filename = filename.replace('"', "_") or "imagery_asset.bin"
         headers = {
             "Content-Disposition": f'attachment; filename="{safe_filename}"',
             "Content-Type": response.headers.get("content-type", "application/octet-stream"),
@@ -335,20 +518,36 @@ class LandsatDownloadService:
 
         return StreamingResponse(stream_file(), headers=headers)
 
-    async def create_download_tasks(self, request: LandsatDownloadTaskCreateRequest) -> Dict:
+    async def create_download_tasks(self, request: ImageryDownloadTaskCreateRequest) -> Dict:
         created_ids = []
+        with self._lock:
+            active_download_dir = self.download_dir
         for item in request.items:
             task_id = uuid.uuid4().hex[:10]
-            level = self._normalize_level(
-                explicit_level=item.level,
+            sensor = self._normalize_sensor(
+                explicit_sensor=item.sensor,
                 scene_id=item.scene_id,
                 filename=item.filename,
                 url=item.url,
+                collection=item.collection or "",
             )
+            product = self._normalize_product(
+                sensor=sensor,
+                explicit_product=item.product,
+                scene_id=item.scene_id,
+                filename=item.filename,
+                url=item.url,
+                collection=item.collection or "",
+            )
+            config = self._get_product_config(sensor=sensor, product=product)
             task_record = {
                 "id": task_id,
+                "sensor": sensor,
+                "product": product,
+                "collection": item.collection or config["collection"],
+                "auth_required": config["auth_required"] if item.auth_required is None else bool(item.auth_required),
                 "scene_id": item.scene_id,
-                "level": level,
+                "level": product if sensor == "landsat" else None,
                 "band": item.band,
                 "filename": item.filename,
                 "url": item.url,
@@ -361,11 +560,13 @@ class LandsatDownloadService:
                 "last_error": None,
                 "retry_count": 0,
                 "max_retries": DOWNLOAD_MAX_RETRIES,
+                "download_root": str(active_download_dir),
                 "local_path": None,
                 "download_date": self._local_today_folder(),
                 "created_at": self._format_timestamp(self._utc_now()),
                 "updated_at": self._format_timestamp(self._utc_now()),
             }
+            task_record["target_dir"] = self._build_task_target_relative_dir(task_record).as_posix()
             with self._lock:
                 self._tasks[task_id] = task_record
 
@@ -376,31 +577,44 @@ class LandsatDownloadService:
 
         return {"task_ids": created_ids, "count": len(created_ids)}
 
-    def list_download_tasks(self) -> Dict:
+    def list_download_tasks(self, sensor: Optional[str] = None) -> Dict:
         with self._lock:
-            tasks = [task.copy() for task in self._tasks.values()]
+            tasks = [
+                task.copy()
+                for task in self._tasks.values()
+                if not sensor or task.get("sensor") == self._normalize_sensor(explicit_sensor=sensor)
+            ]
         tasks.sort(key=lambda item: item["created_at"], reverse=True)
         return {"tasks": tasks}
 
-    def get_download_task(self, task_id: str) -> Optional[Dict]:
+    def get_download_task(self, task_id: str, sensor: Optional[str] = None) -> Optional[Dict]:
         with self._lock:
             task = self._tasks.get(task_id)
-            return task.copy() if task else None
+            if not task:
+                return None
+            if sensor and task.get("sensor") != self._normalize_sensor(explicit_sensor=sensor):
+                return None
+            return task.copy()
 
-    def clear_completed_tasks(self) -> Dict:
+    def clear_completed_tasks(self, sensor: Optional[str] = None) -> Dict:
         terminal_states = {"completed", "failed", "cancelled"}
         deleted = 0
+        sensor_key = self._normalize_sensor(explicit_sensor=sensor) if sensor else None
         with self._lock:
-            task_ids = [task_id for task_id, task in self._tasks.items() if task["status"] in terminal_states]
+            task_ids = [
+                task_id
+                for task_id, task in self._tasks.items()
+                if task["status"] in terminal_states and (not sensor_key or task.get("sensor") == sensor_key)
+            ]
             for task_id in task_ids:
                 deleted += 1
                 self._tasks.pop(task_id, None)
         return {"deleted": deleted}
 
-    def cancel_download_task(self, task_id: str) -> Dict:
+    def cancel_download_task(self, task_id: str, sensor: Optional[str] = None) -> Dict:
         with self._lock:
             task = self._tasks.get(task_id)
-            if not task:
+            if not task or (sensor and task.get("sensor") != self._normalize_sensor(explicit_sensor=sensor)):
                 raise KeyError(task_id)
 
             if task["status"] in {"pending", "downloading", "retrying"}:
@@ -409,8 +623,8 @@ class LandsatDownloadService:
 
         return {"ok": True, "task_id": task_id}
 
-    async def build_task_file_response(self, task_id: str) -> StreamingResponse:
-        task = self.get_download_task(task_id)
+    async def build_task_file_response(self, task_id: str, sensor: Optional[str] = None) -> StreamingResponse:
+        task = self.get_download_task(task_id, sensor=sensor)
         if not task:
             raise KeyError(task_id)
         if task["status"] != "completed" or not task["local_path"]:
@@ -443,7 +657,9 @@ class LandsatDownloadService:
             if not task or task["status"] == "cancelled":
                 return
 
-            target_dir = self._build_server_target_dir(self.download_dir, task)
+            task_download_root = Path(task.get("download_root") or self.download_dir).resolve(strict=False)
+            target_dir = self._build_server_target_dir(task_download_root, task)
+            self._update_task(task_id, target_dir=self._build_task_target_relative_dir(task).as_posix())
             target_dir.mkdir(parents=True, exist_ok=True)
             target_path = target_dir / task["filename"]
 
@@ -504,8 +720,10 @@ class LandsatDownloadService:
 
             async def handle_retry(retry_count: int, delay_seconds: int, exc: Exception) -> bool:
                 logger.warning(
-                    "Landsat 下载任务重试 %s: retry=%s/%s delay=%ss error=%s",
+                    "影像下载任务重试 %s [%s/%s]: retry=%s/%s delay=%ss error=%s",
                     task_id,
+                    task.get("sensor"),
+                    task.get("product"),
                     retry_count,
                     DOWNLOAD_MAX_RETRIES,
                     delay_seconds,
@@ -538,7 +756,14 @@ class LandsatDownloadService:
                     self._update_task(task_id, status="cancelled")
                 return
             except Exception as exc:
-                logger.error("Landsat 下载任务失败 %s: %s", task_id, exc, exc_info=True)
+                logger.error(
+                    "影像下载任务失败 %s [%s/%s]: %s",
+                    task_id,
+                    task.get("sensor"),
+                    task.get("product"),
+                    exc,
+                    exc_info=True,
+                )
                 self._remove_partial_file(target_path)
                 is_retryable = self._is_retryable_download_error(exc)
                 self._update_task(
@@ -743,7 +968,7 @@ class LandsatDownloadService:
 
     async def _sleep_before_retry(self, _retry_count: int, delay_seconds: int, exc: Exception) -> bool:
         logger.warning(
-            "Landsat 代理下载准备重试: delay=%ss error=%s",
+            "影像代理下载准备重试: delay=%ss error=%s",
             delay_seconds,
             exc,
         )
@@ -768,19 +993,56 @@ class LandsatDownloadService:
         return None
 
     @classmethod
+    def _matches_platform(cls, item, config: Dict) -> bool:
+        platform_tokens = tuple(config.get("platform_tokens") or ())
+        if not platform_tokens:
+            return True
+
+        platform_values = [
+            str(item.properties.get("platform", "")),
+            str(item.properties.get("constellation", "")),
+            str(item.properties.get("mission", "")),
+        ]
+        normalized_text = " ".join(value.lower().replace("_", "-") for value in platform_values if value).strip()
+        if not normalized_text:
+            return True
+        return any(token in normalized_text for token in platform_tokens)
+
+    @staticmethod
+    def _item_cloud_cover(item) -> Optional[float]:
+        for key in ("eo:cloud_cover", "s2:cloud_cover", "s2:cloud_cover_percentage", "cloud_cover"):
+            value = item.properties.get(key)
+            if value is None:
+                continue
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return None
+        return None
+
+    @classmethod
+    def _asset_display_map(cls, sensor: str) -> Dict[str, str]:
+        if sensor == "sentinel-2":
+            return cls.SENTINEL_ASSET_DISPLAY
+        return cls.LANDSAT_ASSET_DISPLAY
+
+    @classmethod
     def _parse_assets(cls, item, config: Dict) -> Dict:
         assets = {}
+        display_map = cls._asset_display_map(config.get("sensor", "landsat"))
         for key, asset in item.assets.items():
             if key in cls.SKIP_ASSETS:
                 continue
 
             media_type = getattr(asset, "media_type", "") or ""
-            if "tiff" not in media_type.lower() and key not in cls.BAND_DISPLAY and key not in cls.EXTRA_ASSETS:
+            href = getattr(asset, "href", "") or ""
+            is_tiff_like = "tiff" in media_type.lower() or href.lower().endswith((".tif", ".tiff"))
+            if not is_tiff_like and key not in display_map and key not in cls.EXTRA_ASSETS:
                 continue
 
             assets[key] = {
-                "href": asset.href,
-                "label": cls.BAND_DISPLAY.get(key, key),
+                "href": href,
+                "label": display_map.get(key, key),
                 "signed": config["sign"],
             }
         return assets

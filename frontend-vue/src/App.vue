@@ -691,7 +691,7 @@ onBeforeUnmount(() => {
         :class="{ active: state.currentTab === 'download' }"
         @click="switchTab('download')"
       >
-        Landsat 下载
+        影像下载
       </button>
       <button
         class="tab-btn"
