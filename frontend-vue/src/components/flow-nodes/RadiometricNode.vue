@@ -36,21 +36,81 @@ const props = defineProps(['id', 'data', 'selected'])
 
 <style scoped>
 .flow-node {
-  min-width: 160px; border-radius: 8px; border: 2px solid #9ca3af;
-  background: #f9fafb; cursor: default; transition: box-shadow 0.2s;
+  --node-accent: #68746f;
+  --node-accent-soft: #eef1f0;
+  --node-accent-text: #58625d;
+  min-width: 188px;
+  border-radius: 14px;
+  border: 1px solid #d8e0dd;
+  background: #ffffff;
+  box-shadow: 0 4px 12px rgba(23, 32, 29, 0.05);
+  cursor: default;
+  transition: box-shadow 0.18s ease, border-color 0.18s ease;
 }
-.flow-node.selected { border-color: #6b7280; box-shadow: 0 0 0 3px rgba(107,114,128,0.2); }
+.flow-node.selected {
+  border-color: rgba(104, 116, 111, 0.32);
+  box-shadow: 0 0 0 2px rgba(104, 116, 111, 0.1);
+}
 .node-header {
-  display: flex; align-items: center; gap: 6px;
-  padding: 8px 10px 6px; border-bottom: 1px solid #e5e7eb;
-  background: #e5e7eb; border-radius: 6px 6px 0 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 11px 7px;
+  border-bottom: 1px solid #e7edeb;
+  background: #f8faf9;
 }
-.node-icon { display: flex; align-items: center; color: #374151; }
-.node-title { font-size: 13px; font-weight: 600; color: #374151; flex: 1; }
-.node-lock { display: flex; align-items: center; color: #9ca3af; }
-.node-body { padding: 8px 10px; }
-.node-steps { display: flex; align-items: center; gap: 4px; margin-bottom: 4px; }
-.step { font-size: 10px; background: #d1d5db; padding: 1px 5px; border-radius: 3px; color: #374151; font-weight: 500; }
-.arrow { color: #9ca3af; flex-shrink: 0; }
-.node-hint { font-size: 10px; color: #9ca3af; font-style: italic; }
+.node-icon {
+  width: 24px;
+  height: 24px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 8px;
+  background: var(--node-accent-soft);
+  color: var(--node-accent-text);
+  flex-shrink: 0;
+}
+.node-title {
+  font-size: 12px;
+  font-weight: 700;
+  color: #22312d;
+  flex: 1;
+}
+.node-lock {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  border-radius: 999px;
+  background: #eef2f1;
+  color: #7f8d88;
+}
+.node-body {
+  padding: 10px 11px 11px;
+}
+.node-steps {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-bottom: 6px;
+  flex-wrap: wrap;
+}
+.step {
+  font-size: 10px;
+  padding: 2px 6px;
+  border-radius: 999px;
+  background: #f1f4f3;
+  color: #56635e;
+  font-weight: 700;
+}
+.arrow {
+  color: #8a9691;
+  flex-shrink: 0;
+}
+.node-hint {
+  font-size: 10.5px;
+  color: #889691;
+  font-style: italic;
+}
 </style>

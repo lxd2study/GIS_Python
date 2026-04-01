@@ -12,6 +12,7 @@ frontend-vue/.env.local
 logs/
 *.log
 temp/
+tmp*/
 cache/
 output/
 data/
@@ -36,3 +37,7 @@ docs/archive/
 Thumbs.db
 .DS_Store
 docs/毕业论文起稿.md
+
+# Local installers / archives
+*.whl
+cache.zip

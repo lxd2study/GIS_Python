@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
 
+from ..core.config import settings
 from ..core.models import (
     BatchJob,
     BatchJobConfig,
@@ -18,6 +19,7 @@ from ..core.models import (
 )
 from ..core.processor import Landsat8Processor
 from ..utils.file_utils import collect_band_paths, detect_product_level_from_path, find_scene_support_files
+from ..utils.path_policy import PathAccessController
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +46,7 @@ class BatchJobManager:
         self.workers: List[threading.Thread] = []
         self.shutdown_flag = threading.Event()
         self.paused_jobs: Dict[str, BatchJob] = {}  # 暂停的任务
+        self.path_access = PathAccessController(settings.allowed_path_roots)
 
         # 启动工作线程
         self._start_workers()
@@ -126,10 +129,33 @@ class BatchJobManager:
                 job.config.band_dir,
                 product_level=job.config.product_level,
             )
+            band_paths = {
+                band_name: str(
+                    self.path_access.require_file(
+                        band_path,
+                        access_label="读取波段文件",
+                    )
+                )
+                for band_name, band_path in band_paths.items()
+            }
             scene_support_files = find_scene_support_files(
                 job.config.band_dir,
                 product_level=job.config.product_level,
             )
+            scene_support_files = {
+                "mtl_file": self.path_access.optional_file(
+                    scene_support_files.get("mtl_file"),
+                    access_label="读取自动发现的 MTL 文件",
+                ),
+                "qa_band": self.path_access.optional_file(
+                    scene_support_files.get("qa_band"),
+                    access_label="读取自动发现的 QA 文件",
+                ),
+                "qa_radsat_band": self.path_access.optional_file(
+                    scene_support_files.get("qa_radsat_band"),
+                    access_label="读取自动发现的 QA_RADSAT 文件",
+                ),
+            }
             processor = Landsat8Processor()
 
             def resolve_support_file(configured_path: Optional[str], detected_path: Optional[str]) -> Optional[str]:
@@ -243,9 +269,10 @@ class BatchJobManager:
         """
         batch_id = str(uuid.uuid4())
         created_at = self._utc_now()
+        validated_configs = [self.path_access.validate_batch_job_config(config) for config in jobs_config]
 
         job_list = []
-        for config in jobs_config:
+        for config in validated_configs:
             job_id = str(uuid.uuid4())
             job = BatchJob(
                 job_id=job_id,

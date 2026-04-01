@@ -30,19 +30,79 @@ const props = defineProps(['id', 'data', 'selected'])
 
 <style scoped>
 .flow-node {
-  min-width: 150px; border-radius: 8px; border: 2px solid #6ee7b7;
-  background: #ecfdf5; cursor: pointer; transition: box-shadow 0.2s, border-color 0.2s;
+  --node-accent: #4d7b67;
+  --node-accent-soft: #edf4f0;
+  --node-accent-text: #426755;
+  min-width: 178px;
+  border-radius: 14px;
+  border: 1px solid #d8e0dd;
+  background: #ffffff;
+  box-shadow: 0 4px 12px rgba(23, 32, 29, 0.05);
+  cursor: pointer;
+  transition: box-shadow 0.18s ease, border-color 0.18s ease;
 }
-.flow-node.selected { border-color: #059669; box-shadow: 0 0 0 3px rgba(5,150,105,0.25); }
+.flow-node.selected {
+  border-color: rgba(77, 123, 103, 0.32);
+  box-shadow: 0 0 0 2px rgba(77, 123, 103, 0.1);
+}
 .node-header {
-  display: flex; align-items: center; gap: 6px;
-  padding: 8px 10px 6px; border-bottom: 1px solid #a7f3d0;
-  background: #d1fae5; border-radius: 6px 6px 0 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 11px 7px;
+  border-bottom: 1px solid #e7edeb;
+  background: #f8faf9;
 }
-.node-icon { display: flex; align-items: center; color: #065f46; }
-.node-title { font-size: 13px; font-weight: 600; color: #065f46; flex: 1; }
-.method-badge { font-size: 10px; font-weight: 700; background: #059669; color: #fff; padding: 1px 6px; border-radius: 4px; }
-.node-body { padding: 8px 10px; }
-.node-info { font-size: 11px; color: #047857; margin-bottom: 2px; }
-.cloud-mask { display: flex; align-items: center; gap: 4px; }
+.node-icon {
+  width: 24px;
+  height: 24px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 8px;
+  background: var(--node-accent-soft);
+  color: var(--node-accent-text);
+  flex-shrink: 0;
+}
+.node-title {
+  font-size: 12px;
+  font-weight: 700;
+  color: #22312d;
+  flex: 1;
+}
+.method-badge {
+  min-height: 22px;
+  padding: 0 8px;
+  border-radius: 999px;
+  border: 1px solid #d5e5dd;
+  background: var(--node-accent-soft);
+  color: var(--node-accent-text);
+  font-size: 10px;
+  font-weight: 700;
+  display: inline-flex;
+  align-items: center;
+}
+.node-body {
+  padding: 10px 11px 11px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.node-info {
+  font-size: 11px;
+  color: #5d6d67;
+  line-height: 1.45;
+}
+.cloud-mask {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  align-self: flex-start;
+  min-height: 22px;
+  padding: 0 8px;
+  border-radius: 999px;
+  border: 1px solid #d5e5dd;
+  background: #edf5f1;
+  color: #496858;
+}
 </style>

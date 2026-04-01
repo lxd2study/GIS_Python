@@ -21,26 +21,35 @@
     <div class="node-body">
       <!-- 批量场景模式 -->
       <template v-if="isBatchMode">
-        <div class="scene-summary">
-          已选 <strong>{{ selectedCount }}</strong> / {{ props.data.scenes.length }} 个场景
+        <div class="node-summary">
+          <div class="summary-pill">
+            <strong>{{ selectedCount }}</strong>
+            <span>已选场景</span>
+          </div>
+          <div class="summary-pill">
+            <strong>{{ props.data.scenes.length }}</strong>
+            <span>总场景</span>
+          </div>
         </div>
-        <div class="scene-mtl">
-          <span class="level-badge" :class="productLevelClass">{{ productLevelLabel }}</span>
+        <div class="node-meta">
+          <span class="node-badge accent">{{ productLevelLabel }}</span>
+          <span class="node-badge" :class="hasMixedProducts ? 'warn' : 'ok'">
+            {{ hasMixedProducts ? '混合产品' : '级别统一' }}
+          </span>
         </div>
-        <div class="scene-shp">
-          <span class="shp-has">{{ shpCount }} 个含 SHP</span>
-          <span v-if="noShpCount" class="shp-none">{{ noShpCount }} 个无 SHP</span>
-        </div>
-        <div class="scene-mtl">
-          <span class="mtl-has">{{ mtlCount }} 个含 MTL</span>
-          <span v-if="noMtlCount" class="mtl-none">{{ noMtlCount }} 个无 MTL</span>
+        <div class="node-meta">
+          <span class="node-badge">{{ shpCount }} SHP</span>
+          <span class="node-badge">{{ mtlCount }} MTL</span>
         </div>
       </template>
       <!-- 单场景模式 -->
       <template v-else>
         <div v-if="props.data.scene_name" class="node-info">{{ props.data.scene_name }}</div>
-        <div class="scene-mtl">
-          <span class="level-badge" :class="productLevelClass">{{ productLevelLabel }}</span>
+        <div class="node-meta">
+          <span class="node-badge accent">{{ productLevelLabel }}</span>
+          <span class="node-badge" :class="props.data.mtl_file ? 'ok' : 'muted'">
+            {{ props.data.mtl_file ? 'MTL 已配' : '无 MTL' }}
+          </span>
         </div>
         <div v-if="props.data.band_dir" class="node-path" :title="props.data.band_dir">{{ shortPath(props.data.band_dir) }}</div>
         <div v-else class="node-hint">点击配置波段目录</div>
@@ -58,9 +67,23 @@ const props = defineProps(['id', 'data', 'selected'])
 const isBatchMode = computed(() => (props.data.scenes?.length ?? 0) > 0)
 const selectedCount = computed(() => (props.data.selectedScenes || []).length)
 const shpCount = computed(() => (props.data.scenes || []).filter(s => s.has_shp).length)
-const noShpCount = computed(() => (props.data.scenes || []).filter(s => !s.has_shp).length)
 const mtlCount = computed(() => (props.data.scenes || []).filter(s => s.mtl_file).length)
-const noMtlCount = computed(() => (props.data.scenes || []).filter(s => !s.mtl_file).length)
+const sceneLevelStats = computed(() => {
+  const stats = { onlyL1: 0, onlyL2: 0, mixed: 0 }
+  for (const scene of props.data.scenes || []) {
+    const levels = Array.isArray(scene?.available_product_levels) && scene.available_product_levels.length
+      ? scene.available_product_levels
+      : [scene?.product_level]
+    const normalized = [...new Set(levels.map((item) => String(item || '').trim().toUpperCase()).filter(Boolean))]
+    if (normalized.length > 1) stats.mixed += 1
+    else if (normalized[0] === 'L2') stats.onlyL2 += 1
+    else stats.onlyL1 += 1
+  }
+  return stats
+})
+const hasMixedProducts = computed(() => {
+  return sceneLevelStats.value.mixed > 0 || (sceneLevelStats.value.onlyL1 > 0 && sceneLevelStats.value.onlyL2 > 0)
+})
 const effectiveProductLevel = computed(() => {
   if (isBatchMode.value) {
     const sceneLevels = new Set((props.data.scenes || []).map((scene) => scene.product_level).filter(Boolean))
@@ -68,8 +91,7 @@ const effectiveProductLevel = computed(() => {
   }
   return props.data.product_level || 'L1'
 })
-const productLevelLabel = computed(() => effectiveProductLevel.value === 'L2' ? 'L2 分析' : 'L1 预处理')
-const productLevelClass = computed(() => effectiveProductLevel.value === 'L2' ? 'level-l2' : 'level-l1')
+const productLevelLabel = computed(() => effectiveProductLevel.value === 'L2' ? '当前 L2 路径' : '当前 L1 路径')
 const isConfigured = computed(() => {
   if (isBatchMode.value) return selectedCount.value > 0
   return !!props.data.band_dir
@@ -83,32 +105,158 @@ function shortPath(p) {
 
 <style scoped>
 .flow-node {
-  min-width: 170px; border-radius: 8px; border: 2px solid #93c5fd;
-  background: #eff6ff; cursor: pointer; font-family: inherit;
-  transition: box-shadow 0.2s, border-color 0.2s;
+  --node-accent: #3f6c83;
+  --node-accent-soft: #ebf2f6;
+  --node-accent-text: #36586b;
+  position: relative;
+  overflow: visible;
+  min-width: 196px;
+  border-radius: 14px;
+  border: 1px solid #d8e0dd;
+  background: #ffffff;
+  box-shadow: 0 4px 12px rgba(23, 32, 29, 0.05);
+  cursor: pointer;
+  font-family: inherit;
+  transition: box-shadow 0.18s ease, border-color 0.18s ease;
 }
-.flow-node.selected { border-color: #2563eb; box-shadow: 0 0 0 3px rgba(37,99,235,0.25); }
-.flow-node.configured { border-color: #3b82f6; }
+.flow-node.selected {
+  border-color: rgba(63, 108, 131, 0.34);
+  box-shadow: 0 0 0 2px rgba(63, 108, 131, 0.1);
+}
+.flow-node.configured { border-color: rgba(63, 108, 131, 0.22); }
 .node-header {
-  display: flex; align-items: center; gap: 6px;
-  padding: 8px 10px 6px; border-bottom: 1px solid #bfdbfe;
-  background: #dbeafe; border-radius: 6px 6px 0 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 11px 7px;
+  border-bottom: 1px solid #e7edeb;
+  background: #f8faf9;
 }
-.node-icon { display: flex; align-items: center; color: #1d4ed8; }
-.node-title { font-size: 13px; font-weight: 600; color: #1d4ed8; flex: 1; }
-.node-status { display: flex; align-items: center; }
-.node-status.ok { color: #16a34a; }
-.node-status.warn { color: #d97706; }
-.node-body { padding: 8px 10px; }
-.node-info { font-size: 11px; color: #1e40af; font-weight: 500; margin-bottom: 2px; word-break: break-all; }
-.node-path { font-size: 10px; color: #6b7280; word-break: break-all; }
-.node-hint { font-size: 11px; color: #9ca3af; font-style: italic; }
-.scene-summary { font-size: 12px; color: #1e40af; font-weight: 600; margin-bottom: 3px; }
-.scene-shp { display: flex; gap: 6px; }
-.scene-mtl { display: flex; gap: 6px; margin-top: 3px; }
-.mtl-has { font-size: 10px; color: #2563eb; background: #dbeafe; padding: 1px 5px; border-radius: 3px; }
-.mtl-none { font-size: 10px; color: #9ca3af; background: #f3f4f6; padding: 1px 5px; border-radius: 3px; }
-.level-badge { font-size: 10px; padding: 1px 5px; border-radius: 3px; font-weight: 600; }
-.level-l1 { color: #1e40af; background: #dbeafe; }
-.level-l2 { color: #166534; background: #dcfce7; }
+.node-icon {
+  width: 24px;
+  height: 24px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 8px;
+  background: var(--node-accent-soft);
+  color: var(--node-accent-text);
+  flex-shrink: 0;
+}
+.node-title {
+  font-size: 12px;
+  font-weight: 700;
+  color: #22312d;
+  flex: 1;
+}
+.node-status {
+  width: 20px;
+  height: 20px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 999px;
+}
+.node-status.ok {
+  color: #1b7a57;
+  background: #e5f4ed;
+}
+.node-status.warn {
+  color: #9d6b16;
+  background: #f8eed8;
+}
+.node-body {
+  padding: 10px 11px 11px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.node-info {
+  font-size: 11px;
+  color: #33433e;
+  font-weight: 600;
+  line-height: 1.5;
+  word-break: break-all;
+}
+.node-path {
+  font-size: 10.5px;
+  color: #62716c;
+  line-height: 1.45;
+  word-break: break-all;
+}
+.node-hint {
+  font-size: 11px;
+  color: #889691;
+  font-style: italic;
+}
+.node-summary {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px;
+}
+.summary-pill {
+  padding: 7px 8px;
+  border: 1px solid #e6ece9;
+  border-radius: 10px;
+  background: #f7f9f8;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.summary-pill strong {
+  font-size: 13px;
+  line-height: 1;
+  color: #22312d;
+}
+.summary-pill span {
+  font-size: 10px;
+  color: #80908a;
+}
+.node-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.node-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 22px;
+  padding: 0 8px;
+  border-radius: 999px;
+  border: 1px solid #e1e8e5;
+  background: #f3f6f5;
+  color: #5f6d68;
+  font-size: 10px;
+  font-weight: 700;
+}
+.node-badge.accent {
+  background: var(--node-accent-soft);
+  border-color: #dce6eb;
+  color: var(--node-accent-text);
+}
+.node-badge.ok {
+  background: #e5f4ed;
+  border-color: #d3eadf;
+  color: #1b7a57;
+}
+.node-badge.warn {
+  background: #f8eed8;
+  border-color: #ecdcc0;
+  color: #9d6b16;
+}
+.node-badge.muted {
+  color: #7d8c87;
+}
+
+.input-node :deep(.vue-flow__handle-left[data-handleid="in"]) {
+  left: 0;
+  transform: translate(-50%, -50%);
+}
+
+.input-node :deep(.vue-flow__handle-right[data-handleid="out"]) {
+  top: 40px;
+  right: 0;
+  transform: translate(50%, -50%);
+}
 </style>

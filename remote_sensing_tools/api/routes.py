@@ -28,11 +28,13 @@ from ..services.landsat_download import LandsatDownloadService
 from ..services.templates import ProcessingTemplates
 from ..services.graph_executor import GraphExecutor
 from ..utils.file_utils import find_scene_support_files, infer_available_product_levels
+from ..utils.path_policy import PathAccessController, PathAccessError
 
 logger = logging.getLogger(__name__)
 RASTER_PREVIEW_EXTENSIONS = (".tif", ".tiff", ".img", ".png")
 # 单次写入 1MB，避免大文件上传时把整个文件一次性读入内存。
 UPLOAD_CHUNK_SIZE = 1024 * 1024
+PATH_ACCESS = PathAccessController(settings.allowed_path_roots)
 
 COMPOSITE_DESCRIPTIONS = {
     # RGB合成
@@ -353,23 +355,10 @@ def _launch_async_preprocess(**kwargs) -> None:
 
 
 def _list_root_directories() -> Dict:
-    roots = []
-    if os.name == "nt":
-        for letter in "ABCDEFGHIJKLMNOPQRSTUVWXYZ":
-            drive = f"{letter}:\\"
-            if os.path.exists(drive):
-                roots.append({"name": drive, "path": drive})
-    else:
-        roots.append({"name": "/", "path": "/"})
-
-    cwd = str(Path.cwd())
-    if cwd not in {item["path"] for item in roots}:
-        roots.insert(0, {"name": "当前工作目录", "path": cwd})
-
     return {
         "current": "",
         "parent": "",
-        "directories": roots,
+        "directories": PATH_ACCESS.allowed_roots_payload(),
     }
 
 
@@ -378,10 +367,28 @@ def _list_directory_entries(current: Path) -> List[Dict[str, str]]:
     with os.scandir(current) as it:
         for entry in it:
             if entry.is_dir(follow_symlinks=False):
-                directories.append({"name": entry.name, "path": entry.path})
+                resolved = Path(entry.path).resolve(strict=False)
+                if not PATH_ACCESS.is_allowed(resolved):
+                    continue
+                directories.append({"name": entry.name, "path": str(resolved)})
 
     directories.sort(key=lambda item: item["name"].lower())
     return directories
+
+
+def _raise_path_access_http_error(exc: PathAccessError) -> None:
+    raise HTTPException(status_code=exc.status_code, detail=str(exc))
+
+
+def _optional_allowed_file(path_value: Optional[str], access_label: str) -> Optional[str]:
+    if not path_value:
+        return None
+
+    try:
+        return str(PATH_ACCESS.require_file(path_value, access_label=access_label))
+    except PathAccessError as exc:
+        logger.warning("忽略非法路径 %s: %s", path_value, exc)
+        return None
 
 
 def setup_routes(
@@ -576,16 +583,10 @@ def setup_routes(
         if path is None or not path.strip():
             return _list_root_directories()
 
-        target = Path(path)
-        if not target.exists():
-            raise HTTPException(status_code=404, detail=f"路径不存在: {path}")
-        if not target.is_dir():
-            raise HTTPException(status_code=400, detail=f"不是目录: {path}")
-
         try:
-            current = target.resolve()
-        except Exception:
-            current = target
+            current = PATH_ACCESS.require_directory(path, access_label="浏览目录")
+        except PathAccessError as exc:
+            _raise_path_access_http_error(exc)
 
         try:
             directories = _list_directory_entries(current)
@@ -594,7 +595,9 @@ def setup_routes(
         except OSError as exc:
             raise HTTPException(status_code=500, detail=f"读取目录失败: {exc}")
 
-        parent = str(current.parent) if current.parent != current else ""
+        parent = ""
+        if current.parent != current and PATH_ACCESS.is_allowed(current.parent):
+            parent = str(current.parent.resolve(strict=False))
 
         return {
             "current": str(current),
@@ -605,26 +608,35 @@ def setup_routes(
     @app.get("/filesystem/scan_scenes")
     def scan_scenes(path: str) -> Dict:
         """扫描目录下的遥感影像场景（每个子目录 = 一个场景），检测 shp/ 文件夹"""
-        target = Path(path)
-        if not target.exists():
-            raise HTTPException(status_code=404, detail=f"路径不存在: {path}")
-        if not target.is_dir():
-            raise HTTPException(status_code=400, detail=f"不是目录: {path}")
+        try:
+            target = PATH_ACCESS.require_directory(path, access_label="扫描目录")
+        except PathAccessError as exc:
+            _raise_path_access_http_error(exc)
+
         scenes = []
         try:
             with os.scandir(target) as it:
                 for entry in it:
                     if not entry.is_dir(follow_symlinks=False):
                         continue
-                    scene_path = Path(entry.path)
+
+                    scene_path = Path(entry.path).resolve(strict=False)
+                    if not PATH_ACCESS.is_allowed(scene_path):
+                        continue
+
                     shp_dir = scene_path / "shp"
                     has_shp = False
                     shp_file = None
                     if shp_dir.exists() and shp_dir.is_dir():
-                        shp_files = list(shp_dir.glob("*.shp"))
-                        if shp_files:
-                            has_shp = True
-                            shp_file = str(shp_files[0])
+                        for shp_candidate in shp_dir.glob("*.shp"):
+                            normalized_shp = _optional_allowed_file(
+                                str(shp_candidate),
+                                access_label="读取场景裁剪矢量文件",
+                            )
+                            if normalized_shp:
+                                has_shp = True
+                                shp_file = normalized_shp
+                                break
                     available_product_levels = infer_available_product_levels(scene_path)
                     if available_product_levels:
                         product_level = "L2" if "L2" in available_product_levels else available_product_levels[0]
@@ -634,7 +646,13 @@ def setup_routes(
                         available_product_levels = [product_level]
 
                     product_files = {
-                        level: find_scene_support_files(scene_path, product_level=level)
+                        level: {
+                            key: _optional_allowed_file(
+                                value,
+                                access_label=f"读取场景 {level} 辅助文件",
+                            )
+                            for key, value in find_scene_support_files(scene_path, product_level=level).items()
+                        }
                         for level in available_product_levels
                     }
                     scene_files = product_files.get(product_level, {})
@@ -663,11 +681,17 @@ def setup_routes(
         file_path: str = Form(..., description="待预览的栅格/合成影像路径"),
         max_size: int = Form(512, description="最大预览边长像素"),
     ) -> Dict:
-        if not file_path.lower().endswith(RASTER_PREVIEW_EXTENSIONS):
-            raise HTTPException(status_code=400, detail="仅支持 .tif/.tiff/.img/.png 文件")
+        try:
+            raster_path = PATH_ACCESS.require_file(
+                file_path,
+                access_label="预览栅格",
+                allowed_suffixes=RASTER_PREVIEW_EXTENSIONS,
+            )
+        except PathAccessError as exc:
+            _raise_path_access_http_error(exc)
 
         try:
-            preview = Landsat8Processor().build_preview_base64(file_path, max_size=max_size)
+            preview = Landsat8Processor().build_preview_base64(str(raster_path), max_size=max_size)
             return {"status": "success", "preview": preview}
         except Exception as exc:
             logger.error("预览栅格失败: %s", exc)
@@ -698,6 +722,18 @@ def setup_routes(
     ) -> Dict:
         if not bands:
             raise HTTPException(status_code=400, detail="必须上传至少一个波段文件")
+
+        try:
+            output_dir = str(
+                PATH_ACCESS.require_directory(
+                    output_dir,
+                    access_label="写入输出目录",
+                    must_exist=False,
+                    allow_create=True,
+                )
+            )
+        except PathAccessError as exc:
+            _raise_path_access_http_error(exc)
 
         job_id = str(uuid.uuid4())
         progress_manager.init_progress(job_id)
@@ -798,6 +834,8 @@ def setup_routes(
             }
         except HTTPException:
             raise
+        except PathAccessError as exc:
+            _raise_path_access_http_error(exc)
         except Exception as exc:
             logger.error("图任务提交失败: %s", exc, exc_info=True)
             raise HTTPException(status_code=500, detail=f"图任务提交失败: {exc}")
@@ -832,6 +870,8 @@ def setup_routes(
                 "message": f"成功提交 {len(request.jobs)} 个任务到批量处理队列",
             }
 
+        except PathAccessError as exc:
+            _raise_path_access_http_error(exc)
         except Exception as exc:
             logger.error("批量任务提交失败: %s", exc, exc_info=True)
             raise HTTPException(status_code=500, detail=f"批量任务提交失败: {exc}")

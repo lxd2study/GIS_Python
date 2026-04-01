@@ -5,7 +5,7 @@
 
 import os
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -25,6 +25,7 @@ class Settings(BaseSettings):
     TEMP_DIR: Path = PROJECT_ROOT / "temp"
     CACHE_DIR: Path = PROJECT_ROOT / "cache"
     LANDSAT_DOWNLOAD_DIR: Path = OUTPUT_DIR / "landsat_downloads"
+    ALLOWED_PATH_ROOTS: str = ""
 
     # 6S配置
     SIXS_EXECUTABLE_PATH: Optional[str] = None
@@ -78,6 +79,36 @@ class Settings(BaseSettings):
         """设置GDAL环境变量"""
         os.environ['GDAL_CACHEMAX'] = str(self.GDAL_CACHEMAX)
         os.environ['GDAL_NUM_THREADS'] = self.GDAL_NUM_THREADS
+
+    @property
+    def allowed_path_roots(self) -> List[Path]:
+        """返回允许前端/接口访问的白名单根目录。"""
+        raw_value = (self.ALLOWED_PATH_ROOTS or "").strip()
+        if raw_value:
+            raw_items = [
+                item.strip()
+                for item in raw_value.replace("\r", "\n").replace(";", "\n").splitlines()
+                if item.strip()
+            ]
+        else:
+            raw_items = [self.DATA_DIR, self.OUTPUT_DIR]
+
+        roots: List[Path] = []
+        seen = set()
+        for item in raw_items:
+            path = item if isinstance(item, Path) else Path(str(item).strip()).expanduser()
+            if not path.is_absolute():
+                path = self.PROJECT_ROOT / path
+
+            resolved = path.resolve(strict=False)
+            normalized = os.path.normcase(str(resolved))
+            if normalized in seen:
+                continue
+
+            seen.add(normalized)
+            roots.append(resolved)
+
+        return roots
 
 
 # 全局配置实例
