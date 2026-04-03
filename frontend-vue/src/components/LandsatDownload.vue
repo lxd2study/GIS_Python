@@ -101,7 +101,8 @@ const state = reactive({
   showDownloadDirModal: false,
   showProxyModal: false,
   authForm: { username: '', password: '' },
-  downloadDirForm: '',
+  downloadDirSuffix: '',
+  downloadDirNotice: '',
   authSaving: false,
   downloadDirSaving: false,
   proxyForm: { enabled: false, proxy_url: '', no_proxy: '' },
@@ -207,6 +208,39 @@ function normalizeHistoryStatus(value) {
 function taskMatchesKeyword(task, keyword) {
   if (!keyword) return true
   return [task.scene_id, task.filename, task.band, task.product, task.sensor].some((value) => normalizeTaskKeyword(value).includes(keyword))
+}
+function normalizePath(value) {
+  return String(value || '').trim().replace(/[\\/]+/g, '/').replace(/\/+$/, '')
+}
+function normalizePathForCompare(value) {
+  return normalizePath(value).toLowerCase()
+}
+function sanitizeDownloadDirSuffix(value) {
+  return String(value || '').trim().replace(/^[\\/]+/, '').split(/[\\/]+/).filter(Boolean).join('/')
+}
+function joinDownloadDir(prefix, suffix) {
+  const base = String(prefix || '').trim().replace(/[\\/]+$/, '')
+  const cleanSuffix = sanitizeDownloadDirSuffix(suffix)
+  if (!base) return cleanSuffix
+  if (!cleanSuffix) return base
+  const separator = base.includes('\\') ? '\\' : '/'
+  return `${base}${separator}${cleanSuffix.split('/').join(separator)}`
+}
+function extractDownloadDirSuffix(currentDir, prefix) {
+  const base = String(prefix || '').trim()
+  const current = String(currentDir || '').trim()
+  if (!base) return { suffix: '', notice: '' }
+  const basePath = normalizePath(base)
+  const currentPath = normalizePath(current || base)
+  const baseKey = normalizePathForCompare(base)
+  const currentKey = normalizePathForCompare(current || base)
+  if (!currentKey || currentKey === baseKey) return { suffix: '', notice: '' }
+  if (currentKey.startsWith(`${baseKey}/`)) {
+    const suffix = currentPath.slice(basePath.length + 1)
+    const separator = base.includes('\\') ? '\\' : '/'
+    return { suffix: suffix.split('/').filter(Boolean).join(separator), notice: '' }
+  }
+  return { suffix: '', notice: '当前目录不在预设目录下，保存后会自动迁回固定目录体系。' }
 }
 function buildTaskPanelData(tasks, panelState) {
   const keyword = normalizeTaskKeyword(panelState.keyword)
@@ -492,11 +526,20 @@ function clearLocal() { Object.entries(state.localTasks).forEach(([id, task]) =>
 function openAuth() { state.authForm.username = state.authStatus.username || ''; state.authForm.password = ''; state.showAuthModal = true }
 function closeAuth() { state.showAuthModal = false; state.authForm.password = '' }
 async function saveAuth() { const username = state.authForm.username.trim(); const password = state.authForm.password; if (!username || !password) return toast('请填写完整账号和密码', 'warn'); state.authSaving = true; try { await request('/imagery/auth/earthdata', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username, password }) }); await loadAuthStatus(true); closeAuth(); toast('EarthData / EROS 账号已更新', 'ok') } catch (error) { toast(`账号验证失败：${error.message}`, 'error') } finally { state.authSaving = false } }
-function openDownloadDir() { state.downloadDirForm = state.downloadRoot || state.defaultDownloadRoot || ''; state.showDownloadDirModal = true }
-function closeDownloadDir() { state.showDownloadDirModal = false }
-function pickDownloadRoot(path) { state.downloadDirForm = path || '' }
+function openDownloadDir() {
+  const fixedPrefix = String(state.defaultDownloadRoot || state.downloadRoot || '').trim()
+  const { suffix, notice } = extractDownloadDirSuffix(state.downloadRoot || fixedPrefix, fixedPrefix)
+  state.downloadDirSuffix = suffix
+  state.downloadDirNotice = notice
+  state.showDownloadDirModal = true
+}
+function closeDownloadDir() { state.showDownloadDirModal = false; state.downloadDirNotice = '' }
 async function saveDownloadDir(useDefault = false) {
-  const payload = { download_dir: useDefault ? '' : state.downloadDirForm.trim() }
+  const fixedPrefix = String(state.defaultDownloadRoot || '').trim()
+  const cleanSuffix = sanitizeDownloadDirSuffix(state.downloadDirSuffix)
+  if (!useDefault && cleanSuffix && !fixedPrefix) return toast('默认下载目录未加载，无法保存子目录', 'warn')
+  const payload = { download_dir: useDefault || !cleanSuffix ? '' : joinDownloadDir(fixedPrefix, cleanSuffix) }
+  if (!useDefault) state.downloadDirSuffix = cleanSuffix
   state.downloadDirSaving = true
   try {
     const data = await request('/imagery/download_dir', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) })
@@ -814,7 +857,29 @@ onBeforeUnmount(() => {
     </section>
     <div v-if="state.modalOpen" class="mask" @click.self="closeAssetModal"><div class="modal"><div class="head"><div><h3>选择资产</h3><p>{{ state.modalScene?.id }} · {{ sensorLabel(state.modalScene?.sensor) }} / {{ state.modalScene?.product }}</p></div><button class="btn sub" type="button" @click="closeAssetModal">关闭</button></div><div class="row"><button class="btn sub" type="button" @click="choosePreset('rgb')">RGB</button><button class="btn sub" type="button" @click="choosePreset('vegetation')">植被组合</button><button class="btn sub" type="button" @click="choosePreset('all')">全选</button><span class="count">已选 {{ selectedModalAssetCount }} 项</span></div><div class="asset-grid"><label v-for="[key, asset] in sortedAssets(state.modalScene?.assets)" :key="key" class="asset-item"><input v-model="state.modalAssets[key]" type="checkbox" /><div><strong>{{ key }}</strong><p>{{ asset.label }}</p></div></label></div><div class="row end"><button class="btn" type="button" @click="confirmAssetDownload">加入下载</button></div></div></div>
     <div v-if="state.showAuthModal" class="mask" @click.self="closeAuth"><div class="modal auth-modal"><div class="head"><div><h3>EarthData / EROS</h3><p>当前主要用于 Landsat L1 / USGS 资产下载。</p></div><button class="btn sub" type="button" @click="closeAuth">关闭</button></div><div class="fields"><label class="full"><span>用户名</span><input v-model="state.authForm.username" type="text" placeholder="EarthData 用户名" /></label><label class="full"><span>密码</span><input v-model="state.authForm.password" type="password" placeholder="密码" /></label></div><div class="row end"><button class="btn" type="button" :disabled="state.authSaving" @click="saveAuth">{{ state.authSaving ? '验证中...' : '保存并验证' }}</button></div></div></div>
-    <div v-if="state.showDownloadDirModal" class="mask" @click.self="closeDownloadDir"><div class="modal auth-modal"><div class="head"><div><h3>服务端下载目录</h3><p>服务端任务会保存到该目录下的 YYYY-MM-DD/sensor/product/场景ID。</p></div><button class="btn sub" type="button" @click="closeDownloadDir">关闭</button></div><div class="fields"><label class="full"><span>下载根目录</span><input v-model="state.downloadDirForm" type="text" :placeholder="state.defaultDownloadRoot || '请输入服务端目录路径'" /></label><div class="full"><span>允许的根目录</span><div class="download-root-list"><button v-for="root in state.allowedDownloadRoots" :key="root.path" class="btn sub tiny" type="button" @click="pickDownloadRoot(root.path)">{{ root.name }}</button></div></div><div class="full root-note"><span>默认目录</span><strong>{{ state.defaultDownloadRoot || '--' }}</strong></div></div><div class="row between"><button class="btn sub" type="button" :disabled="state.downloadDirSaving" @click="saveDownloadDir(true)">恢复默认</button><button class="btn" type="button" :disabled="state.downloadDirSaving" @click="saveDownloadDir(false)">{{ state.downloadDirSaving ? '保存中...' : '保存目录' }}</button></div></div></div>
+    <div v-if="state.showDownloadDirModal" class="mask" @click.self="closeDownloadDir">
+      <div class="modal auth-modal">
+        <div class="head">
+          <div>
+            <h3>服务端下载目录</h3>
+            <p>服务端任务会保存到该目录下的 YYYY-MM-DD/sensor/product/场景ID。</p>
+          </div>
+          <button class="btn sub" type="button" @click="closeDownloadDir">关闭</button>
+        </div>
+        <div class="fields">
+          <label class="full">
+            <span>子目录</span>
+            <input v-model.trim="state.downloadDirSuffix" type="text" placeholder="只填写后半段，例如 project-a/2026-04；留空则使用默认目录" />
+          </label>
+          <p class="root-hint full">这里只需要填写后半段目录，系统会自动保存到固定目录下。</p>
+          <p v-if="state.downloadDirNotice" class="root-hint full">{{ state.downloadDirNotice }}</p>
+        </div>
+        <div class="row between">
+          <button class="btn sub" type="button" :disabled="state.downloadDirSaving" @click="saveDownloadDir(true)">恢复默认</button>
+          <button class="btn" type="button" :disabled="state.downloadDirSaving" @click="saveDownloadDir(false)">{{ state.downloadDirSaving ? '保存中...' : '保存目录' }}</button>
+        </div>
+      </div>
+    </div>
     <div v-if="state.showProxyModal" class="mask" @click.self="closeProxy"><div class="modal auth-modal"><div class="head"><div><h3>下载代理</h3><p>用于 STAC 检索、EarthData 登录和影像下载请求。</p></div><button class="btn sub" type="button" @click="closeProxy">关闭</button></div><div class="fields"><label class="full proxy-toggle"><span>启用代理</span><input v-model="state.proxyForm.enabled" type="checkbox" /></label><label class="full"><span>代理地址</span><input v-model="state.proxyForm.proxy_url" type="text" placeholder="http://127.0.0.1:7890" :disabled="!state.proxyForm.enabled" /></label><label class="full"><span>直连列表（可选）</span><input v-model="state.proxyForm.no_proxy" type="text" placeholder="127.0.0.1,localhost,.microsoft.com" :disabled="!state.proxyForm.enabled" /></label></div><div class="row between"><button class="btn sub" type="button" :disabled="state.proxySaving || !state.proxyStatus.enabled" @click="disableProxy">关闭代理</button><button class="btn" type="button" :disabled="state.proxySaving" @click="saveProxy">{{ state.proxySaving ? '保存中...' : '保存配置' }}</button></div></div></div>
   </div>
 </template>

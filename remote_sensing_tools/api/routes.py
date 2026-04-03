@@ -647,6 +647,20 @@ def setup_routes(
         payload["allowed_download_roots"] = PATH_ACCESS.allowed_roots_payload()
         return payload
 
+    def _require_landsat_default_download_prefix(target_dir: Optional[Path]) -> Optional[Path]:
+        if target_dir is None:
+            return None
+        default_dir = landsat_download_service.get_default_download_dir().resolve(strict=False)
+        candidate = Path(target_dir).resolve(strict=False)
+        candidate_text = os.path.normcase(str(candidate))
+        default_text = os.path.normcase(str(default_dir))
+        if candidate_text != default_text and not candidate_text.startswith(default_text + os.sep):
+            raise PathAccessError(
+                f"服务端下载目录必须位于固定前缀 {default_dir} 下",
+                status_code=400,
+            )
+        return candidate
+
     @app.get("/imagery/collections")
     def imagery_collections() -> Dict:
         payload = landsat_download_service.list_collections()
@@ -699,6 +713,7 @@ def setup_routes(
                     must_exist=False,
                     allow_create=True,
                 )
+                target_dir = _require_landsat_default_download_prefix(target_dir)
             payload = landsat_download_service.configure_download_dir(target_dir)
             payload["allowed_download_roots"] = PATH_ACCESS.allowed_roots_payload()
             return payload
@@ -839,6 +854,7 @@ def setup_routes(
                     must_exist=False,
                     allow_create=True,
                 )
+                target_dir = _require_landsat_default_download_prefix(target_dir)
             payload = landsat_download_service.configure_download_dir(target_dir)
             payload["allowed_download_roots"] = PATH_ACCESS.allowed_roots_payload()
             return payload

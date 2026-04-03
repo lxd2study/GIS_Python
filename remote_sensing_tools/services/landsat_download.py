@@ -269,6 +269,10 @@ class LandsatDownloadService:
             "default_download_dir": str(default_dir),
         }
 
+    def get_default_download_dir(self) -> Path:
+        with self._lock:
+            return self._default_download_dir
+
     def configure_download_dir(self, download_dir: Optional[Path] = None) -> Dict:
         next_dir = Path(download_dir or self._default_download_dir).resolve(strict=False)
         next_dir.mkdir(parents=True, exist_ok=True)
