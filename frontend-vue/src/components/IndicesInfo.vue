@@ -5,12 +5,12 @@ const activeCategory = ref('all')
 const searchQuery = ref('')
 
 const categories = [
-  { id: 'all', name: '全部', icon: '📊' },
-  { id: 'rgb', name: 'RGB合成', icon: '🎨' },
-  { id: 'vegetation', name: '植被指数', icon: '🌱' },
-  { id: 'water', name: '水体指数', icon: '💧' },
-  { id: 'urban', name: '建筑指数', icon: '🏙️' },
-  { id: 'other', name: '其他指数', icon: '🔬' }
+  { id: 'all', name: '全部', icon: 'chart' },
+  { id: 'rgb', name: 'RGB合成', icon: 'palette' },
+  { id: 'vegetation', name: '植被指数', icon: 'leaf' },
+  { id: 'water', name: '水体指数', icon: 'drop' },
+  { id: 'urban', name: '建筑指数', icon: 'city' },
+  { id: 'other', name: '其他指数', icon: 'flask' }
 ]
 
 const indices = [
@@ -282,6 +282,55 @@ const stats = computed(() => {
     other: indices.filter(i => i.category === 'other').length
   }
 })
+
+function iconPaths(icon) {
+  switch (icon) {
+    case 'chart':
+      return [
+        'M4 19V10',
+        'M10 19V5',
+        'M16 19v-7',
+        'M22 19V3'
+      ]
+    case 'palette':
+      return [
+        'M12 3a9 9 0 0 0 0 18h1.2a2.8 2.8 0 0 0 0-5.6H12a1.6 1.6 0 0 1 0-3.2h1.6A4.4 4.4 0 0 0 18 7.8 4.8 4.8 0 0 0 12 3Z',
+        'M7.5 10.5h.01',
+        'M9.5 7.5h.01',
+        'M14.5 7.5h.01',
+        'M16.5 10.5h.01'
+      ]
+    case 'leaf':
+      return [
+        'M6 20C15 20 19 14 19 6c-8 0-13 4-13 14Z',
+        'M8.5 15.5c2.5-2.6 5.6-4.7 9.5-6.5'
+      ]
+    case 'drop':
+      return [
+        'M12 3C9.5 7.2 6 10.6 6 14a6 6 0 0 0 12 0c0-3.4-3.5-6.8-6-11Z'
+      ]
+    case 'city':
+      return [
+        'M3 21V9l6-4v16',
+        'M9 21V3l6 3v15',
+        'M15 21v-8l6-3v11',
+        'M6 12h.01',
+        'M6 16h.01',
+        'M12 10h.01',
+        'M12 14h.01',
+        'M18 15h.01',
+        'M18 18h.01'
+      ]
+    case 'flask':
+      return [
+        'M10 3v5l-5.5 9.2A2 2 0 0 0 6.2 20h11.6a2 2 0 0 0 1.7-2.8L14 8V3',
+        'M9 12h6',
+        'M8 16h8'
+      ]
+    default:
+      return []
+  }
+}
 </script>
 
 <template>
@@ -304,7 +353,11 @@ const stats = computed(() => {
         :class="{ active: activeCategory === cat.id }"
         @click="activeCategory = cat.id"
       >
-        <span class="icon">{{ cat.icon }}</span>
+        <span class="icon" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+            <path v-for="path in iconPaths(cat.icon)" :key="path" :d="path" />
+          </svg>
+        </span>
         <span class="label">{{ cat.name }}</span>
         <span v-if="cat.id !== 'all'" class="count">({{ stats[cat.id] }})</span>
       </button>
@@ -420,7 +473,16 @@ const stats = computed(() => {
 }
 
 .category-btn .icon {
-  font-size: 1.1rem;
+  width: 1.1rem;
+  height: 1.1rem;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.category-btn .icon svg {
+  width: 100%;
+  height: 100%;
 }
 
 .category-btn .count {

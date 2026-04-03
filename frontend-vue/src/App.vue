@@ -721,7 +721,11 @@ onBeforeUnmount(() => {
           <div class="band-info-compact full">
             <div class="info-summary" @click="state.showBandDetails = !state.showBandDetails">
               <strong>识别波段：</strong>{{ bandAnalysis.recognized.map((item) => item.band).join(', ') || '无' }}
-              <span class="toggle-icon">{{ state.showBandDetails ? '▼' : '▶' }}</span>
+              <span class="toggle-icon" :class="{ open: state.showBandDetails }" aria-hidden="true">
+                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M5 3.5 10 8l-5 4.5" />
+                </svg>
+              </span>
             </div>
             <div v-if="state.showBandDetails" class="info-details">
               <p v-if="bandAnalysis.missingCore.length" class="warn-line">
@@ -812,7 +816,12 @@ onBeforeUnmount(() => {
           <!-- 高级选项（可折叠） -->
           <div class="field-compact full">
             <button class="toggle-section" @click="state.showAdvancedOptions = !state.showAdvancedOptions">
-              {{ state.showAdvancedOptions ? '▼' : '▶' }} 高级选项
+              <span>高级选项</span>
+              <span class="toggle-section-icon" :class="{ open: state.showAdvancedOptions }" aria-hidden="true">
+                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M5 3.5 10 8l-5 4.5" />
+                </svg>
+              </span>
             </button>
           </div>
 

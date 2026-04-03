@@ -219,8 +219,22 @@ h1 {
 
 .toggle-icon {
   margin-left: auto;
-  font-size: 0.65rem;
   color: var(--muted);
+  width: 0.75rem;
+  height: 0.75rem;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition: transform 0.18s ease;
+}
+
+.toggle-icon svg {
+  width: 100%;
+  height: 100%;
+}
+
+.toggle-icon.open {
+  transform: rotate(90deg);
 }
 
 .info-details {
@@ -299,7 +313,6 @@ h1 {
 
 .toggle-section {
   width: 100%;
-  text-align: left;
   padding: 0.35rem 0.4rem;
   background: #f7faf9;
   border: 1px solid #d9e3e0;
@@ -308,10 +321,32 @@ h1 {
   font-size: 0.72rem;
   font-weight: 600;
   cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
 }
 
 .toggle-section:hover {
   background: #e8f5f1;
+}
+
+.toggle-section-icon {
+  width: 0.8rem;
+  height: 0.8rem;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: currentColor;
+  transition: transform 0.18s ease;
+}
+
+.toggle-section-icon svg {
+  width: 100%;
+  height: 100%;
+}
+
+.toggle-section-icon.open {
+  transform: rotate(90deg);
 }
 
 .chips-compact {
