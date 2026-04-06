@@ -1,5 +1,6 @@
 """几何处理操作模块"""
 
+import os
 import tempfile
 import numpy as np
 from osgeo import gdal
@@ -84,6 +85,84 @@ def resample_to_match(input_path: str, target_path: str,
              dstNodata=0)
 
     target_ds = None
+    return output_path
+
+
+def mosaic_rasters(input_paths: List[str],
+                  output_path: str,
+                  reference_path: Optional[str] = None,
+                  dst_nodata: Optional[float] = None,
+                  resample_alg: str = 'bilinear') -> str:
+    """
+    将多幅同名栅格镶嵌为单幅输出。
+
+    Args:
+        input_paths: 输入栅格路径列表
+        output_path: 输出路径
+        reference_path: 参考栅格，用于统一投影和分辨率
+        dst_nodata: 输出 NoData 值
+        resample_alg: 重采样算法 ('bilinear', 'nearest')
+
+    Returns:
+        输出文件路径
+    """
+    valid_inputs = [path for path in input_paths if path]
+    if not valid_inputs:
+        raise Exception("镶嵌输入不能为空")
+
+    reference = reference_path or valid_inputs[0]
+    ref_ds = gdal.Open(reference)
+    if ref_ds is None:
+        raise Exception(f"无法打开参考栅格: {reference}")
+
+    if dst_nodata is None and ref_ds.RasterCount > 0:
+        dst_nodata = ref_ds.GetRasterBand(1).GetNoDataValue()
+    if dst_nodata is None:
+        dst_nodata = 0
+
+    geo_transform = ref_ds.GetGeoTransform(can_return_null=True)
+    projection = ref_ds.GetProjection()
+    x_res = abs(geo_transform[1]) if geo_transform else None
+    y_res = abs(geo_transform[5]) if geo_transform else None
+
+    vrt_path = tempfile.mktemp(suffix='.vrt')
+    build_options = gdal.BuildVRTOptions(
+        resampleAlg=resample_alg,
+        srcNodata=dst_nodata,
+        VRTNodata=dst_nodata,
+    )
+
+    try:
+        vrt_ds = gdal.BuildVRT(vrt_path, valid_inputs, options=build_options)
+        if vrt_ds is None:
+            raise Exception("构建镶嵌 VRT 失败")
+        vrt_ds = None
+
+        warp_kwargs = {
+            'format': 'GTiff',
+            'creationOptions': ['COMPRESS=LZW'],
+            'resampleAlg': resample_alg,
+            'dstNodata': dst_nodata,
+            'targetAlignedPixels': True,
+        }
+        if x_res and y_res:
+            warp_kwargs['xRes'] = x_res
+            warp_kwargs['yRes'] = y_res
+        if projection:
+            warp_kwargs['dstSRS'] = projection
+
+        out_ds = gdal.Warp(output_path, vrt_path, **warp_kwargs)
+        if out_ds is None:
+            raise Exception("执行栅格镶嵌失败")
+        out_ds = None
+    finally:
+        ref_ds = None
+        if os.path.exists(vrt_path):
+            try:
+                os.remove(vrt_path)
+            except OSError:
+                pass
+
     return output_path
 
 

@@ -1,5 +1,7 @@
 <script setup>
-import { computed, defineAsyncComponent, onBeforeUnmount, onMounted, reactive } from 'vue'
+import { computed, defineAsyncComponent, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
+import AoiMapPicker from './components/AoiMapPicker.vue'
+import { assessCoverage } from './utils/coverage'
 
 const BatchManager = defineAsyncComponent(() => import('./components/BatchManager.vue'))
 const IndicesInfo = defineAsyncComponent(() => import('./components/IndicesInfo.vue'))
@@ -73,6 +75,17 @@ const state = reactive({
   shapeFiles: [],
   productLevel: 'L1',
   clipExtent: '',
+  clipGeoJson: null,
+  clipBbox: null,
+  clipAoiLabel: '',
+  clipAoiFeatureCount: 0,
+  clipAoiSourceType: '',
+  clipAoiParsing: false,
+  sceneCoverageGeoJson: null,
+  sceneCoverageBbox: null,
+  sceneCoverageLabel: '',
+  sceneCoverageLoading: false,
+  sceneCoverageError: '',
   selectedComposites: ['true_color', 'ndvi'],
   customFormula: '',
   customName: '',
@@ -110,6 +123,8 @@ const state = reactive({
 })
 
 let timer = null
+const clipFileInput = ref(null)
+let singleCoverageRequestId = 0
 
 function normalizedApiBase() {
   const value = state.apiBase.trim().replace(/\/+$/, '')
@@ -380,11 +395,144 @@ function onPickFile(event, type) {
       const hint = inferSceneName(files)
       if (hint) state.outputSceneName = hint
     }
+    void loadSingleSceneCoverage(files)
   }
   if (type === 'mtl') state.mtlFile = files[0] || null
   if (type === 'qa') state.qaFile = files[0] || null
   if (type === 'qa_radsat') state.qaRadsatFile = files[0] || null
   if (type === 'shape') state.shapeFiles = files
+}
+
+function parseExtentText(text) {
+  if (!text || !String(text).trim()) return null
+  const values = String(text)
+    .split(',')
+    .map((item) => Number(item.trim()))
+  if (values.length !== 4 || values.some((value) => Number.isNaN(value))) return null
+  return values
+}
+
+function formatExtentText(extent) {
+  return extent
+    .map((value) => {
+      const rounded = Number(value.toFixed(6))
+      return Number.isInteger(rounded) ? String(rounded) : String(rounded)
+    })
+    .join(',')
+}
+
+function resetSingleClipPreview() {
+  state.clipGeoJson = null
+  state.clipBbox = null
+  state.clipAoiLabel = ''
+  state.clipAoiFeatureCount = 0
+  state.clipAoiSourceType = ''
+}
+
+function resetSingleSceneCoverage() {
+  state.sceneCoverageGeoJson = null
+  state.sceneCoverageBbox = null
+  state.sceneCoverageLabel = ''
+  state.sceneCoverageLoading = false
+  state.sceneCoverageError = ''
+}
+
+function clearSingleClipSelection() {
+  state.clipExtent = ''
+  state.shapeFiles = []
+  resetSingleClipPreview()
+  if (clipFileInput.value) clipFileInput.value.value = ''
+}
+
+function syncSingleClipExtentPreview() {
+  const bbox = parseExtentText(state.clipExtent)
+  if (!bbox) {
+    if (!state.shapeFiles.length) resetSingleClipPreview()
+    return
+  }
+
+  if (!state.shapeFiles.length || !state.clipGeoJson) {
+    state.clipBbox = bbox
+    state.clipGeoJson = null
+    state.clipAoiLabel = state.clipAoiLabel || '矩形范围'
+    state.clipAoiFeatureCount = 1
+    state.clipAoiSourceType = 'bbox'
+  }
+}
+
+function onSingleClipDraw(bbox) {
+  state.clipExtent = formatExtentText(bbox)
+  state.shapeFiles = []
+  state.clipGeoJson = null
+  state.clipBbox = bbox
+  state.clipAoiLabel = '矩形框选'
+  state.clipAoiFeatureCount = 1
+  state.clipAoiSourceType = 'bbox'
+  if (clipFileInput.value) clipFileInput.value.value = ''
+}
+
+function triggerSingleClipUpload() {
+  clipFileInput.value?.click()
+}
+
+async function handleSingleClipUpload(event) {
+  const files = Array.from(event?.target?.files || [])
+  if (!files.length) return
+
+  const body = new FormData()
+  files.forEach((file) => body.append('files', file))
+
+  state.clipAoiParsing = true
+  try {
+    const data = await request('/imagery/aoi/parse', { method: 'POST', body })
+    state.shapeFiles = files
+    state.clipGeoJson = data.geojson || null
+    state.clipBbox = Array.isArray(data.bbox) && data.bbox.length === 4 ? data.bbox.map((value) => Number(value)) : null
+    state.clipAoiLabel = data.label || 'AOI'
+    state.clipAoiFeatureCount = Number(data.feature_count || 0)
+    state.clipAoiSourceType = data.source_type || 'vector'
+    if (state.clipBbox) state.clipExtent = formatExtentText(state.clipBbox)
+    setToast(`已加载裁剪范围：${state.clipAoiLabel}`, 'ok')
+  } catch (error) {
+    state.shapeFiles = []
+    resetSingleClipPreview()
+    setToast(`解析矢量选区失败：${error.message}`, 'error')
+  } finally {
+    state.clipAoiParsing = false
+    if (event?.target) event.target.value = ''
+  }
+}
+
+async function loadSingleSceneCoverage(files = state.bands) {
+  const currentRequestId = ++singleCoverageRequestId
+  const targetFile = files.find((file) => detectBandName(file.name)) || files[0]
+  if (!targetFile) {
+    resetSingleSceneCoverage()
+    return
+  }
+
+  state.sceneCoverageLoading = true
+  state.sceneCoverageError = ''
+  try {
+    const body = new FormData()
+    body.append('raster', targetFile)
+    const data = await request('/imagery/raster_footprint', { method: 'POST', body })
+    if (currentRequestId !== singleCoverageRequestId) return
+    state.sceneCoverageGeoJson = data.geojson || null
+    state.sceneCoverageBbox = Array.isArray(data.bbox) && data.bbox.length === 4 ? data.bbox.map((value) => Number(value)) : null
+    state.sceneCoverageLabel = data.label || targetFile.name
+  } catch (error) {
+    if (currentRequestId !== singleCoverageRequestId) return
+    state.sceneCoverageGeoJson = null
+    state.sceneCoverageBbox = null
+    state.sceneCoverageLabel = ''
+    state.sceneCoverageError = error.message
+    setToast(`读取影像覆盖范围失败：${error.message}`, 'warn')
+  } finally {
+    if (currentRequestId === singleCoverageRequestId) {
+      state.sceneCoverageLoading = false
+    }
+  }
 }
 
 function toggleComposite(type) {
@@ -429,6 +577,15 @@ async function submitTask() {
   state.previewMeta = null
 
   try {
+    if (state.sceneCoverageLoading && singleClipRoiBbox.value) {
+      setToast('正在读取影像覆盖范围，请稍候再提交', 'warn')
+      return
+    }
+    if (['partial', 'outside'].includes(singleCoverageValidation.value.status)) {
+      setToast('当前 ROI 超出影像覆盖范围，请先调整裁剪区域', 'error')
+      return
+    }
+
     const body = new FormData()
     state.bands.forEach((file) => body.append('bands', file))
     if (state.mtlFile) body.append('mtl_file', state.mtlFile)
@@ -503,6 +660,9 @@ function resetForm() {
   state.shapeFiles = []
   state.productLevel = 'L1'
   state.clipExtent = ''
+  resetSingleClipPreview()
+  resetSingleSceneCoverage()
+  if (clipFileInput.value) clipFileInput.value.value = ''
   state.selectedComposites = ['true_color', 'ndvi']
   state.customFormula = ''
   state.customName = ''
@@ -510,6 +670,50 @@ function resetForm() {
   state.atmMethod = 'DOS'
   setToast('表单已重置', 'idle')
 }
+
+const singleClipRoiBbox = computed(() => {
+  return state.clipBbox || parseExtentText(state.clipExtent)
+})
+
+const singleCoverageValidation = computed(() => {
+  return assessCoverage(singleClipRoiBbox.value, state.sceneCoverageBbox ? [state.sceneCoverageBbox] : [])
+})
+
+const singleClipStatusText = computed(() => {
+  if (state.sceneCoverageLoading) return '正在加载影像覆盖范围...'
+  if (state.sceneCoverageError) return `影像覆盖范围读取失败：${state.sceneCoverageError}`
+  if (state.sceneCoverageBbox && singleClipRoiBbox.value) {
+    if (singleCoverageValidation.value.status === 'inside') return 'ROI 完全位于当前影像覆盖范围内'
+    if (singleCoverageValidation.value.status === 'partial') return 'ROI 部分超出当前影像覆盖范围，请调整'
+    if (singleCoverageValidation.value.status === 'outside') return 'ROI 完全不在当前影像覆盖范围内'
+  }
+  if (state.clipAoiParsing) return '正在解析矢量范围...'
+  if (state.clipGeoJson) {
+    const label = state.clipAoiLabel || '矢量范围'
+    const count = state.clipAoiFeatureCount || 0
+    return `${label}，${count} 个要素，提交时优先使用上传矢量`
+  }
+  if (state.sceneCoverageBbox) return `已叠加影像覆盖范围：${state.sceneCoverageLabel || '当前场景'}`
+  if (state.clipBbox) return '当前显示矩形范围，提交时按 bbox 裁剪'
+  return '可在地图框选矩形，或上传 GeoJSON / Shapefile 预览 ROI'
+})
+
+const singleCoverageStateLabel = computed(() => {
+  if (state.sceneCoverageLoading) return '加载中'
+  if (state.sceneCoverageError) return '读取失败'
+  if (!state.sceneCoverageBbox) return '未加载'
+  if (!singleClipRoiBbox.value) return '已加载'
+  if (singleCoverageValidation.value.status === 'inside') return '完全覆盖'
+  if (singleCoverageValidation.value.status === 'partial') return '部分越界'
+  if (singleCoverageValidation.value.status === 'outside') return '完全越界'
+  return '待校验'
+})
+
+const singleClipFileSummary = computed(() => {
+  if (!state.shapeFiles.length) return '未上传矢量文件'
+  if (state.shapeFiles.length === 1) return state.shapeFiles[0].name
+  return `${state.shapeFiles[0].name} 等 ${state.shapeFiles.length} 个文件`
+})
 
 async function loadPreview(path = '') {
   const targetPath = (path || state.previewPath).trim()
@@ -826,14 +1030,64 @@ onBeforeUnmount(() => {
           </div>
 
           <template v-if="state.showAdvancedOptions">
-            <label class="field-compact">
-              <span>裁剪范围</span>
-              <input v-model="state.clipExtent" type="text" placeholder="xmin,ymin,xmax,ymax" />
-            </label>
+            <div class="field-compact full clip-visual-field">
+              <div class="clip-visual-head">
+                <span>可视化裁剪 ROI</span>
+                <div class="clip-visual-actions">
+                  <button class="btn-mini" type="button" :disabled="state.clipAoiParsing" @click="triggerSingleClipUpload">
+                    {{ state.clipAoiParsing ? '解析中...' : '上传矢量' }}
+                  </button>
+                  <button class="btn-mini ghost" type="button" @click="clearSingleClipSelection">清空 ROI</button>
+                </div>
+              </div>
+              <input
+                ref="clipFileInput"
+                type="file"
+                multiple
+                accept=".shp,.shx,.dbf,.prj,.geojson,.json"
+                class="sr-only"
+                @change="handleSingleClipUpload"
+              />
+              <AoiMapPicker
+                v-model="state.clipExtent"
+                :bbox="state.clipBbox"
+                :geojson="state.clipGeoJson"
+                :coverage-geojson="state.sceneCoverageGeoJson"
+                :coverage-bbox="state.sceneCoverageBbox"
+                :status-text="singleClipStatusText"
+                label="当前 ROI"
+                :height="250"
+                @drawend="onSingleClipDraw"
+                @clear="clearSingleClipSelection"
+              />
+              <div class="clip-meta-grid">
+                <div class="clip-meta-pill">
+                  <strong>来源</strong>
+                  <span>{{ state.clipAoiSourceType || '未设置' }}</span>
+                </div>
+                <div class="clip-meta-pill">
+                  <strong>要素</strong>
+                  <span>{{ state.clipAoiFeatureCount || 0 }}</span>
+                </div>
+                <div class="clip-meta-pill">
+                  <strong>覆盖校验</strong>
+                  <span>{{ singleCoverageStateLabel }}</span>
+                </div>
+                <div class="clip-meta-pill clip-meta-pill-wide">
+                  <strong>矢量文件</strong>
+                  <span>{{ singleClipFileSummary }}</span>
+                </div>
+              </div>
+            </div>
 
-            <label class="field-compact">
-              <span>矢量裁剪</span>
-              <input type="file" multiple accept=".shp,.shx,.dbf" @change="(e) => onPickFile(e, 'shape')" />
+            <label class="field-compact full">
+              <span>裁剪范围（xmin,ymin,xmax,ymax）</span>
+              <input
+                v-model="state.clipExtent"
+                type="text"
+                placeholder="xmin,ymin,xmax,ymax"
+                @change="syncSingleClipExtentPreview"
+              />
             </label>
 
             <label class="field-compact">
@@ -1023,3 +1277,78 @@ onBeforeUnmount(() => {
     </div>
   </main>
 </template>
+
+<style scoped>
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.clip-visual-field {
+  gap: 10px;
+}
+
+.clip-visual-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.clip-visual-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.clip-meta-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.clip-meta-pill {
+  min-width: 0;
+  padding: 10px 12px;
+  border-radius: 12px;
+  border: 1px solid rgba(206, 217, 212, 0.9);
+  background: rgba(248, 251, 250, 0.94);
+}
+
+.clip-meta-pill strong {
+  display: block;
+  font-size: 11px;
+  color: #4a5d56;
+}
+
+.clip-meta-pill span {
+  display: block;
+  margin-top: 4px;
+  font-size: 12px;
+  color: #1f312c;
+  word-break: break-all;
+}
+
+.clip-meta-pill-wide {
+  grid-column: span 1;
+}
+
+.btn-mini.ghost {
+  background: #fff;
+  color: #33564b;
+}
+
+@media (max-width: 900px) {
+  .clip-meta-grid {
+    grid-template-columns: 1fr;
+  }
+}
+</style>

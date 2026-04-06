@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Dict, Optional, Sequence
 
 from ..core.config import settings
-from ..core.models import BatchJobConfig
+from ..core.models import BatchJobConfig, JobKind
 
 
 class PathAccessError(ValueError):
@@ -136,7 +136,6 @@ class PathAccessController:
 
     def validate_batch_job_config(self, config: BatchJobConfig) -> BatchJobConfig:
         updates: Dict[str, Optional[str]] = {
-            "band_dir": str(self.require_directory(config.band_dir, access_label="读取波段目录")),
             "output_dir": str(
                 self.require_directory(
                     config.output_dir,
@@ -147,14 +146,42 @@ class PathAccessController:
             ),
         }
 
-        if config.mtl_file:
-            updates["mtl_file"] = str(self.require_file(config.mtl_file, access_label="读取 MTL 文件"))
-        if config.qa_band:
-            updates["qa_band"] = str(self.require_file(config.qa_band, access_label="读取 QA 文件"))
-        if config.qa_radsat_band:
-            updates["qa_radsat_band"] = str(
-                self.require_file(config.qa_radsat_band, access_label="读取 QA_RADSAT 文件")
-            )
+        if config.job_kind == JobKind.MOSAIC:
+            if not config.scene_inputs:
+                raise PathAccessError("镶嵌任务缺少输入场景", status_code=400)
+
+            validated_inputs = []
+            for scene_input in config.scene_inputs:
+                scene_updates: Dict[str, Optional[str]] = {
+                    "band_dir": str(self.require_directory(scene_input.band_dir, access_label="读取镶嵌输入波段目录")),
+                }
+                if scene_input.mtl_file:
+                    scene_updates["mtl_file"] = str(
+                        self.require_file(scene_input.mtl_file, access_label="读取镶嵌输入 MTL 文件")
+                    )
+                if scene_input.qa_band:
+                    scene_updates["qa_band"] = str(
+                        self.require_file(scene_input.qa_band, access_label="读取镶嵌输入 QA 文件")
+                    )
+                if scene_input.qa_radsat_band:
+                    scene_updates["qa_radsat_band"] = str(
+                        self.require_file(scene_input.qa_radsat_band, access_label="读取镶嵌输入 QA_RADSAT 文件")
+                    )
+                validated_inputs.append(scene_input.model_copy(update=scene_updates))
+
+            updates["scene_inputs"] = validated_inputs
+            updates["band_dir"] = validated_inputs[0].band_dir
+        else:
+            updates["band_dir"] = str(self.require_directory(config.band_dir, access_label="读取波段目录"))
+            if config.mtl_file:
+                updates["mtl_file"] = str(self.require_file(config.mtl_file, access_label="读取 MTL 文件"))
+            if config.qa_band:
+                updates["qa_band"] = str(self.require_file(config.qa_band, access_label="读取 QA 文件"))
+            if config.qa_radsat_band:
+                updates["qa_radsat_band"] = str(
+                    self.require_file(config.qa_radsat_band, access_label="读取 QA_RADSAT 文件")
+                )
+
         if config.clip_shapefile:
             updates["clip_shapefile"] = str(
                 self.require_file(config.clip_shapefile, access_label="读取裁剪矢量文件")

@@ -125,6 +125,22 @@ class ProcessingTemplate(str, Enum):
     CUSTOM = "custom"  # 自定义
 
 
+class JobKind(str, Enum):
+    """批处理任务类型"""
+    SCENE = "scene"
+    MOSAIC = "mosaic"
+
+
+class SceneInputConfig(BaseModel):
+    """镶嵌任务中的单景输入配置"""
+    scene_name: str = Field(..., description="场景名称")
+    band_dir: str = Field(..., description="波段文件目录")
+    mtl_file: Optional[str] = Field(None, description="MTL元数据文件路径")
+    qa_band: Optional[str] = Field(None, description="QA波段路径")
+    qa_radsat_band: Optional[str] = Field(None, description="QA_RADSAT 波段路径")
+    product_level: str = Field("L1", pattern="^(L1|L2)$", description="输入产品级别")
+
+
 class BatchJobConfig(BaseModel):
     """批量任务配置"""
     scene_name: str = Field(..., description="场景名称")
@@ -139,6 +155,10 @@ class BatchJobConfig(BaseModel):
     template: ProcessingTemplate = Field(ProcessingTemplate.STANDARD, description="处理流程模板")
     atm_correction_method: str = Field("DOS", description="大气校正方法")
     apply_cloud_mask: bool = Field(False, description="是否应用云掩膜")
+    job_kind: JobKind = Field(JobKind.SCENE, description="任务类型")
+    scene_inputs: List[SceneInputConfig] = Field(default_factory=list, description="镶嵌任务输入场景")
+    keep_intermediate: bool = Field(False, description="是否保留镶嵌中间产物")
+    display_balance_enabled: bool = Field(True, description="是否启用镶嵌显示匀色")
 
     # 裁剪选项
     clip_extent: Optional[List[float]] = Field(None, description="裁剪范围 [xmin, ymin, xmax, ymax]")

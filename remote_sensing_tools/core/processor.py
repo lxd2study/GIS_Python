@@ -836,13 +836,18 @@ class Landsat8Processor:
         create_composites: Optional[List[str]],
         custom_index_formula: Optional[str],
         custom_index_name: Optional[str],
+        composite_band_overrides: Optional[Dict[str, Dict[str, str]]] = None,
     ) -> Dict[str, str]:
         composites: Dict[str, str] = {}
 
         for composite_type in create_composites or []:
             composite_path = self._safe_join(output_dir, f'{composite_type}.tif')
+            band_paths = (
+                (composite_band_overrides or {}).get(composite_type)
+                or processed_bands
+            )
             create_composite(
-                processed_bands,
+                band_paths,
                 composite_path,
                 composite_type=composite_type,
             )

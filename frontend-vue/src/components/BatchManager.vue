@@ -1,5 +1,5 @@
 <template>
-  <div class="batch-manager">
+  <div class="batch-manager" :class="{ 'is-touch': supportsTouch, 'is-phone': isPhoneViewport, 'is-tablet': isTabletViewport }">
     <header class="toolbar">
       <div class="toolbar-main">
         <div class="toolbar-title-row">
@@ -63,8 +63,8 @@
       </div>
     </header>
 
-    <div class="main-area">
-      <aside v-if="!supportsTouch" class="node-palette">
+    <div class="main-area" :class="{ tablet: isTabletViewport }">
+      <aside v-if="showPaletteRail" class="node-palette" :class="{ touch: supportsTouch, tablet: isTabletViewport }">
         <div class="palette-header">
           <div class="palette-title">流程构件</div>
           <button type="button" class="palette-fit-btn" @click="vfFitView()">查看全局</button>
@@ -75,7 +75,7 @@
             v-for="nt in nodeTypes"
             :key="nt.type"
             :class="['palette-item', `type-${nt.type}`]"
-            draggable="true"
+            :draggable="!supportsTouch"
             tabindex="0"
             @click="handlePaletteActivate(nt)"
             @keydown.enter.prevent="addNodeFromPalette(nt)"
@@ -97,7 +97,7 @@
           <div class="stage-title">流程画布</div>
           <div class="stage-actions">
             <button type="button" class="stage-action" @click="vfFitView()">查看全局</button>
-            <button v-if="supportsTouch" type="button" class="stage-action stage-action-primary" @click="togglePaletteDrawer">
+            <button v-if="showMobilePaletteDrawer" type="button" class="stage-action stage-action-primary" @click="togglePaletteDrawer">
               {{ state.paletteDrawerOpen ? '收起构件' : '流程构件' }}
             </button>
           </div>
@@ -167,7 +167,7 @@
 
       <aside class="right-panel">
         <transition name="slide-panel" mode="out-in">
-          <section v-if="state.showSidePanel" key="side-panel" class="side-panel" :class="{ mobile: supportsTouch }">
+          <section v-if="state.showSidePanel" key="side-panel" class="side-panel" :class="{ mobile: showMobilePaletteDrawer }">
             <div class="side-panel-header">
               <div class="side-panel-title">{{ sidePanelTitle }}</div>
               <button type="button" class="close-btn" @click="closeSidePanel">
@@ -457,18 +457,86 @@
                     />
                     <button type="button" class="btn-pick" @click="pickPath('clip_shapefile')">浏览</button>
                   </div>
+                  <div class="clip-action-row">
+                    <button
+                      type="button"
+                      class="btn-pick"
+                      :disabled="state.clipPreviewLoading || !String(state.editingParams.clip_shapefile || '').trim()"
+                      @click="loadClipVectorPreview(state.editingParams.clip_shapefile, { syncExtent: !String(state.editingParams.clip_extent || '').trim() })"
+                    >
+                      {{ state.clipPreviewLoading ? '预览中...' : '预览矢量' }}
+                    </button>
+                    <span class="form-hint">批处理页只保存本地路径，地图用于预览与 bbox 回写。</span>
+                  </div>
                 </div>
 
-                <div class="or-divider">或</div>
+                <div class="form-group">
+                  <label>共享 ROI 预览</label>
+                  <AoiMapPicker
+                    v-model="state.editingParams.clip_extent"
+                    :bbox="state.clipPreviewBbox"
+                    :geojson="state.clipPreviewGeoJson"
+                    :coverage-geojson="state.clipCoverageGeoJson"
+                    :status-text="clipPreviewStatusText"
+                    label="当前 ROI"
+                    :height="224"
+                    @drawend="onClipDraw"
+                    @clear="clearClipPreview"
+                  />
+                  <div class="clip-preview-meta">
+                    <div class="clip-preview-pill">
+                      <strong>来源</strong>
+                      <span>{{ getClipSourceLabel(state.editingParams.clip_source || state.clipPreviewSource) }}</span>
+                    </div>
+                    <div class="clip-preview-pill">
+                      <strong>要素</strong>
+                      <span>{{ state.editingParams.clip_feature_count || state.clipPreviewFeatureCount || 0 }}</span>
+                    </div>
+                    <div class="clip-preview-pill">
+                      <strong>确认</strong>
+                      <span>{{ state.editingParams.clip_confirmed ? '已确认' : '未确认' }}</span>
+                    </div>
+                    <div class="clip-preview-pill">
+                      <strong>越界校验</strong>
+                      <span>{{ batchClipCoverageValidation.message || '待校验' }}</span>
+                    </div>
+                  </div>
+                  <div v-if="state.clipPreviewError" class="form-hint form-hint-error">{{ state.clipPreviewError }}</div>
+                </div>
 
                 <div class="form-group">
-                  <label>经纬度范围</label>
+                  <label>经纬度范围（共享 bbox）</label>
                   <input
                     v-model="state.editingParams.clip_extent"
                     class="form-input"
                     placeholder="minLon,minLat,maxLon,maxLat"
+                    @change="syncClipPreviewFromExtent({ markManual: true })"
                   />
-                  <div class="form-hint">例如：116.3,39.8,116.6,40.1</div>
+                  <div class="form-hint">例如：116.3,39.8,116.6,40.1。地图框选会自动回写；若保留上方 .shp 路径，提交时优先使用矢量。</div>
+                </div>
+              </template>
+
+              <template v-else-if="state.selectedNode?.type === 'mosaic'">
+                <div class="form-group">
+                  <label>输出目录名</label>
+                  <input v-model="state.editingParams.output_name" class="form-input" placeholder="如 mosaic_2024" />
+                  <div class="form-hint">用于输出根目录下的镶嵌结果子目录，不影响单景中间目录名称。</div>
+                </div>
+
+                <div class="form-group">
+                  <label class="checkbox-label">
+                    <input type="checkbox" v-model="state.editingParams.keep_intermediate" />
+                    保留每景中间产物
+                  </label>
+                  <div class="form-hint">关闭时会在聚合完成后自动清理 `_intermediate` 目录。</div>
+                </div>
+
+                <div class="form-group">
+                  <label class="checkbox-label">
+                    <input type="checkbox" v-model="state.editingParams.display_balance_enabled" />
+                    启用显示匀色
+                  </label>
+                  <div class="form-hint">仅影响 true_color 等显示型合成，不改分析波段与指数输入。</div>
                 </div>
               </template>
 
@@ -597,7 +665,7 @@
       </aside>
     </div>
 
-      <div v-if="supportsTouch" class="mobile-palette-drawer" :class="{ open: state.paletteDrawerOpen }">
+      <div v-if="showMobilePaletteDrawer" class="mobile-palette-drawer" :class="{ open: state.paletteDrawerOpen }">
       <button type="button" class="mobile-drawer-handle" @click="togglePaletteDrawer">
         <span>{{ state.paletteDrawerOpen ? '收起流程构件' : '流程构件' }}</span>
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
@@ -632,7 +700,7 @@
     <div v-if="state.showPicker" class="picker-overlay" @click.self="state.showPicker = false">
       <div class="picker-dialog">
         <div class="picker-header">
-          <span>选择路径</span>
+          <span>{{ state.pickerTitle || '选择路径' }}</span>
           <button type="button" @click="state.showPicker = false">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
               <line x1="18" y1="6" x2="6" y2="18" />
@@ -644,12 +712,12 @@
         <div class="picker-breadcrumb">
           <button
             v-for="(seg, i) in state.pickerBreadcrumb"
-            :key="`${seg}-${i}`"
+            :key="`${seg.path || 'root'}-${i}`"
             type="button"
             class="breadcrumb-btn"
             @click="navigatePicker(i)"
           >
-            {{ seg }}
+            {{ seg.label }}
           </button>
         </div>
 
@@ -667,12 +735,41 @@
             </span>
             <span>{{ item.name }}</span>
           </div>
-          <div v-if="state.pickerItems.length === 0" class="picker-empty">空目录</div>
+          <template v-if="state.pickerMode === 'file'">
+            <div v-if="state.pickerFiles.length" class="picker-section-label">文件</div>
+            <div
+              v-for="file in state.pickerFiles"
+              :key="file.path"
+              :class="['picker-item', 'file', { selected: state.pickerSelectedPath === file.path }]"
+              @click="selectPickerFile(file)"
+            >
+              <span class="picker-item-icon">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+                  <polyline points="14 2 14 8 20 8" />
+                </svg>
+              </span>
+              <span>{{ file.name }}</span>
+            </div>
+          </template>
+          <div
+            v-if="state.pickerItems.length === 0 && (state.pickerMode !== 'file' || state.pickerFiles.length === 0)"
+            class="picker-empty"
+          >
+            空目录
+          </div>
         </div>
 
         <div class="picker-footer">
-          <span class="picker-current">{{ state.pickerCurrentPath }}</span>
-          <button type="button" class="btn btn-primary" @click="confirmPick">选择此目录</button>
+          <span class="picker-current">{{ pickerCurrentLabel }}</span>
+          <button
+            type="button"
+            class="btn btn-primary"
+            :disabled="pickerConfirmDisabled"
+            @click="confirmPick"
+          >
+            {{ pickerConfirmLabel }}
+          </button>
         </div>
       </div>
     </div>
@@ -692,9 +789,12 @@ import InputNode from './flow-nodes/InputNode.vue'
 import RadiometricNode from './flow-nodes/RadiometricNode.vue'
 import AtmosphericNode from './flow-nodes/AtmosphericNode.vue'
 import ClipNode from './flow-nodes/ClipNode.vue'
+import MosaicNode from './flow-nodes/MosaicNode.vue'
 import ConditionalNode from './flow-nodes/ConditionalNode.vue'
 import SynthesisNode from './flow-nodes/SynthesisNode.vue'
 import OutputNode from './flow-nodes/OutputNode.vue'
+import AoiMapPicker from './AoiMapPicker.vue'
+import { assessCoverage, buildBboxFeatureCollection, normalizeBbox } from '../utils/coverage'
 
 const props = defineProps(['apiBase'])
 const emit = defineEmits(['toast'])
@@ -702,6 +802,10 @@ const emit = defineEmits(['toast'])
 const { zoomIn: vfZoomIn, zoomOut: vfZoomOut, fitView: vfFitView, screenToFlowCoordinate } = useVueFlow()
 const canvasWrapperRef = ref(null)
 const supportsTouch = ref(false)
+const isPhoneViewport = ref(false)
+const isTabletViewport = ref(false)
+const showPaletteRail = computed(() => !isPhoneViewport.value || !supportsTouch.value)
+const showMobilePaletteDrawer = computed(() => isPhoneViewport.value && supportsTouch.value)
 
 const levelOptions = ['L1', 'L2']
 const priorityOptions = [
@@ -716,6 +820,7 @@ const customNodeTypes = {
   radiometric: markRaw(RadiometricNode),
   atmospheric: markRaw(AtmosphericNode),
   clip: markRaw(ClipNode),
+  mosaic: markRaw(MosaicNode),
   conditional: markRaw(ConditionalNode),
   synthesis: markRaw(SynthesisNode),
   output: markRaw(OutputNode),
@@ -723,12 +828,14 @@ const customNodeTypes = {
 
 const ICON_CLOUD = `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 10h-1.26A8 8 0 109 20h9a5 5 0 000-10z"/></svg>`
 const ICON_CROP = `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6.13 1L6 16a2 2 0 002 2h15"/><path d="M1 6.13L16 6a2 2 0 012 2v15"/></svg>`
+const ICON_MOSAIC = `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3h7v7H3z"/><path d="M14 3h7v7h-7z"/><path d="M3 14h7v7H3z"/><path d="M14 14h7v7h-7z"/></svg>`
 const ICON_LAYERS = `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/></svg>`
 const ICON_COND = `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3"/></svg>`
 
 const nodeTypes = [
   { type: 'atmospheric', iconSvg: ICON_CLOUD, label: '大气校正', desc: 'DOS / 6S 方法切换' },
   { type: 'conditional', iconSvg: ICON_COND, label: 'SHP 检测', desc: '按场景是否存在 SHP 分流' },
+  { type: 'mosaic', iconSvg: ICON_MOSAIC, label: '影像镶嵌', desc: '多景同名波段拼接为单一结果' },
   { type: 'clip', iconSvg: ICON_CROP, label: '区域裁剪', desc: '支持 SHP 或经纬度范围' },
   { type: 'synthesis', iconSvg: ICON_LAYERS, label: '合成指数', desc: '多种组合与自定义公式' },
 ]
@@ -789,6 +896,18 @@ const state = reactive({
   selectedNode: null,
   showSidePanel: false,
   editingParams: {},
+  clipPreviewGeoJson: null,
+  clipPreviewBbox: null,
+  clipPreviewLabel: '',
+  clipPreviewFeatureCount: 0,
+  clipPreviewSource: '',
+  clipPreviewLoading: false,
+  clipPreviewError: '',
+  clipCoverageGeoJson: null,
+  clipCoverageBboxes: [],
+  clipCoverageLoading: false,
+  clipCoverageError: '',
+  clipCoverageMode: '',
   priority: 'medium',
   submitting: false,
   taskQueue: [],
@@ -796,9 +915,16 @@ const state = reactive({
   pollingTimer: null,
   showPicker: false,
   pickerField: '',
+  pickerMode: 'directory',
+  pickerTitle: '选择路径',
+  pickerAllowedSuffixes: [],
   pickerCurrentPath: '',
-  pickerBreadcrumb: ['根目录'],
+  pickerBreadcrumb: [{ label: '根目录', path: '' }],
+  pickerRoots: [],
   pickerItems: [],
+  pickerFiles: [],
+  pickerSelectedPath: '',
+  pickerSelectedKind: '',
   paletteDrawerOpen: false,
 })
 
@@ -809,6 +935,7 @@ const sidePanelTitle = computed(() => {
     radiometric: '辐射定标',
     atmospheric: '大气校正配置',
     conditional: 'SHP 检测',
+    mosaic: '影像镶嵌配置',
     clip: '区域裁剪配置',
     synthesis: '合成指数配置',
     output: '输出配置',
@@ -827,6 +954,26 @@ const statusLabel = {
 }
 
 const priorityLabel = { high: '高', medium: '中', low: '低' }
+
+const PICKER_CONFIG = {
+  root_dir: { mode: 'directory', title: '选择数据根目录', allowedSuffixes: [] },
+  band_dir: { mode: 'directory', title: '选择波段目录', allowedSuffixes: [] },
+  output_dir: { mode: 'directory', title: '选择输出目录', allowedSuffixes: [] },
+  clip_shapefile: { mode: 'file', title: '选择矢量文件', allowedSuffixes: ['.shp', '.geojson', '.json'] },
+  mtl_file: { mode: 'file', title: '选择 MTL 文件', allowedSuffixes: ['.txt', '.mtl'] },
+}
+
+const pickerConfirmLabel = computed(() => (state.pickerMode === 'file' ? '选择文件' : '选择此目录'))
+
+const pickerConfirmDisabled = computed(() => {
+  if (state.pickerMode === 'file') return !state.pickerSelectedPath
+  return !state.pickerCurrentPath
+})
+
+const pickerCurrentLabel = computed(() => {
+  if (state.pickerMode === 'file') return state.pickerSelectedPath || state.pickerCurrentPath || '未选择文件'
+  return state.pickerCurrentPath || '未选择目录'
+})
 
 const compositeGroups = [
   {
@@ -889,6 +1036,265 @@ function shortPath(path, depth = 2) {
   const parts = path.replace(/\\/g, '/').split('/').filter(Boolean)
   if (parts.length <= depth) return path
   return `.../${parts.slice(-depth).join('/')}`
+}
+
+function parseExtentText(text) {
+  if (!text || !String(text).trim()) return null
+  const values = String(text)
+    .split(',')
+    .map((item) => Number(item.trim()))
+  if (values.length !== 4 || values.some((value) => Number.isNaN(value))) return null
+  return values
+}
+
+function formatExtentText(extent) {
+  return extent.map((value) => String(Number(value.toFixed(6)))).join(',')
+}
+
+function getClipSourceLabel(source) {
+  if (source === 'filesystem') return '本地矢量'
+  if (source === 'bbox') return '地图框选'
+  if (source === 'manual') return '手填范围'
+  return source || '未设置'
+}
+
+function resetClipPreview() {
+  state.clipPreviewGeoJson = null
+  state.clipPreviewBbox = null
+  state.clipPreviewLabel = ''
+  state.clipPreviewFeatureCount = 0
+  state.clipPreviewSource = ''
+  state.clipPreviewLoading = false
+  state.clipPreviewError = ''
+}
+
+function resetClipCoverage() {
+  state.clipCoverageGeoJson = null
+  state.clipCoverageBboxes = []
+  state.clipCoverageLoading = false
+  state.clipCoverageError = ''
+  state.clipCoverageMode = ''
+}
+
+function clearClipPreview({ preserveConfig = false } = {}) {
+  resetClipPreview()
+  if (preserveConfig || state.selectedNode?.type !== 'clip') return
+  state.editingParams.clip_shapefile = ''
+  state.editingParams.clip_extent = ''
+  state.editingParams.clip_source = ''
+  state.editingParams.clip_label = ''
+  state.editingParams.clip_feature_count = 0
+  state.editingParams.clip_confirmed = false
+}
+
+function applyClipPreview({
+  bbox = null,
+  geojson = null,
+  label = '',
+  featureCount = 0,
+  source = '',
+  confirmed = true,
+  syncExtent = false,
+  clearShapefile = false,
+} = {}) {
+  state.clipPreviewGeoJson = geojson || null
+  state.clipPreviewBbox = Array.isArray(bbox) && bbox.length === 4 ? bbox.map((value) => Number(value)) : null
+  state.clipPreviewLabel = label || ''
+  state.clipPreviewFeatureCount = Number(featureCount || 0)
+  state.clipPreviewSource = source || ''
+  state.clipPreviewError = ''
+
+  if (state.selectedNode?.type !== 'clip') return
+
+  state.editingParams.clip_source = source || ''
+  state.editingParams.clip_label = label || ''
+  state.editingParams.clip_feature_count = Number(featureCount || 0)
+  state.editingParams.clip_confirmed = confirmed
+
+  if (syncExtent && state.clipPreviewBbox) {
+    state.editingParams.clip_extent = formatExtentText(state.clipPreviewBbox)
+  }
+  if (clearShapefile) {
+    state.editingParams.clip_shapefile = ''
+  }
+}
+
+async function loadClipVectorPreview(path = '', options = {}) {
+  const targetPath = (path || state.editingParams.clip_shapefile || '').trim()
+  if (!targetPath) {
+    state.clipPreviewError = '请先输入本地矢量路径'
+    return false
+  }
+
+  state.clipPreviewLoading = true
+  state.clipPreviewError = ''
+  try {
+    const body = new FormData()
+    body.append('path', targetPath)
+    const resp = await fetch(`${props.apiBase}/filesystem/vector_preview`, {
+      method: 'POST',
+      body,
+    })
+    const data = await resp.json().catch(() => ({}))
+    if (!resp.ok) {
+      throw new Error(data.detail || '矢量预览失败')
+    }
+
+    applyClipPreview({
+      bbox: data.bbox,
+      geojson: data.geojson || null,
+      label: data.label || targetPath.split(/[\\/]/).pop() || '矢量范围',
+      featureCount: data.feature_count || 0,
+      source: 'filesystem',
+      confirmed: true,
+      syncExtent: Boolean(options.syncExtent),
+    })
+    state.editingParams.clip_shapefile = targetPath
+    return true
+  } catch (error) {
+    state.clipPreviewError = error.message
+    if (!options.silent) {
+      emit('toast', { type: 'error', message: `矢量预览失败：${error.message}` })
+    }
+    return false
+  } finally {
+    state.clipPreviewLoading = false
+  }
+}
+
+function syncClipPreviewFromExtent({ markManual = false } = {}) {
+  const bbox = parseExtentText(state.editingParams.clip_extent)
+  if (!bbox) {
+    if (!state.editingParams.clip_shapefile) resetClipPreview()
+    return false
+  }
+
+  applyClipPreview({
+    bbox,
+    geojson: null,
+    label: markManual ? '手填范围' : (state.editingParams.clip_label || '矩形范围'),
+    featureCount: 1,
+    source: markManual ? 'manual' : (state.editingParams.clip_source || 'bbox'),
+    confirmed: true,
+    syncExtent: false,
+  })
+  return true
+}
+
+function onClipDraw(bbox) {
+  applyClipPreview({
+    bbox,
+    geojson: null,
+    label: '矩形框选',
+    featureCount: 1,
+    source: 'bbox',
+    confirmed: true,
+    syncExtent: true,
+    clearShapefile: true,
+  })
+}
+
+async function restoreClipPreviewFromNode(nodeData = {}) {
+  resetClipPreview()
+  const clipPath = (nodeData.clip_shapefile || '').trim()
+  if (clipPath) {
+    await loadClipVectorPreview(clipPath, {
+      silent: true,
+      syncExtent: !String(nodeData.clip_extent || '').trim(),
+    })
+    return
+  }
+
+  const bbox = parseExtentText(nodeData.clip_extent)
+  if (!bbox) return
+
+  applyClipPreview({
+    bbox,
+    geojson: null,
+    label: nodeData.clip_label || '矩形范围',
+    featureCount: Number(nodeData.clip_feature_count || 1),
+    source: nodeData.clip_source || 'bbox',
+    confirmed: nodeData.clip_confirmed !== false,
+    syncExtent: false,
+  })
+}
+
+function getWorkflowSelectedScenes() {
+  const selected = getSelectedSceneItems(workflowScenes.value, workflowSelectedScenes.value)
+  if (selected.length) return selected
+
+  const inputNode = workflowInputNode.value
+  if (inputNode?.data?.band_dir && !(inputNode?.data?.scenes?.length ?? 0)) {
+    return [{
+      name: inputNode.data.scene_name || shortPath(inputNode.data.band_dir, 2),
+      path: inputNode.data.band_dir,
+      product_level: inputNode.data.product_level || 'L1',
+      footprint_bbox: null,
+    }]
+  }
+  return []
+}
+
+async function loadRasterFootprint(path, productLevel = '') {
+  const body = new FormData()
+  body.append('path', path)
+  if (productLevel) body.append('product_level', productLevel)
+  const resp = await fetch(`${props.apiBase}/filesystem/raster_footprint`, {
+    method: 'POST',
+    body,
+  })
+  const data = await resp.json().catch(() => ({}))
+  if (!resp.ok) {
+    throw new Error(data.detail || '影像覆盖范围读取失败')
+  }
+  return data
+}
+
+async function restoreClipCoverage() {
+  resetClipCoverage()
+  const selectedScenes = getWorkflowSelectedScenes()
+  if (!selectedScenes.length) return
+
+  const sceneBoxes = selectedScenes
+    .map((scene) => ({
+      scene,
+      bbox: normalizeBbox(scene.footprint_bbox),
+    }))
+    .filter((item) => item.bbox)
+
+  if (sceneBoxes.length) {
+    state.clipCoverageBboxes = sceneBoxes.map((item) => item.bbox)
+    state.clipCoverageGeoJson = buildBboxFeatureCollection(
+      sceneBoxes.map((item) => ({
+        bbox: item.bbox,
+        properties: { sceneName: item.scene.name },
+      })),
+    )
+    state.clipCoverageMode = findNodeByType('mosaic') ? 'mosaic' : 'scene'
+    if (sceneBoxes.length !== selectedScenes.length) {
+      state.clipCoverageError = `有 ${selectedScenes.length - sceneBoxes.length} 个场景缺少覆盖范围，校验结果可能不完整`
+    }
+    return
+  }
+
+  const inputNode = workflowInputNode.value
+  if (!inputNode?.data?.band_dir) {
+    state.clipCoverageError = '当前输入节点未提供可用的影像覆盖范围'
+    return
+  }
+
+  state.clipCoverageLoading = true
+  try {
+    const data = await loadRasterFootprint(inputNode.data.band_dir, inputNode.data.product_level || 'L1')
+    const bbox = normalizeBbox(data.bbox)
+    state.clipCoverageBboxes = bbox ? [bbox] : []
+    state.clipCoverageGeoJson = data.geojson || (bbox ? buildBboxFeatureCollection([{ bbox }]) : null)
+    state.clipCoverageMode = findNodeByType('mosaic') ? 'mosaic' : 'scene'
+  } catch (error) {
+    state.clipCoverageError = error.message
+  } finally {
+    state.clipCoverageLoading = false
+  }
 }
 
 function getSceneSelectionKey(scene) {
@@ -1042,6 +1448,44 @@ function getUpstreamDataDirNode(targetNodeId) {
   return edge ? state.nodes.find((node) => node.id === edge.source && node.type === 'datadir') || null : null
 }
 
+function evaluateSavedClipCoverage(nodeData = {}) {
+  const roi = normalizeBbox(parseExtentText(nodeData.clip_extent))
+  const selectedScenes = getWorkflowSelectedScenes()
+  const coverageBboxes = selectedScenes.map((scene) => normalizeBbox(scene.footprint_bbox)).filter(Boolean)
+  if (!roi || !coverageBboxes.length) {
+    return { status: 'unknown', invalid: false, message: '' }
+  }
+
+  if (findNodeByType('mosaic')) {
+    const result = assessCoverage(roi, coverageBboxes)
+    return {
+      status: result.status,
+      invalid: result.status === 'partial' || result.status === 'outside',
+      message: result.status === 'inside'
+        ? '共享 ROI 位于镶嵌覆盖范围内'
+        : '共享 ROI 超出镶嵌覆盖范围',
+    }
+  }
+
+  const invalidScenes = selectedScenes.filter((scene) => {
+    const result = assessCoverage(roi, scene.footprint_bbox ? [scene.footprint_bbox] : [])
+    return result.status === 'partial' || result.status === 'outside'
+  })
+  const unionCoverage = assessCoverage(roi, coverageBboxes)
+  if (invalidScenes.length && unionCoverage.status === 'inside') {
+    return {
+      status: 'partial',
+      invalid: true,
+      message: '当前 ROI 需要多景联合覆盖；请先添加 mosaic 节点，再执行共享裁剪',
+    }
+  }
+  return {
+    status: invalidScenes.length ? 'partial' : 'inside',
+    invalid: invalidScenes.length > 0,
+    message: invalidScenes.length ? '共享 ROI 超出部分场景覆盖范围' : '共享 ROI 位于所有场景覆盖范围内',
+  }
+}
+
 function isNodeConfigured(node) {
   const data = node?.data || {}
   switch (node?.type) {
@@ -1053,6 +1497,8 @@ function isNodeConfigured(node) {
       return !!data.output_dir
     case 'clip':
       return !!(data.clip_extent || data.clip_shapefile)
+    case 'mosaic':
+      return !!String(data.output_name || '').trim()
     case 'synthesis':
       return (data.composites?.length ?? 0) > 0 || !!data.custom_formula
     case 'atmospheric':
@@ -1085,7 +1531,10 @@ const workflowStatus = computed(() => {
   const outputNode = findNodeByType('output')
   const inputNode = workflowInputNode.value
   const dataDirNode = workflowDataDirNode.value
+  const mosaicNode = findNodeByType('mosaic')
+  const clipNode = findNodeByType('clip')
   const hasSingleInput = !!inputNode?.data?.band_dir && !(inputNode?.data?.scenes?.length ?? 0)
+  const effectiveSceneCount = workflowSceneStats.value.selected || (hasSingleInput ? 1 : 0)
 
   if (state.submitting) {
     return {
@@ -1127,11 +1576,32 @@ const workflowStatus = computed(() => {
     }
   }
 
+  if (mosaicNode && effectiveSceneCount < 2) {
+    return {
+      label: '镶嵌场景不足',
+      tone: 'warn',
+      description: 'mosaic 节点至少需要 2 个已选场景，当前数量不足。',
+    }
+  }
+
+  if (clipNode) {
+    const clipCoverage = evaluateSavedClipCoverage(clipNode.data || {})
+    if (clipCoverage.invalid) {
+      return {
+        label: 'ROI 越界',
+        tone: 'warn',
+        description: clipCoverage.message,
+      }
+    }
+  }
+
   if ((dataDirNode?.data?.scenes?.length ?? 0) > 0 || hasSingleInput) {
     return {
       label: '可提交',
       tone: 'ok',
-      description: `流程已就绪，预计提交 ${workflowSceneStats.value.selected || (hasSingleInput ? 1 : 0)} 个任务。`,
+      description: mosaicNode
+        ? `流程已就绪，预计提交 1 个镶嵌聚合任务（${effectiveSceneCount} 景）。`
+        : `流程已就绪，预计提交 ${effectiveSceneCount} 个任务。`,
     }
   }
 
@@ -1158,6 +1628,86 @@ const panelPreferredLevel = computed(() => {
 })
 
 const panelSceneStats = computed(() => buildSceneStats(panelScenes.value, state.editingParams.selectedScenes, panelPreferredLevel.value))
+
+const clipPreviewStatusText = computed(() => {
+  if (state.clipCoverageLoading) return '正在加载影像覆盖范围...'
+  if (state.clipCoverageError) return state.clipCoverageError
+  if (state.clipPreviewLoading) return '正在读取本地矢量并生成预览...'
+  if (batchClipCoverageValidation.value.status === 'inside') {
+    return batchClipCoverageValidation.value.message
+  }
+  if (batchClipCoverageValidation.value.status === 'partial') {
+    return batchClipCoverageValidation.value.message
+  }
+  if (batchClipCoverageValidation.value.status === 'outside') {
+    return batchClipCoverageValidation.value.message
+  }
+  if (state.clipPreviewGeoJson) {
+    return `${state.clipPreviewLabel || '矢量范围'}，${state.clipPreviewFeatureCount || 0} 个要素`
+  }
+  if (state.clipPreviewBbox) return '当前显示矩形范围，保存后会作为共享 ROI'
+  return '可框选共享 ROI，或通过本地 .shp 路径请求预览'
+})
+
+const batchClipCoverageValidation = computed(() => {
+  const roi = normalizeBbox(state.clipPreviewBbox || parseExtentText(state.editingParams.clip_extent))
+  const coverageBboxes = state.clipCoverageBboxes.map((bbox) => normalizeBbox(bbox)).filter(Boolean)
+  if (!roi || !coverageBboxes.length) {
+    return {
+      status: 'unknown',
+      tone: 'neutral',
+      message: state.clipCoverageError || '尚未加载影像覆盖范围或 ROI',
+      invalid: false,
+    }
+  }
+
+  const mosaicNode = findNodeByType('mosaic')
+  if (mosaicNode) {
+    const result = assessCoverage(roi, coverageBboxes)
+    if (result.status === 'inside') {
+      return { status: 'inside', tone: 'ok', message: `ROI 完全位于 ${coverageBboxes.length} 景镶嵌覆盖范围内`, invalid: false }
+    }
+    if (result.status === 'outside') {
+      return { status: 'outside', tone: 'warn', message: 'ROI 完全不在选中场景的联合覆盖范围内', invalid: true }
+    }
+    return { status: 'partial', tone: 'warn', message: 'ROI 部分超出选中场景的联合覆盖范围', invalid: true }
+  }
+
+  const selectedScenes = getWorkflowSelectedScenes()
+  const invalidScenes = selectedScenes
+    .map((scene) => ({
+      scene,
+      coverage: assessCoverage(roi, scene.footprint_bbox ? [scene.footprint_bbox] : []),
+    }))
+    .filter((item) => item.coverage.status === 'partial' || item.coverage.status === 'outside')
+
+  if (!invalidScenes.length) {
+    return {
+      status: 'inside',
+      tone: 'ok',
+      message: `ROI 完全位于全部 ${Math.max(selectedScenes.length, coverageBboxes.length)} 个已选场景覆盖范围内`,
+      invalid: false,
+    }
+  }
+
+  const unionCoverage = assessCoverage(roi, coverageBboxes)
+  if (unionCoverage.status === 'inside') {
+    return {
+      status: 'partial',
+      tone: 'warn',
+      message: '当前 ROI 需要多景联合覆盖；请先添加 mosaic 节点，再执行共享裁剪',
+      invalid: true,
+    }
+  }
+
+  const allOutside = invalidScenes.every((item) => item.coverage.status === 'outside')
+  return {
+    status: allOutside ? 'outside' : 'partial',
+    tone: 'warn',
+    message: `${invalidScenes.length}/${selectedScenes.length} 个已选场景不能完整覆盖当前 ROI`,
+    invalid: true,
+  }
+})
 
 const inputStrategy = computed(() => {
   if (state.selectedNode?.type !== 'input') {
@@ -1283,21 +1833,56 @@ const panelSummary = computed(() => {
     }
   }
 
+  if (node.type === 'mosaic') {
+    const selectedSceneCount = workflowSceneStats.value.selected || (workflowInputNode.value?.data?.band_dir ? 1 : 0)
+    const ready = !!String(data.output_name || '').trim()
+    const enoughScenes = selectedSceneCount >= 2
+    const displayBalanceEnabled = data.display_balance_enabled !== false
+    return {
+      label: '影像镶嵌',
+      title: ready ? '聚合镶嵌任务已配置' : '等待镶嵌输出名',
+      badge: ready ? `${selectedSceneCount} 景` : '待配置',
+      tone: ready && enoughScenes ? 'ok' : 'warn',
+      copy: ready
+        ? `多景同名波段会先完成预处理，再统一镶嵌到 ${data.output_name || 'mosaic'} 目录。${displayBalanceEnabled ? '显示型合成会额外做匀色。' : '显示型合成保持原始镶嵌色调。'}`
+        : '请指定镶嵌结果目录名，系统会将多景结果聚合为单个任务执行。',
+      metrics: [
+        { label: '输出名', value: data.output_name || 'mosaic' },
+        { label: '中间产物', value: data.keep_intermediate ? '保留' : '清理' },
+        { label: '显示匀色', value: displayBalanceEnabled ? '开启' : '关闭' },
+        { label: '场景数', value: selectedSceneCount },
+      ],
+      note: enoughScenes
+        ? '镶嵌后的共享结果会继续进入下游裁剪、合成或指数节点。'
+        : 'mosaic 节点至少需要 2 个已选场景；单景或空批次会在提交时被拒绝。',
+    }
+  }
+
   if (node.type === 'clip') {
     const ready = !!(data.clip_shapefile || data.clip_extent)
+    const sourceLabel = getClipSourceLabel(data.clip_source)
+    const clipLabel = data.clip_label || (data.clip_shapefile ? shortPath(data.clip_shapefile, 3) : (data.clip_extent || ''))
+    const coverage = evaluateSavedClipCoverage(data)
     return {
       label: '区域裁剪',
-      title: ready ? '裁剪范围已指定' : '等待裁剪条件',
-      badge: ready ? '已配置' : '待配置',
-      tone: ready ? 'ok' : 'neutral',
+      title: ready ? (data.clip_confirmed ? '共享 ROI 已确认' : '裁剪条件已填写') : '等待裁剪条件',
+      badge: ready ? (coverage.invalid ? '越界' : (data.clip_confirmed ? '已确认' : '待确认')) : '待配置',
+      tone: ready ? (coverage.invalid ? 'warn' : (data.clip_confirmed ? 'ok' : 'warn')) : 'neutral',
       copy: data.clip_shapefile
-        ? `优先使用矢量裁剪：${shortPath(data.clip_shapefile, 3)}`
-        : (data.clip_extent || '可使用 SHP 或经纬度范围限制输出范围。'),
+        ? `矢量预览：${clipLabel}，提交时优先使用本地路径 ${shortPath(data.clip_shapefile, 3)}。`
+        : (data.clip_extent || '可使用地图框选、手填 bbox 或本地 SHP 作为共享裁剪范围。'),
       metrics: [
-        { label: '矢量', value: data.clip_shapefile ? '已选' : '未选' },
-        { label: '范围', value: data.clip_extent ? '已填' : '未填' },
+        { label: '来源', value: sourceLabel },
+        { label: '要素', value: data.clip_feature_count || (data.clip_extent ? 1 : 0) },
+        { label: '矢量路径', value: data.clip_shapefile ? '已填' : '未填' },
       ],
-      note: '若接入 SHP 检测节点，系统可按场景自动切换到对应的矢量文件。',
+      note: coverage.invalid
+        ? coverage.message
+        : (
+          findNodeByType('mosaic')
+            ? 'mosaic 下游只能使用一个共享 ROI；若切换为 bbox，建议直接在地图重新框选。'
+            : '若接入 SHP 检测节点，系统可按场景自动切换到对应的矢量文件。'
+        ),
     }
   }
 
@@ -1322,6 +1907,7 @@ const panelSummary = computed(() => {
 
   if (node.type === 'output') {
     const ready = !!data.output_dir
+    const mosaicNode = findNodeByType('mosaic')
     return {
       label: '输出配置',
       title: ready ? '输出目录已配置' : '等待输出目录',
@@ -1331,7 +1917,9 @@ const panelSummary = computed(() => {
       metrics: [
         { label: '输出目录', value: ready ? '已选' : '未选' },
       ],
-      note: '批量模式下每个场景会在输出根目录下自动创建同名子目录。',
+      note: mosaicNode
+        ? '存在 mosaic 节点时，输出根目录下会生成单个镶嵌结果目录。'
+        : '批量模式下每个场景会在输出根目录下自动创建同名子目录。',
     }
   }
 
@@ -1404,14 +1992,18 @@ const NODE_HALF_HEIGHT = 42
 
 function updateInteractionMode() {
   if (typeof window === 'undefined') return
-  supportsTouch.value = window.innerWidth <= 900 || window.matchMedia('(pointer: coarse)').matches
-  if (!supportsTouch.value) {
+  const width = window.innerWidth
+  const coarsePointer = window.matchMedia('(pointer: coarse)').matches || navigator.maxTouchPoints > 0
+  supportsTouch.value = coarsePointer
+  isPhoneViewport.value = width <= 767
+  isTabletViewport.value = width > 767 && width <= 1180
+  if (!showMobilePaletteDrawer.value) {
     state.paletteDrawerOpen = false
   }
 }
 
 function togglePaletteDrawer() {
-  if (!supportsTouch.value) return
+  if (!showMobilePaletteDrawer.value) return
   state.paletteDrawerOpen = !state.paletteDrawerOpen
 }
 
@@ -1419,7 +2011,15 @@ function getDefaultNodeData(type) {
   const defaults = {
     atmospheric: { method: 'DOS', apply_cloud_mask: false },
     conditional: {},
-    clip: { clip_extent: '', clip_shapefile: '' },
+    clip: {
+      clip_extent: '',
+      clip_shapefile: '',
+      clip_source: '',
+      clip_label: '',
+      clip_feature_count: 0,
+      clip_confirmed: false,
+    },
+    mosaic: { output_name: 'mosaic', keep_intermediate: false, display_balance_enabled: true },
     synthesis: { composites: [], custom_formula: '', custom_name: '' },
   }
   return JSON.parse(JSON.stringify(defaults[type] || {}))
@@ -1490,10 +2090,11 @@ function onDrop(event) {
   dragNodeType = null
 }
 
-function onNodeClick({ node }) {
+async function onNodeClick({ node }) {
   state.selectedNode = node
   state.editingParams = JSON.parse(JSON.stringify(node.data))
   state.paletteDrawerOpen = false
+  state.showSidePanel = true
 
   if (node.type === 'datadir') {
     syncSceneSelections(state.editingParams, { defaultToAll: true })
@@ -1523,7 +2124,17 @@ function onNodeClick({ node }) {
     syncSceneSelections(state.editingParams, { defaultToAll: true })
   }
 
-  state.showSidePanel = true
+  if (node.type === 'mosaic') {
+    state.editingParams.display_balance_enabled = state.editingParams.display_balance_enabled !== false
+  }
+
+  if (node.type === 'clip') {
+    await restoreClipPreviewFromNode(state.editingParams)
+    await restoreClipCoverage()
+  } else {
+    resetClipPreview()
+    resetClipCoverage()
+  }
 }
 
 function onConnect(params) {
@@ -1545,6 +2156,8 @@ function closeSidePanel() {
   state.showSidePanel = false
   state.selectedNode = null
   state.editingParams = {}
+  resetClipPreview()
+  resetClipCoverage()
 }
 
 async function saveNodeParams() {
@@ -1553,6 +2166,34 @@ async function saveNodeParams() {
   if (!node) return
 
   syncSceneSelections(state.editingParams)
+
+  if (node.type === 'clip') {
+    state.editingParams.clip_shapefile = String(state.editingParams.clip_shapefile || '').trim()
+    state.editingParams.clip_extent = String(state.editingParams.clip_extent || '').trim()
+
+    if (!state.editingParams.clip_shapefile && !parseExtentText(state.editingParams.clip_extent)) {
+      state.editingParams.clip_source = ''
+      state.editingParams.clip_label = ''
+      state.editingParams.clip_feature_count = 0
+      state.editingParams.clip_confirmed = false
+    } else if (!state.editingParams.clip_shapefile && parseExtentText(state.editingParams.clip_extent)) {
+      state.editingParams.clip_source = state.editingParams.clip_source || 'bbox'
+      state.editingParams.clip_label = state.editingParams.clip_label || '矩形范围'
+      state.editingParams.clip_feature_count = Number(state.editingParams.clip_feature_count || 1)
+      state.editingParams.clip_confirmed = state.editingParams.clip_confirmed !== false
+    } else if (state.editingParams.clip_shapefile) {
+      state.editingParams.clip_source = state.editingParams.clip_source || 'filesystem'
+      state.editingParams.clip_label = state.editingParams.clip_label || shortPath(state.editingParams.clip_shapefile, 3)
+      state.editingParams.clip_confirmed = state.editingParams.clip_confirmed !== false
+    }
+  }
+
+  if (node.type === 'mosaic') {
+    state.editingParams.output_name = String(state.editingParams.output_name || '').trim() || 'mosaic'
+    state.editingParams.keep_intermediate = Boolean(state.editingParams.keep_intermediate)
+    state.editingParams.display_balance_enabled = state.editingParams.display_balance_enabled !== false
+  }
+
   Object.assign(node.data, state.editingParams)
 
   if (node.type === 'datadir' && node.data.root_dir) {
@@ -1636,6 +2277,7 @@ function miniMapColor(node) {
     radiometric: '#78848b',
     atmospheric: '#628273',
     conditional: '#9a855b',
+    mosaic: '#546f8d',
     clip: '#9f8266',
     synthesis: '#80789a',
     output: '#4f7d83',
@@ -1672,6 +2314,15 @@ async function submitTask() {
   if (!isFlowConnected()) {
     emit('toast', { type: 'error', message: '流程未完整连接，请确保存在通往输出节点的完整路径' })
     return
+  }
+
+  const clipNode = findNodeByType('clip')
+  if (clipNode) {
+    const clipCoverage = evaluateSavedClipCoverage(clipNode.data || {})
+    if (clipCoverage.invalid) {
+      emit('toast', { type: 'error', message: clipCoverage.message })
+      return
+    }
   }
 
   const batchName = `graph_batch_${Date.now()}`
@@ -1744,47 +2395,167 @@ async function clearQueue() {
 }
 
 async function pickPath(field) {
+  const config = PICKER_CONFIG[field] || { mode: 'directory', title: '选择路径', allowedSuffixes: [] }
+  const initialValue = String(state.editingParams[field] || '').trim()
   state.pickerField = field
+  state.pickerMode = config.mode
+  state.pickerTitle = config.title
+  state.pickerAllowedSuffixes = Array.isArray(config.allowedSuffixes) ? [...config.allowedSuffixes] : []
   state.pickerCurrentPath = ''
-  state.pickerBreadcrumb = ['根目录']
+  state.pickerBreadcrumb = [{ label: '根目录', path: '' }]
+  state.pickerRoots = []
+  state.pickerItems = []
+  state.pickerFiles = []
+  state.pickerSelectedPath = ''
+  state.pickerSelectedKind = ''
+  state.showPicker = true
+
+  let initialDir = ''
+  let preselectPath = ''
+  if (initialValue) {
+    if (config.mode === 'file') {
+      const { directory } = splitParentPath(initialValue)
+      initialDir = directory
+      preselectPath = initialValue
+    } else {
+      initialDir = initialValue
+    }
+  }
+
   await loadPickerDir('')
+  if (initialDir) {
+    const loaded = await loadPickerDir(initialDir, { preselectPath })
+    if (!loaded) {
+      await loadPickerDir('')
+    }
+  }
   state.showPicker = true
 }
 
-async function loadPickerDir(path) {
+function splitParentPath(path) {
+  const raw = String(path || '').trim()
+  if (!raw) return { directory: '', basename: '' }
+  const slashIndex = Math.max(raw.lastIndexOf('/'), raw.lastIndexOf('\\'))
+  if (slashIndex < 0) return { directory: '', basename: raw }
+  let directory = raw.slice(0, slashIndex)
+  if (/^[A-Za-z]:$/.test(directory)) {
+    directory = `${directory}\\`
+  }
+  return {
+    directory,
+    basename: raw.slice(slashIndex + 1),
+  }
+}
+
+function samePickerPath(left, right) {
+  return String(left || '').replace(/\\/g, '/').toLowerCase() === String(right || '').replace(/\\/g, '/').toLowerCase()
+}
+
+function pathWithinPickerRoot(candidate, rootPath) {
+  const left = String(candidate || '').replace(/\\/g, '/').toLowerCase()
+  const right = String(rootPath || '').replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase()
+  return left === right || left.startsWith(`${right}/`)
+}
+
+function buildPickerBreadcrumb(currentPath) {
+  if (!currentPath) return [{ label: '根目录', path: '' }]
+
+  const matchedRoot = state.pickerRoots
+    .filter((item) => item?.path && pathWithinPickerRoot(currentPath, item.path))
+    .sort((left, right) => String(right.path || '').length - String(left.path || '').length)[0]
+
+  if (!matchedRoot?.path) {
+    return [
+      { label: '根目录', path: '' },
+      { label: currentPath, path: currentPath },
+    ]
+  }
+
+  const breadcrumbs = [
+    { label: '根目录', path: '' },
+    { label: matchedRoot.name || matchedRoot.path, path: matchedRoot.path },
+  ]
+
+  const normalizedCurrent = String(currentPath).replace(/\\/g, '/')
+  const normalizedRoot = String(matchedRoot.path).replace(/\\/g, '/').replace(/\/+$/, '')
+  const relativePath = normalizedCurrent === normalizedRoot
+    ? ''
+    : normalizedCurrent.slice(normalizedRoot.length).replace(/^\/+/, '')
+
+  if (!relativePath) return breadcrumbs
+
+  const separator = String(matchedRoot.path).includes('\\') ? '\\' : '/'
+  let accPath = String(matchedRoot.path).replace(/[\\/]+$/, '')
+  for (const segment of relativePath.split('/').filter(Boolean)) {
+    accPath = `${accPath}${separator}${segment}`
+    breadcrumbs.push({ label: segment, path: accPath })
+  }
+  return breadcrumbs
+}
+
+async function loadPickerDir(path, { preselectPath = '' } = {}) {
   try {
-    const resp = await fetch(`${props.apiBase}/filesystem/list_dirs?path=${encodeURIComponent(path)}`)
-    if (!resp.ok) return
+    const params = new URLSearchParams()
+    if (path) params.set('path', path)
+    if (state.pickerMode === 'file') {
+      params.set('include_files', 'true')
+      if (state.pickerAllowedSuffixes.length) {
+        params.set('allowed_suffixes', state.pickerAllowedSuffixes.join(','))
+      }
+    }
+
+    const query = params.toString()
+    const resp = await fetch(`${props.apiBase}/filesystem/list_dirs${query ? `?${query}` : ''}`)
+    if (!resp.ok) return false
     const data = await resp.json()
     state.pickerCurrentPath = data.current || path
     state.pickerItems = data.directories || []
-
-    if (state.pickerCurrentPath) {
-      const segs = state.pickerCurrentPath.replace(/\\/g, '/').split('/').filter(Boolean)
-      state.pickerBreadcrumb = ['根目录', ...segs]
-    } else {
-      state.pickerBreadcrumb = ['根目录']
+    state.pickerFiles = data.files || []
+    if (!state.pickerCurrentPath) {
+      state.pickerRoots = state.pickerItems.map((item) => ({ name: item.name, path: item.path }))
     }
-  } catch (_) {}
+
+    if (state.pickerMode === 'file') {
+      const matched = state.pickerFiles.find((item) => samePickerPath(item.path, preselectPath))
+      state.pickerSelectedPath = matched?.path || ''
+      state.pickerSelectedKind = matched ? 'file' : ''
+    } else {
+      state.pickerSelectedPath = state.pickerCurrentPath
+      state.pickerSelectedKind = state.pickerCurrentPath ? 'directory' : ''
+    }
+
+    state.pickerBreadcrumb = buildPickerBreadcrumb(state.pickerCurrentPath)
+    return true
+  } catch (_) {
+    return false
+  }
 }
 
 async function onPickerItemClick(item) {
   await loadPickerDir(item.path)
 }
 
-async function navigatePicker(index) {
-  if (index === 0) {
-    await loadPickerDir('')
-    return
-  }
-
-  const segs = state.pickerBreadcrumb.slice(1, index + 1)
-  await loadPickerDir(segs.join('/'))
+function selectPickerFile(file) {
+  state.pickerSelectedPath = file.path
+  state.pickerSelectedKind = 'file'
 }
 
-function confirmPick() {
+async function navigatePicker(index) {
+  const target = state.pickerBreadcrumb[index]
+  await loadPickerDir(target?.path || '')
+}
+
+async function confirmPick() {
+  const selectedPath = state.pickerMode === 'file' ? state.pickerSelectedPath : state.pickerCurrentPath
+  if (!selectedPath) return
   if (state.selectedNode) {
-    state.editingParams[state.pickerField] = state.pickerCurrentPath
+    state.editingParams[state.pickerField] = selectedPath
+    if (state.pickerField === 'clip_shapefile') {
+      await loadClipVectorPreview(selectedPath, {
+        syncExtent: !String(state.editingParams.clip_extent || '').trim(),
+        silent: true,
+      })
+    }
   }
   state.showPicker = false
 }
@@ -2103,6 +2874,17 @@ onUnmounted(() => {
   flex: 1;
 }
 
+.main-area.tablet {
+  grid-template-columns: 176px minmax(0, 1fr);
+  grid-template-rows: minmax(460px, 62vh) minmax(276px, 34vh);
+  grid-template-areas:
+    "palette canvas"
+    "panel panel";
+  align-content: stretch;
+  align-items: stretch;
+  height: 100%;
+}
+
 .node-palette,
 .canvas-stage,
 .right-panel {
@@ -2121,6 +2903,15 @@ onUnmounted(() => {
   overflow: hidden;
 }
 
+.main-area.tablet .node-palette {
+  grid-area: palette;
+  padding: 10px 9px;
+}
+
+.node-palette.touch .palette-item {
+  cursor: pointer;
+}
+
 .palette-header,
 .mobile-palette-header {
   display: flex;
@@ -2135,6 +2926,10 @@ onUnmounted(() => {
   color: var(--text-soft);
   font-size: 12px;
   line-height: 1.6;
+}
+
+.form-hint-error {
+  color: var(--danger);
 }
 
 .palette-fit-btn,
@@ -2248,6 +3043,12 @@ onUnmounted(() => {
   --palette-border: rgba(124, 116, 98, 0.24);
 }
 
+.palette-item.type-mosaic {
+  --palette-accent: #546f8d;
+  --palette-soft: rgba(84, 111, 141, 0.14);
+  --palette-border: rgba(84, 111, 141, 0.24);
+}
+
 .palette-item.type-clip {
   --palette-accent: #8b6951;
   --palette-soft: rgba(139, 105, 81, 0.14);
@@ -2265,6 +3066,27 @@ onUnmounted(() => {
   flex-direction: column;
   padding: 12px;
   min-height: 0;
+}
+
+.main-area.tablet .canvas-stage {
+  grid-area: canvas;
+  padding: 10px;
+  height: 100%;
+}
+
+.main-area.tablet .canvas-wrapper {
+  flex: 1 1 auto;
+  min-height: 420px;
+  height: 100%;
+}
+
+.main-area.tablet .canvas-wrapper.touch {
+  min-height: 420px;
+  height: 100%;
+}
+
+.main-area.tablet .vue-flow-canvas {
+  min-height: 420px;
 }
 
 .stage-header {
@@ -2375,6 +3197,12 @@ onUnmounted(() => {
 .right-panel {
   min-height: 0;
   overflow: hidden;
+}
+
+.main-area.tablet .right-panel {
+  grid-area: panel;
+  overflow: hidden;
+  height: 100%;
 }
 
 .queue-panel,
@@ -2728,6 +3556,41 @@ onUnmounted(() => {
   gap: 8px;
 }
 
+.clip-action-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.clip-preview-meta {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.clip-preview-pill {
+  min-width: 0;
+  padding: 10px 12px;
+  border-radius: 12px;
+  border: 1px solid var(--border);
+  background: var(--surface-soft);
+}
+
+.clip-preview-pill strong {
+  display: block;
+  font-size: 11px;
+  color: var(--text-soft);
+}
+
+.clip-preview-pill span {
+  display: block;
+  margin-top: 4px;
+  font-size: 12px;
+  color: var(--text);
+  word-break: break-all;
+}
+
 .btn-pick {
   min-height: 38px;
   padding: 0 11px;
@@ -2972,6 +3835,15 @@ onUnmounted(() => {
   padding: 10px;
 }
 
+.picker-section-label {
+  padding: 10px 12px 6px;
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--text-faint);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
 .picker-item {
   display: flex;
   align-items: center;
@@ -2984,6 +3856,15 @@ onUnmounted(() => {
 
 .picker-item:hover {
   background: var(--surface-soft);
+}
+
+.picker-item.selected {
+  background: rgba(30, 122, 94, 0.1);
+  border: 1px solid rgba(30, 122, 94, 0.28);
+}
+
+.picker-item.file {
+  margin-top: 4px;
 }
 
 .picker-item-icon {
@@ -3055,7 +3936,7 @@ onUnmounted(() => {
 }
 
 @media (max-width: 900px) {
-  .batch-manager {
+  .batch-manager.is-phone {
     overflow: visible;
     height: auto;
   }
@@ -3089,7 +3970,7 @@ onUnmounted(() => {
     flex: 0 0 auto;
   }
 
-  .main-area {
+  .batch-manager.is-phone .main-area {
     display: flex;
     flex-direction: column;
     gap: 12px;
@@ -3097,16 +3978,16 @@ onUnmounted(() => {
     overflow: visible;
   }
 
-  .canvas-stage,
-  .right-panel {
+  .batch-manager.is-phone .canvas-stage,
+  .batch-manager.is-phone .right-panel {
     width: 100%;
   }
 
-  .canvas-stage {
+  .batch-manager.is-phone .canvas-stage {
     padding: 10px;
   }
 
-  .canvas-wrapper {
+  .batch-manager.is-phone .canvas-wrapper {
     min-height: 54vh;
   }
 
@@ -3114,11 +3995,11 @@ onUnmounted(() => {
     right: 12px;
   }
 
-  .right-panel {
+  .batch-manager.is-phone .right-panel {
     overflow: visible;
   }
 
-  .side-panel.mobile {
+  .batch-manager.is-phone .side-panel.mobile {
     position: fixed;
     inset: 0;
     z-index: 40;
@@ -3126,11 +4007,11 @@ onUnmounted(() => {
     background: var(--surface);
   }
 
-  .side-panel.mobile .side-panel-header {
+  .batch-manager.is-phone .side-panel.mobile .side-panel-header {
     padding-top: 14px;
   }
 
-  .side-panel.mobile .side-panel-footer {
+  .batch-manager.is-phone .side-panel.mobile .side-panel-footer {
     position: sticky;
     bottom: 0;
     padding-bottom: calc(16px + env(safe-area-inset-bottom));
@@ -3156,7 +4037,11 @@ onUnmounted(() => {
     flex-wrap: wrap;
   }
 
-  .mobile-palette-drawer {
+  .clip-preview-meta {
+    grid-template-columns: 1fr;
+  }
+
+  .batch-manager.is-phone .mobile-palette-drawer {
     position: fixed;
     left: 10px;
     right: 10px;
@@ -3166,12 +4051,12 @@ onUnmounted(() => {
     pointer-events: none;
   }
 
-  .mobile-drawer-handle,
-  .mobile-palette-content {
+  .batch-manager.is-phone .mobile-drawer-handle,
+  .batch-manager.is-phone .mobile-palette-content {
     pointer-events: auto;
   }
 
-  .mobile-drawer-handle {
+  .batch-manager.is-phone .mobile-drawer-handle {
     width: 100%;
     border: 1px solid rgba(199, 210, 206, 0.88);
     background: rgba(255, 255, 255, 0.95);
@@ -3189,7 +4074,7 @@ onUnmounted(() => {
     cursor: pointer;
   }
 
-  .mobile-palette-content {
+  .batch-manager.is-phone .mobile-palette-content {
     margin-top: 8px;
     border-radius: 20px;
     border: 1px solid rgba(199, 210, 206, 0.92);
@@ -3203,21 +4088,21 @@ onUnmounted(() => {
     transition: max-height 0.24s ease, opacity 0.24s ease, transform 0.24s ease;
   }
 
-  .mobile-palette-drawer.open .mobile-palette-content {
+  .batch-manager.is-phone .mobile-palette-drawer.open .mobile-palette-content {
     max-height: 296px;
     opacity: 1;
     transform: translateY(0);
   }
 
-  .mobile-palette-list {
+  .batch-manager.is-phone .mobile-palette-list {
     max-height: 214px;
   }
 
-  .picker-overlay {
+  .batch-manager.is-phone .picker-overlay {
     padding: 0;
   }
 
-  .picker-dialog {
+  .batch-manager.is-phone .picker-dialog {
     width: 100%;
     max-height: 100%;
     height: 100%;

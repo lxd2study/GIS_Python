@@ -1,27 +1,49 @@
 """批量任务管理器"""
 
 import logging
+import shutil
 import queue
 import threading
 import uuid
+from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
+
+import numpy as np
+from osgeo import gdal
 
 from ..core.config import settings
+from ..core.constants import COMPOSITE_MAP
 from ..core.models import (
     BatchJob,
     BatchJobConfig,
     BatchStatusResponse,
+    JobKind,
     TaskPriority,
     TaskStatus,
     ProcessingResult,
+    SceneInputConfig,
 )
 from ..core.processor import Landsat8Processor
+from ..operations import clip_raster, mosaic_rasters
 from ..utils.file_utils import collect_band_paths, detect_product_level_from_path, find_scene_support_files
 from ..utils.path_policy import PathAccessController
 
 logger = logging.getLogger(__name__)
+
+DISPLAY_COMPOSITE_TYPES = (
+    "true_color",
+    "false_color",
+    "natural_color",
+    "agriculture",
+    "urban",
+    "swir",
+)
+DISPLAY_COMPOSITE_TYPE_SET = set(DISPLAY_COMPOSITE_TYPES)
+DISPLAY_BALANCE_PERCENTILES = np.asarray([1, 5, 25, 50, 75, 95, 99], dtype=np.float32)
+DISPLAY_BALANCE_SAMPLE_TARGET = 200_000
+DISPLAY_BALANCE_CLIP_RANGE = (np.float32(-0.2), np.float32(1.6))
 
 
 class BatchJobManager:
@@ -125,89 +147,16 @@ class BatchJobManager:
             self._mark_job_running(job)
 
         try:
-            band_paths = collect_band_paths(
-                job.config.band_dir,
-                product_level=job.config.product_level,
-            )
-            band_paths = {
-                band_name: str(
-                    self.path_access.require_file(
-                        band_path,
-                        access_label="读取波段文件",
-                    )
-                )
-                for band_name, band_path in band_paths.items()
-            }
-            scene_support_files = find_scene_support_files(
-                job.config.band_dir,
-                product_level=job.config.product_level,
-            )
-            scene_support_files = {
-                "mtl_file": self.path_access.optional_file(
-                    scene_support_files.get("mtl_file"),
-                    access_label="读取自动发现的 MTL 文件",
-                ),
-                "qa_band": self.path_access.optional_file(
-                    scene_support_files.get("qa_band"),
-                    access_label="读取自动发现的 QA 文件",
-                ),
-                "qa_radsat_band": self.path_access.optional_file(
-                    scene_support_files.get("qa_radsat_band"),
-                    access_label="读取自动发现的 QA_RADSAT 文件",
-                ),
-            }
-            processor = Landsat8Processor()
-
-            def resolve_support_file(configured_path: Optional[str], detected_path: Optional[str]) -> Optional[str]:
-                if not configured_path:
-                    return detected_path
-
-                detected_level = detect_product_level_from_path(Path(configured_path))
-                if (
-                    job.config.product_level
-                    and detected_level
-                    and detected_level != job.config.product_level
-                    and detected_path
-                ):
-                    logger.info(
-                        "任务 %s 检测到辅助文件产品级别不匹配，已切换为自动发现的 %s 文件: %s",
-                        job.job_id,
-                        job.config.product_level,
-                        detected_path,
-                    )
-                    return detected_path
-
-                return configured_path
-
-            mtl_file = resolve_support_file(job.config.mtl_file, scene_support_files.get("mtl_file"))
-            qa_band = resolve_support_file(job.config.qa_band, scene_support_files.get("qa_band"))
-            qa_radsat_band = resolve_support_file(
-                job.config.qa_radsat_band,
-                scene_support_files.get("qa_radsat_band"),
-            )
-
             def progress_callback(progress_info: Dict):
                 with self.lock:
                     if 'progress' in progress_info:
                         job.progress = progress_info['progress']
                     job.updated_at = self._utc_now()
 
-            result = processor.one_click_preprocess(
-                band_paths=band_paths,
-                output_dir=job.config.output_dir,
-                mtl_path=mtl_file,
-                clip_extent=job.config.clip_extent,
-                clip_shapefile=job.config.clip_shapefile,
-                create_composites=job.config.create_composites,
-                apply_cloud_mask=job.config.apply_cloud_mask,
-                qa_band_path=qa_band,
-                qa_radsat_band_path=qa_radsat_band,
-                atm_correction_method=job.config.atm_correction_method,
-                product_level=job.config.product_level,
-                custom_index_formula=job.config.custom_index_formula,
-                custom_index_name=job.config.custom_index_name,
-                progress_callback=progress_callback,
-            )
+            if job.config.job_kind == JobKind.MOSAIC:
+                result = self._execute_mosaic_job(job.config, progress_callback)
+            else:
+                result = self._execute_scene_job(job.config, progress_callback)
 
             if result.get("status") != "success":
                 error_message = result.get("error") or "批处理预处理返回失败状态"
@@ -221,6 +170,519 @@ class BatchJobManager:
         except Exception as e:
             logger.error("Job %s failed: %s", job.job_id, e)
             self._handle_job_failure(job, str(e))
+
+    @staticmethod
+    def _resolve_support_file(
+        configured_path: Optional[str],
+        detected_path: Optional[str],
+        product_level: str,
+        scene_name: str,
+    ) -> Optional[str]:
+        if not configured_path:
+            return detected_path
+
+        detected_level = detect_product_level_from_path(Path(configured_path))
+        if (
+            product_level
+            and detected_level
+            and detected_level != product_level
+            and detected_path
+        ):
+            logger.info(
+                "场景 %s 检测到辅助文件产品级别不匹配，已切换为自动发现的 %s 文件: %s",
+                scene_name,
+                product_level,
+                detected_path,
+            )
+            return detected_path
+
+        return configured_path
+
+    def _resolve_scene_inputs(self, config: BatchJobConfig) -> Tuple[Dict[str, str], Optional[str], Optional[str], Optional[str]]:
+        band_paths = collect_band_paths(
+            config.band_dir,
+            product_level=config.product_level,
+        )
+        band_paths = {
+            band_name: str(
+                self.path_access.require_file(
+                    band_path,
+                    access_label="读取波段文件",
+                )
+            )
+            for band_name, band_path in band_paths.items()
+        }
+
+        scene_support_files = find_scene_support_files(
+            config.band_dir,
+            product_level=config.product_level,
+        )
+        scene_support_files = {
+            "mtl_file": self.path_access.optional_file(
+                scene_support_files.get("mtl_file"),
+                access_label="读取自动发现的 MTL 文件",
+            ),
+            "qa_band": self.path_access.optional_file(
+                scene_support_files.get("qa_band"),
+                access_label="读取自动发现的 QA 文件",
+            ),
+            "qa_radsat_band": self.path_access.optional_file(
+                scene_support_files.get("qa_radsat_band"),
+                access_label="读取自动发现的 QA_RADSAT 文件",
+            ),
+        }
+
+        mtl_file = self._resolve_support_file(
+            config.mtl_file,
+            scene_support_files.get("mtl_file"),
+            config.product_level,
+            config.scene_name,
+        )
+        qa_band = self._resolve_support_file(
+            config.qa_band,
+            scene_support_files.get("qa_band"),
+            config.product_level,
+            config.scene_name,
+        )
+        qa_radsat_band = self._resolve_support_file(
+            config.qa_radsat_band,
+            scene_support_files.get("qa_radsat_band"),
+            config.product_level,
+            config.scene_name,
+        )
+        return band_paths, mtl_file, qa_band, qa_radsat_band
+
+    def _execute_scene_job(
+        self,
+        config: BatchJobConfig,
+        progress_callback: Optional[Callable[[Dict], None]] = None,
+    ) -> Dict:
+        band_paths, mtl_file, qa_band, qa_radsat_band = self._resolve_scene_inputs(config)
+        processor = Landsat8Processor()
+        return processor.one_click_preprocess(
+            band_paths=band_paths,
+            output_dir=config.output_dir,
+            mtl_path=mtl_file,
+            clip_extent=config.clip_extent,
+            clip_shapefile=config.clip_shapefile,
+            create_composites=config.create_composites,
+            apply_cloud_mask=config.apply_cloud_mask,
+            qa_band_path=qa_band,
+            qa_radsat_band_path=qa_radsat_band,
+            atm_correction_method=config.atm_correction_method,
+            product_level=config.product_level,
+            custom_index_formula=config.custom_index_formula,
+            custom_index_name=config.custom_index_name,
+            progress_callback=progress_callback,
+        )
+
+    def _update_mosaic_progress(
+        self,
+        progress_callback: Optional[Callable[[Dict], None]],
+        progress: int,
+        detail: str,
+    ) -> None:
+        if progress_callback is None:
+            return
+        progress_callback({"progress": progress, "detail": detail})
+
+    def _scene_input_to_job_config(
+        self,
+        scene_input: SceneInputConfig,
+        output_dir: str,
+        template,
+        atm_correction_method: str,
+        apply_cloud_mask: bool,
+    ) -> BatchJobConfig:
+        return BatchJobConfig(
+            scene_name=scene_input.scene_name,
+            band_dir=scene_input.band_dir,
+            output_dir=output_dir,
+            mtl_file=scene_input.mtl_file,
+            qa_band=scene_input.qa_band,
+            qa_radsat_band=scene_input.qa_radsat_band,
+            product_level=scene_input.product_level,
+            template=template,
+            atm_correction_method=atm_correction_method,
+            apply_cloud_mask=apply_cloud_mask,
+            clip_extent=None,
+            clip_shapefile=None,
+            create_composites=[],
+            custom_index_formula=None,
+            custom_index_name=None,
+            display_balance_enabled=False,
+        )
+
+    @staticmethod
+    def _filter_display_composites(create_composites: Optional[List[str]]) -> List[str]:
+        return [item for item in (create_composites or []) if item in DISPLAY_COMPOSITE_TYPE_SET]
+
+    @staticmethod
+    def _collect_display_band_names(display_composites: List[str]) -> List[str]:
+        ordered: List[str] = []
+        seen = set()
+        for composite_type in display_composites:
+            for band_name in COMPOSITE_MAP.get(composite_type, []):
+                if band_name in seen:
+                    continue
+                seen.add(band_name)
+                ordered.append(band_name)
+        return ordered
+
+    @staticmethod
+    def _read_processed_band_array(band_path: str) -> np.ndarray:
+        dataset = gdal.Open(band_path)
+        if dataset is None:
+            raise RuntimeError(f"无法打开匀色输入波段: {band_path}")
+
+        band = dataset.GetRasterBand(1)
+        nodata = band.GetNoDataValue()
+        band_array = band.ReadAsArray().astype(np.float32)
+        mask = band.GetMaskBand().ReadAsArray()
+        dataset = None
+
+        if mask is not None:
+            band_array = np.where(mask == 0, np.nan, band_array)
+        if nodata is not None:
+            band_array = np.where(band_array == nodata, np.nan, band_array)
+        return band_array
+
+    @staticmethod
+    def _sample_valid_values(array: np.ndarray, sample_target: int = DISPLAY_BALANCE_SAMPLE_TARGET) -> np.ndarray:
+        if array.size == 0:
+            return np.asarray([], dtype=np.float32)
+
+        step = max(int(np.sqrt(array.size / max(sample_target, 1))), 1)
+        sampled = array[::step, ::step]
+        valid = sampled[np.isfinite(sampled)]
+        if valid.size == 0 and step > 1:
+            valid = array[np.isfinite(array)]
+        return valid.astype(np.float32, copy=False)
+
+    def _compute_band_quantiles(self, band_path: str) -> Optional[np.ndarray]:
+        band_array = self._read_processed_band_array(band_path)
+        valid = self._sample_valid_values(band_array)
+        if valid.size == 0:
+            return None
+        return np.percentile(valid, DISPLAY_BALANCE_PERCENTILES).astype(np.float32)
+
+    def _build_display_balance_stats(
+        self,
+        scene_inputs: List[SceneInputConfig],
+        scene_results: List[Dict],
+        display_band_names: List[str],
+    ) -> List[Dict]:
+        stats: List[Dict] = []
+        for scene_input, scene_result in zip(scene_inputs, scene_results):
+            processed_bands = scene_result.get("processed_bands") or {}
+            band_stats: Dict[str, Dict[str, object]] = {}
+            scene_medians: List[float] = []
+            for band_name in display_band_names:
+                band_path = processed_bands.get(band_name)
+                if not band_path:
+                    continue
+                quantiles = self._compute_band_quantiles(band_path)
+                if quantiles is None:
+                    continue
+                band_stats[band_name] = {
+                    "path": band_path,
+                    "quantiles": quantiles,
+                }
+                scene_medians.append(float(quantiles[3]))
+            brightness = float(np.mean(scene_medians)) if scene_medians else None
+            stats.append({
+                "scene_name": scene_input.scene_name,
+                "band_stats": band_stats,
+                "brightness": brightness,
+            })
+        return stats
+
+    @staticmethod
+    def _select_reference_scene(scene_stats: List[Dict], display_band_names: List[str]) -> Optional[Dict]:
+        full_candidates = [
+            (index, item)
+            for index, item in enumerate(scene_stats)
+            if item.get("brightness") is not None
+            and all(band_name in (item.get("band_stats") or {}) for band_name in display_band_names)
+        ]
+        candidates = full_candidates or [
+            (index, item)
+            for index, item in enumerate(scene_stats)
+            if item.get("brightness") is not None
+        ]
+        if not candidates:
+            return None
+
+        brightness_values = [item["brightness"] for _, item in candidates]
+        target_brightness = float(np.median(brightness_values))
+        reference_index, reference_item = min(
+            candidates,
+            key=lambda pair: (abs(pair[1]["brightness"] - target_brightness), pair[0]),
+        )
+        return {
+            "index": reference_index,
+            "scene_name": reference_item["scene_name"],
+            "band_stats": reference_item["band_stats"],
+            "brightness": reference_item["brightness"],
+        }
+
+    @staticmethod
+    def _prepare_interp_knots(source_quantiles: np.ndarray, target_quantiles: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        source = np.asarray(source_quantiles, dtype=np.float32)
+        target = np.asarray(target_quantiles, dtype=np.float32)
+        if source.shape != target.shape:
+            raise RuntimeError("匀色分位点数量不一致")
+
+        unique_source, unique_indices = np.unique(source, return_index=True)
+        unique_target = target[unique_indices]
+        return unique_source.astype(np.float32), unique_target.astype(np.float32)
+
+    def _write_display_balanced_band(
+        self,
+        source_path: str,
+        output_path: str,
+        source_quantiles: np.ndarray,
+        target_quantiles: np.ndarray,
+    ) -> str:
+        source_knots, target_knots = self._prepare_interp_knots(source_quantiles, target_quantiles)
+        band_array = self._read_processed_band_array(source_path)
+        valid_mask = np.isfinite(band_array)
+
+        balanced = np.array(band_array, dtype=np.float32, copy=True)
+        if np.any(valid_mask):
+            if source_knots.size <= 1:
+                balanced[valid_mask] = target_knots[0]
+            else:
+                balanced[valid_mask] = np.interp(
+                    balanced[valid_mask],
+                    source_knots,
+                    target_knots,
+                ).astype(np.float32)
+            balanced_valid = np.clip(
+                balanced[valid_mask],
+                DISPLAY_BALANCE_CLIP_RANGE[0],
+                DISPLAY_BALANCE_CLIP_RANGE[1],
+            )
+            balanced[valid_mask] = balanced_valid.astype(np.float32, copy=False)
+        balanced[~valid_mask] = np.nan
+
+        Landsat8Processor._write_processed_band(output_path, source_path, balanced)
+        return output_path
+
+    def _build_display_balance_overrides(
+        self,
+        config: BatchJobConfig,
+        scene_results: List[Dict],
+        output_root: Path,
+        processed_bands: Dict[str, str],
+        progress_callback: Optional[Callable[[Dict], None]] = None,
+    ) -> Tuple[Dict[str, Dict[str, str]], bool, str]:
+        display_composites = self._filter_display_composites(config.create_composites)
+        if not display_composites or not config.display_balance_enabled:
+            return {}, False, ""
+
+        display_band_names = self._collect_display_band_names(display_composites)
+        if not display_band_names:
+            return {}, False, ""
+
+        self._update_mosaic_progress(progress_callback, 80, "正在分析显示匀色参考景")
+        scene_stats = self._build_display_balance_stats(config.scene_inputs, scene_results, display_band_names)
+        reference_scene = self._select_reference_scene(scene_stats, display_band_names)
+        if reference_scene is None:
+            logger.warning("显示匀色已跳过：无法为镶嵌结果选择参考景")
+            return {}, False, ""
+
+        display_root = output_root / "_display_balance"
+        display_root.mkdir(parents=True, exist_ok=True)
+        balanced_scene_band_paths: Dict[str, List[str]] = defaultdict(list)
+
+        for scene_stat in scene_stats:
+            scene_band_stats = scene_stat.get("band_stats") or {}
+            scene_output_dir = display_root / scene_stat["scene_name"]
+            scene_output_dir.mkdir(parents=True, exist_ok=True)
+            for band_name in display_band_names:
+                band_info = scene_band_stats.get(band_name)
+                source_path = band_info.get("path") if band_info else None
+                if not source_path:
+                    continue
+
+                reference_band_info = (reference_scene.get("band_stats") or {}).get(band_name)
+                if not reference_band_info or scene_stat["scene_name"] == reference_scene["scene_name"]:
+                    balanced_scene_band_paths[band_name].append(source_path)
+                    continue
+
+                balanced_path = scene_output_dir / f"{band_name}_balanced_processed.tif"
+                self._write_display_balanced_band(
+                    source_path,
+                    str(balanced_path),
+                    band_info["quantiles"],
+                    reference_band_info["quantiles"],
+                )
+                balanced_scene_band_paths[band_name].append(str(balanced_path))
+
+        self._update_mosaic_progress(progress_callback, 84, "正在生成匀色后的显示波段镶嵌")
+        balanced_mosaics: Dict[str, str] = {}
+        for band_name in display_band_names:
+            input_paths = balanced_scene_band_paths.get(band_name) or []
+            if not input_paths:
+                continue
+
+            mosaic_path = display_root / f"{band_name}_display_processed.tif"
+            mosaic_rasters(input_paths, str(mosaic_path), reference_path=input_paths[0])
+
+            final_path = mosaic_path
+            if config.clip_extent or config.clip_shapefile:
+                clipped_path = display_root / f"{band_name}_display_clipped.tif"
+                clip_raster(
+                    str(mosaic_path),
+                    str(clipped_path),
+                    extent=config.clip_extent,
+                    shapefile=config.clip_shapefile,
+                )
+                final_path = clipped_path
+                if not config.keep_intermediate:
+                    mosaic_path.unlink(missing_ok=True)
+
+            balanced_mosaics[band_name] = str(final_path)
+
+        if not balanced_mosaics:
+            return {}, False, reference_scene["scene_name"]
+
+        composite_overrides = {
+            composite_type: {**processed_bands, **balanced_mosaics}
+            for composite_type in display_composites
+        }
+        return composite_overrides, True, reference_scene["scene_name"]
+
+    def _execute_mosaic_job(
+        self,
+        config: BatchJobConfig,
+        progress_callback: Optional[Callable[[Dict], None]] = None,
+    ) -> Dict:
+        if not config.scene_inputs:
+            raise RuntimeError("镶嵌任务缺少输入场景")
+
+        output_root = Path(config.output_dir)
+        output_root.mkdir(parents=True, exist_ok=True)
+        intermediate_root = output_root / "_intermediate"
+        intermediate_root.mkdir(parents=True, exist_ok=True)
+
+        processor = Landsat8Processor()
+        scene_results: List[Dict] = []
+        total_scenes = len(config.scene_inputs)
+        self._update_mosaic_progress(progress_callback, 5, "开始执行镶嵌任务")
+
+        for index, scene_input in enumerate(config.scene_inputs, start=1):
+            scene_output_dir = intermediate_root / scene_input.scene_name
+            scene_output_dir.mkdir(parents=True, exist_ok=True)
+            self._update_mosaic_progress(
+                progress_callback,
+                10 + int(35 * (index - 1) / max(total_scenes, 1)),
+                f"预处理场景 {scene_input.scene_name} ({index}/{total_scenes})",
+            )
+            scene_config = self._scene_input_to_job_config(
+                scene_input,
+                str(scene_output_dir),
+                config.template,
+                config.atm_correction_method,
+                config.apply_cloud_mask,
+            )
+            scene_result = self._execute_scene_job(scene_config)
+            if scene_result.get("status") != "success":
+                error_message = scene_result.get("error") or f"场景 {scene_input.scene_name} 预处理失败"
+                raise RuntimeError(error_message)
+            scene_results.append(scene_result)
+
+        skipped_bands = sorted({
+            band_name
+            for result in scene_results
+            for band_name in (result.get("skipped_bands") or [])
+        })
+
+        grouped_band_paths: Dict[str, List[str]] = defaultdict(list)
+        for result in scene_results:
+            for band_name, band_path in (result.get("processed_bands") or {}).items():
+                grouped_band_paths[band_name].append(band_path)
+        if not grouped_band_paths:
+            raise RuntimeError("镶嵌任务未产生可用波段")
+
+        processed_bands: Dict[str, str] = {}
+        band_names = sorted(grouped_band_paths)
+        total_bands = len(band_names)
+        self._update_mosaic_progress(progress_callback, 48, "开始执行同名波段镶嵌")
+
+        for index, band_name in enumerate(band_names, start=1):
+            input_paths = grouped_band_paths[band_name]
+            mosaic_path = output_root / f"{band_name}_processed.tif"
+            mosaic_rasters(input_paths, str(mosaic_path), reference_path=input_paths[0])
+
+            final_path = mosaic_path
+            if config.clip_extent or config.clip_shapefile:
+                clipped_path = output_root / f"{band_name}_clipped.tif"
+                clip_raster(
+                    str(mosaic_path),
+                    str(clipped_path),
+                    extent=config.clip_extent,
+                    shapefile=config.clip_shapefile,
+                )
+                final_path = clipped_path
+                if not config.keep_intermediate:
+                    mosaic_path.unlink(missing_ok=True)
+
+            processed_bands[band_name] = str(final_path)
+            self._update_mosaic_progress(
+                progress_callback,
+                50 + int(25 * index / max(total_bands, 1)),
+                f"已完成波段 {band_name} 镶嵌 ({index}/{total_bands})",
+            )
+
+        composites: Dict[str, str] = {}
+        composite_band_overrides: Dict[str, Dict[str, str]] = {}
+        display_balance_applied = False
+        display_balance_reference_scene = ""
+        if config.create_composites or (config.custom_index_formula and config.custom_index_formula.strip()):
+            composite_band_overrides, display_balance_applied, display_balance_reference_scene = self._build_display_balance_overrides(
+                config,
+                scene_results,
+                output_root,
+                processed_bands,
+                progress_callback,
+            )
+            self._update_mosaic_progress(progress_callback, 85, "开始生成镶嵌结果的合成与指数")
+            composites = processor._create_requested_composites(
+                processed_bands,
+                str(output_root),
+                config.create_composites,
+                config.custom_index_formula,
+                config.custom_index_name,
+                composite_band_overrides=composite_band_overrides,
+            )
+
+        if not config.keep_intermediate:
+            shutil.rmtree(intermediate_root, ignore_errors=True)
+            shutil.rmtree(output_root / "_display_balance", ignore_errors=True)
+
+        return {
+            "status": "success",
+            "processed_bands": processed_bands,
+            "composites": composites,
+            "cloud_mask": None,
+            "metadata": {
+                "job_kind": JobKind.MOSAIC.value,
+                "scene_count": total_scenes,
+                "display_balance_enabled": bool(config.display_balance_enabled),
+                "display_balance_applied": bool(display_balance_applied),
+                "display_balance_reference_scene": display_balance_reference_scene or "",
+            },
+            "summary": {
+                "scene_count": total_scenes,
+                "band_count": total_bands,
+            },
+            "atm_correction_method": config.atm_correction_method,
+            "skipped_bands": skipped_bands,
+            "product_level": config.product_level,
+            "processing_mode": "mosaic",
+        }
 
     def _handle_job_failure(self, job: BatchJob, error: str):
         """处理任务失败"""

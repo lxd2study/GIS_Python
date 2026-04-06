@@ -33,11 +33,12 @@ from ..services.batch_manager import BatchJobManager
 from ..services.landsat_download import LandsatDownloadService
 from ..services.templates import ProcessingTemplates
 from ..services.graph_executor import GraphExecutor
-from ..utils.file_utils import find_scene_support_files, infer_available_product_levels
+from ..utils.file_utils import collect_band_paths, find_scene_support_files, infer_available_product_levels
 from ..utils.path_policy import PathAccessController, PathAccessError
 
 logger = logging.getLogger(__name__)
 RASTER_PREVIEW_EXTENSIONS = (".tif", ".tiff", ".img", ".png")
+VECTOR_PREVIEW_EXTENSIONS = (".shp", ".geojson", ".json")
 # 单次写入 1MB，避免大文件上传时把整个文件一次性读入内存。
 UPLOAD_CHUNK_SIZE = 1024 * 1024
 PATH_ACCESS = PathAccessController(settings.allowed_path_roots)
@@ -365,11 +366,33 @@ def _list_root_directories() -> Dict:
         "current": "",
         "parent": "",
         "directories": PATH_ACCESS.allowed_roots_payload(),
+        "files": [],
     }
 
 
-def _list_directory_entries(current: Path) -> List[Dict[str, str]]:
+def _normalize_suffix_filters(raw_value: Optional[str]) -> List[str]:
+    if not raw_value:
+        return []
+    suffixes = []
+    for item in str(raw_value).split(","):
+        value = item.strip().lower()
+        if not value:
+            continue
+        if not value.startswith("."):
+            value = f".{value}"
+        suffixes.append(value)
+    return sorted(set(suffixes))
+
+
+def _list_directory_entries(
+    current: Path,
+    *,
+    include_files: bool = False,
+    allowed_suffixes: Optional[List[str]] = None,
+) -> Dict[str, List[Dict[str, str]]]:
     directories = []
+    files = []
+    suffix_filters = {suffix.lower() for suffix in (allowed_suffixes or [])}
     with os.scandir(current) as it:
         for entry in it:
             if entry.is_dir(follow_symlinks=False):
@@ -377,9 +400,21 @@ def _list_directory_entries(current: Path) -> List[Dict[str, str]]:
                 if not PATH_ACCESS.is_allowed(resolved):
                     continue
                 directories.append({"name": entry.name, "path": str(resolved)})
+                continue
+
+            if not include_files or not entry.is_file(follow_symlinks=False):
+                continue
+
+            resolved = Path(entry.path).resolve(strict=False)
+            if not PATH_ACCESS.is_allowed(resolved):
+                continue
+            if suffix_filters and resolved.suffix.lower() not in suffix_filters:
+                continue
+            files.append({"name": entry.name, "path": str(resolved)})
 
     directories.sort(key=lambda item: item["name"].lower())
-    return directories
+    files.sort(key=lambda item: item["name"].lower())
+    return {"directories": directories, "files": files}
 
 
 def _raise_path_access_http_error(exc: PathAccessError) -> None:
@@ -487,6 +522,90 @@ def _vector_dataset_payload(vector_path: str, *, label: str) -> Dict:
             "features": features,
         },
     }
+
+
+def _resolve_raster_preview_target(path_value: str, product_level: Optional[str] = None) -> Path:
+    target_path = Path(path_value)
+    if target_path.suffix.lower() in RASTER_PREVIEW_EXTENSIONS:
+        return PATH_ACCESS.require_file(
+            path_value,
+            access_label="读取栅格覆盖范围",
+            allowed_suffixes=RASTER_PREVIEW_EXTENSIONS,
+        )
+
+    target_dir = PATH_ACCESS.require_directory(path_value, access_label="读取场景目录")
+    band_paths = collect_band_paths(target_dir, product_level=product_level)
+    preferred_band = next((band_paths.get(band) for band in ("B4", "B3", "B2", "B5") if band_paths.get(band)), None)
+    raster_path = preferred_band or next(iter(sorted(band_paths.values())))
+    return PATH_ACCESS.require_file(
+        raster_path,
+        access_label="读取场景代表波段",
+        allowed_suffixes=RASTER_PREVIEW_EXTENSIONS,
+    )
+
+
+def _raster_dataset_payload(raster_path: str, *, label: str) -> Dict:
+    dataset = gdal.Open(raster_path)
+    if dataset is None:
+        raise ValueError(f"无法打开栅格文件: {raster_path}")
+
+    width = dataset.RasterXSize
+    height = dataset.RasterYSize
+    geo_transform = dataset.GetGeoTransform(can_return_null=True)
+    if geo_transform is None:
+        dataset = None
+        raise ValueError("栅格缺少地理参考信息，无法生成覆盖范围")
+
+    source_srs = None
+    projection = dataset.GetProjection()
+    if projection:
+        source_srs = osr.SpatialReference()
+        source_srs.ImportFromWkt(projection)
+
+    def _pixel_to_geo(pixel_x: float, pixel_y: float) -> List[float]:
+        x = geo_transform[0] + pixel_x * geo_transform[1] + pixel_y * geo_transform[2]
+        y = geo_transform[3] + pixel_x * geo_transform[4] + pixel_y * geo_transform[5]
+        return [x, y]
+
+    corners = [
+        _pixel_to_geo(0, 0),
+        _pixel_to_geo(width, 0),
+        _pixel_to_geo(width, height),
+        _pixel_to_geo(0, height),
+        _pixel_to_geo(0, 0),
+    ]
+    ring = ogr.Geometry(ogr.wkbLinearRing)
+    for x_coord, y_coord in corners:
+        ring.AddPoint(float(x_coord), float(y_coord))
+    polygon = ogr.Geometry(ogr.wkbPolygon)
+    polygon.AddGeometry(ring)
+    polygon_wgs84 = _transform_geometry_to_wgs84(polygon, source_srs)
+    min_x, max_x, min_y, max_y = polygon_wgs84.GetEnvelope()
+    payload = {
+        "label": label,
+        "bbox": [round(min_x, 6), round(min_y, 6), round(max_x, 6), round(max_y, 6)],
+        "geojson": {
+            "type": "FeatureCollection",
+            "features": [
+                {
+                    "type": "Feature",
+                    "properties": {
+                        "label": label,
+                        "width": width,
+                        "height": height,
+                    },
+                    "geometry": json.loads(polygon_wgs84.ExportToJson()),
+                }
+            ],
+        },
+        "width": width,
+        "height": height,
+    }
+    dataset = None
+    polygon = None
+    polygon_wgs84 = None
+    ring = None
+    return payload
 
 
 async def _parse_vector_upload(files: List[UploadFile], file_manager: FileManager) -> Dict:
@@ -966,10 +1085,17 @@ def setup_routes(
         return BAND_INFO
 
     @app.get("/filesystem/list_dirs")
-    def list_directories(path: Optional[str] = None) -> Dict:
+    def list_directories(
+        path: Optional[str] = None,
+        include_files: bool = False,
+        allowed_suffixes: Optional[str] = None,
+    ) -> Dict:
         """List directories for UI path picker (local deployment)."""
+        suffix_filters = _normalize_suffix_filters(allowed_suffixes)
         if path is None or not path.strip():
-            return _list_root_directories()
+            payload = _list_root_directories()
+            payload["files"] = []
+            return payload
 
         try:
             current = PATH_ACCESS.require_directory(path, access_label="浏览目录")
@@ -977,7 +1103,11 @@ def setup_routes(
             _raise_path_access_http_error(exc)
 
         try:
-            directories = _list_directory_entries(current)
+            entries = _list_directory_entries(
+                current,
+                include_files=include_files,
+                allowed_suffixes=suffix_filters,
+            )
         except PermissionError:
             raise HTTPException(status_code=403, detail=f"无权限访问目录: {current}")
         except OSError as exc:
@@ -990,8 +1120,80 @@ def setup_routes(
         return {
             "current": str(current),
             "parent": parent,
-            "directories": directories,
+            "directories": entries["directories"],
+            "files": entries["files"],
         }
+
+    @app.post("/filesystem/vector_preview")
+    def preview_vector_file(path: str = Form(..., description="本地矢量文件路径")) -> Dict:
+        """读取本地 GeoJSON / Shapefile，并返回 bbox + geojson 预览信息。"""
+        try:
+            vector_path = PATH_ACCESS.require_file(
+                path,
+                access_label="预览矢量文件",
+                allowed_suffixes=VECTOR_PREVIEW_EXTENSIONS,
+            )
+        except PathAccessError as exc:
+            _raise_path_access_http_error(exc)
+
+        try:
+            payload = _vector_dataset_payload(str(vector_path), label=vector_path.name)
+            payload["source_type"] = "filesystem"
+            payload["path"] = str(vector_path)
+            return payload
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        except Exception as exc:
+            logger.error("预览本地矢量文件失败: %s", exc, exc_info=True)
+            raise HTTPException(status_code=500, detail=f"预览矢量文件失败: {exc}")
+
+    @app.post("/filesystem/raster_footprint")
+    def preview_raster_footprint(
+        path: str = Form(..., description="本地栅格文件或场景目录路径"),
+        product_level: Optional[str] = Form(None, description="场景目录产品级别，可选 L1/L2"),
+    ) -> Dict:
+        """读取本地栅格或场景目录，返回覆盖范围 bbox + geojson。"""
+        try:
+            raster_path = _resolve_raster_preview_target(path, product_level=product_level)
+        except PathAccessError as exc:
+            _raise_path_access_http_error(exc)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+        try:
+            payload = _raster_dataset_payload(str(raster_path), label=raster_path.name)
+            payload["source_type"] = "filesystem"
+            payload["path"] = str(Path(path).resolve(strict=False))
+            payload["raster_path"] = str(raster_path)
+            return payload
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        except Exception as exc:
+            logger.error("预览本地栅格覆盖范围失败: %s", exc, exc_info=True)
+            raise HTTPException(status_code=500, detail=f"预览栅格覆盖范围失败: {exc}")
+
+    @app.post("/imagery/raster_footprint")
+    async def imagery_parse_raster_footprint(raster: UploadFile = File(..., description="本地上传的栅格文件")) -> Dict:
+        """读取浏览器上传的栅格文件，并返回覆盖范围 bbox + geojson。"""
+        suffix = Path(raster.filename or "").suffix.lower()
+        if suffix not in RASTER_PREVIEW_EXTENSIONS:
+            raise HTTPException(status_code=400, detail="请上传 .tif/.tiff/.img/.png 栅格文件")
+
+        file_manager = FileManager()
+        temp_dir = file_manager.create_temp_dir(prefix="imagery_footprint_")
+        try:
+            target_path = os.path.join(temp_dir, raster.filename or f"footprint{suffix or '.tif'}")
+            await _save_upload(raster, target_path)
+            payload = _raster_dataset_payload(target_path, label=raster.filename or Path(target_path).name)
+            payload["source_type"] = "upload"
+            return payload
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        except Exception as exc:
+            logger.error("解析上传栅格覆盖范围失败: %s", exc, exc_info=True)
+            raise HTTPException(status_code=500, detail=f"解析栅格覆盖范围失败: {exc}")
+        finally:
+            file_manager.cleanup_temp_dir(temp_dir)
 
     @app.get("/filesystem/scan_scenes")
     def scan_scenes(path: str) -> Dict:
@@ -1044,6 +1246,16 @@ def setup_routes(
                         for level in available_product_levels
                     }
                     scene_files = product_files.get(product_level, {})
+                    footprint_bbox = None
+                    footprint_raster_path = None
+                    try:
+                        representative_raster = _resolve_raster_preview_target(str(scene_path), product_level=product_level)
+                        footprint_payload = _raster_dataset_payload(str(representative_raster), label=entry.name)
+                        footprint_bbox = footprint_payload.get("bbox")
+                        footprint_raster_path = str(representative_raster)
+                    except Exception as exc:
+                        logger.warning("场景 %s 覆盖范围读取失败: %s", scene_path, exc)
+
                     scenes.append({
                         "id": str(scene_path),
                         "name": entry.name,
@@ -1056,6 +1268,8 @@ def setup_routes(
                         "product_level": product_level,
                         "available_product_levels": available_product_levels,
                         "product_files": product_files,
+                        "footprint_bbox": footprint_bbox,
+                        "footprint_raster_path": footprint_raster_path,
                     })
         except PermissionError:
             raise HTTPException(status_code=403, detail=f"无权限访问目录: {target}")
