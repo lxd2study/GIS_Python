@@ -326,3 +326,31 @@ class LandsatProxyRequest(BaseModel):
 class LandsatDownloadDirRequest(BaseModel):
     """Landsat 服务端下载目录配置请求。"""
     download_dir: str = Field("", description="服务端下载根目录。留空时恢复默认目录")
+
+
+class ResultArtifactItem(BaseModel):
+    """任务结果中的单个产物条目。"""
+    key: str = Field(..., description="产物唯一键")
+    label: str = Field(..., description="产物显示名称")
+    category: str = Field(..., description="产物分类：processed/composite/mask/metadata/extra")
+    path: str = Field(..., description="产物绝对路径")
+    filename: str = Field(..., description="产物文件名")
+    size_bytes: int = Field(0, ge=0, description="文件大小（字节）")
+    previewable: bool = Field(False, description="是否支持栅格预览")
+
+
+class ResultTaskItem(BaseModel):
+    """结果下载页统一任务卡片。"""
+    id: str = Field(..., description="任务唯一标识")
+    source: str = Field(..., description="结果来源：current/history")
+    task_type: str = Field(..., description="任务类型：single/batch/mosaic")
+    title: str = Field(..., description="任务标题")
+    job_id: Optional[str] = Field(None, description="任务 ID")
+    batch_id: Optional[str] = Field(None, description="批次 ID")
+    status: str = Field(..., description="任务状态")
+    output_dir: str = Field(..., description="输出目录")
+    created_at: Optional[str] = Field(None, description="任务创建时间")
+    completed_at: Optional[str] = Field(None, description="任务完成时间")
+    summary: Dict[str, Any] = Field(default_factory=dict, description="任务摘要")
+    artifact_count: int = Field(0, ge=0, description="产物数量")
+    artifacts: List[ResultArtifactItem] = Field(default_factory=list, description="产物列表")

@@ -27,6 +27,7 @@ from ..core.models import (
 )
 from ..core.processor import Landsat8Processor
 from ..operations import clip_raster, mosaic_rasters
+from ..services.task_results import write_task_manifest
 from ..utils.file_utils import collect_band_paths, detect_product_level_from_path, find_scene_support_files
 from ..utils.path_policy import PathAccessController
 
@@ -165,6 +166,10 @@ class BatchJobManager:
             with self.lock:
                 self._mark_job_success(job, result)
 
+            try:
+                self._write_job_manifest(job, result)
+            except Exception as exc:
+                logger.warning("写入批量任务结果清单失败，不影响任务成功状态: %s", exc, exc_info=True)
             logger.info("Job %s completed successfully", job.job_id)
 
         except Exception as e:
@@ -801,6 +806,44 @@ class BatchJobManager:
         """获取任务状态"""
         with self.lock:
             return self.jobs.get(job_id)
+
+    def list_jobs(self, status: Optional[TaskStatus] = None) -> List[BatchJob]:
+        """列出所有任务。"""
+        with self.lock:
+            jobs = list(self.jobs.values())
+        if status is None:
+            return jobs
+        expected = getattr(status, "value", status)
+        return [job for job in jobs if getattr(job.status, "value", job.status) == expected]
+
+    def get_batch_name(self, batch_id: str) -> str:
+        """根据批次 ID 获取批次名称。"""
+        with self.lock:
+            batch_info = self.batches.get(batch_id) or {}
+        return str(batch_info.get("batch_name") or "")
+
+    def _write_job_manifest(self, job: BatchJob, result: Dict) -> None:
+        """将成功任务的结果摘要写入输出目录。"""
+        batch_name = self.get_batch_name(job.batch_id)
+        task_type = "mosaic" if job.config.job_kind == JobKind.MOSAIC else "batch"
+        if task_type == "mosaic":
+            title = f"镶嵌任务 · {job.config.scene_name}" if job.config.scene_name else "镶嵌任务"
+        else:
+            title = job.config.scene_name or batch_name or Path(job.config.output_dir).name
+            if batch_name and job.config.scene_name and batch_name != job.config.scene_name:
+                title = f"{batch_name} / {job.config.scene_name}"
+
+        write_task_manifest(
+            task_type=task_type,
+            title=title,
+            output_dir=job.config.output_dir,
+            result=result,
+            job_id=job.job_id,
+            batch_id=job.batch_id,
+            created_at=job.created_at,
+            completed_at=job.completed_at or job.updated_at,
+            summary=result.get("summary") or {},
+        )
 
     def pause_job(self, job_id: str) -> bool:
         """暂停任务（仅对排队中的任务有效）"""

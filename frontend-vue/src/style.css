@@ -1127,6 +1127,7 @@ select:focus {
 /* Batch / Download / Indices View */
 .batch-view,
 .download-view,
+.results-view,
 .indices-view {
   animation: fadeIn 0.3s ease-in;
   flex: 1;

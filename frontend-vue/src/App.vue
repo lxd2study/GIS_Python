@@ -6,6 +6,7 @@ import { assessCoverage } from './utils/coverage'
 const BatchManager = defineAsyncComponent(() => import('./components/BatchManager.vue'))
 const IndicesInfo = defineAsyncComponent(() => import('./components/IndicesInfo.vue'))
 const LandsatDownload = defineAsyncComponent(() => import('./components/LandsatDownload.vue'))
+const TaskAssetCenter = defineAsyncComponent(() => import('./components/TaskAssetCenter.vue'))
 
 const ENV_API = (import.meta.env.VITE_API_BASE_URL || '').trim()
 const HISTORY_KEY = 'rst_output_history'
@@ -67,7 +68,14 @@ const state = reactive({
   apiBase: localStorage.getItem(API_KEY) || ENV_API || 'http://127.0.0.1:5001',
   currentTab: 'single',
   health: null,
+  inputSource: 'upload',
   composites: [],
+  serverResourceRoot: '',
+  serverRootLoading: false,
+  serverScenes: [],
+  serverScenesLoading: false,
+  serverSceneError: '',
+  selectedServerScenePath: '',
   bands: [],
   mtlFile: null,
   qaFile: null,
@@ -174,6 +182,37 @@ function joinPath(base, child) {
   return `${b}${separator}${c}`
 }
 
+function normalizeProductLevel(value, fallback = 'L1') {
+  const normalized = String(value || '').trim().toUpperCase()
+  if (normalized === 'L1' || normalized === 'L2') return normalized
+  return fallback
+}
+
+function normalizeBbox(value) {
+  if (!Array.isArray(value) || value.length !== 4) return null
+  const numbers = value.map((item) => Number(item))
+  return numbers.every((item) => Number.isFinite(item)) ? numbers : null
+}
+
+function shortPath(path, keepSegments = 2) {
+  if (!path) return ''
+  const parts = String(path).replace(/\\/g, '/').split('/').filter(Boolean)
+  return parts.length <= keepSegments ? String(path) : `.../${parts.slice(-keepSegments).join('/')}`
+}
+
+function getSceneAvailableLevels(scene) {
+  const base = Array.isArray(scene?.available_product_levels) && scene.available_product_levels.length
+    ? scene.available_product_levels
+    : [scene?.product_level]
+  return [...new Set(base.map((item) => normalizeProductLevel(item, '')).filter(Boolean))]
+}
+
+function sceneSupportsProductLevel(scene, level) {
+  const normalized = normalizeProductLevel(level)
+  const levels = getSceneAvailableLevels(scene)
+  return !levels.length || levels.includes(normalized)
+}
+
 function saveOutputPrefs() {
   localStorage.setItem(OUTPUT_MODE_KEY, state.outputMode)
   localStorage.setItem(OUTPUT_BASE_KEY, state.outputBaseDir.trim())
@@ -254,8 +293,19 @@ const bandAnalysis = computed(() => {
   }
 })
 
+const selectedServerScene = computed(() => {
+  return state.serverScenes.find((scene) => scene.path === state.selectedServerScenePath) || null
+})
+
+const serverSceneAvailableLevels = computed(() => getSceneAvailableLevels(selectedServerScene.value))
+
+const activeProductLevel = computed(() => normalizeProductLevel(state.productLevel))
+
 const outputSceneResolved = computed(() => {
-  return sanitizeSceneName(state.outputSceneName || bandAnalysis.value.sceneHint || 'scene')
+  const fallbackSceneName = state.inputSource === 'server'
+    ? selectedServerScene.value?.name
+    : bandAnalysis.value.sceneHint
+  return sanitizeSceneName(state.outputSceneName || fallbackSceneName || 'scene')
 })
 
 const outputDirResolved = computed(() => {
@@ -267,8 +317,31 @@ const selectedBandCount = computed(() => state.bands.length)
 const serviceOk = computed(() => state.health?.status === 'healthy')
 const statusLabel = computed(() => state.progress?.status || 'pending')
 const progressValue = computed(() => Number(state.progress?.progress || 0))
+const singleInputSummaryText = computed(() => {
+  if (state.inputSource === 'server') {
+    if (selectedServerScene.value) return '已选 1 景'
+    return `${state.serverScenes.length} 景可选`
+  }
+  return `${selectedBandCount.value} 文件`
+})
+const suggestedOutputSceneName = computed(() => {
+  if (state.inputSource === 'server') {
+    return sanitizeSceneName(selectedServerScene.value?.name || '')
+  }
+  return bandAnalysis.value.sceneHint
+})
+
+const pathPickerTitle = computed(() => {
+  if (state.pathPickerTarget === 'base') return '选择输出基路径'
+  if (state.pathPickerTarget === 'manual') return '选择输出目录'
+  if (state.pathPickerTarget === 'serverRoot') return '选择资源根目录'
+  return '选择目录'
+})
 
 const canSubmit = computed(() => {
+  if (state.inputSource === 'server') {
+    return !!selectedServerScene.value && outputDirResolved.value.length > 0 && !state.submitting
+  }
   return (
     selectedBandCount.value > 0 &&
     outputDirResolved.value.length > 0 &&
@@ -320,6 +393,39 @@ function saveApiBase() {
   localStorage.setItem(API_KEY, state.apiBase)
   setToast(`API 地址已保存：${state.apiBase}`, 'ok')
   loadMeta()
+  void loadServerDownloadRoot({ force: true, silent: true })
+}
+
+async function loadServerDownloadRoot({ force = false, silent = false } = {}) {
+  if (state.serverRootLoading) return
+
+  state.serverRootLoading = true
+  try {
+    const data = await request('/imagery/download_dir')
+    const nextRoot = normalizePath(data.download_dir || data.default_download_dir || '')
+    const currentRoot = normalizePath(state.serverResourceRoot)
+    if (nextRoot && (force || !normalizePath(state.serverResourceRoot))) {
+      state.serverResourceRoot = nextRoot
+      if (nextRoot !== currentRoot) {
+        state.serverScenes = []
+        state.selectedServerScenePath = ''
+        state.serverSceneError = ''
+        if (state.inputSource === 'server') resetSingleSceneCoverage()
+      }
+    }
+  } catch (error) {
+    if (!silent) setToast(`读取在线资源根目录失败：${error.message}`, 'error')
+  } finally {
+    state.serverRootLoading = false
+  }
+}
+
+function handleServerRootEdited() {
+  state.serverResourceRoot = normalizePath(state.serverResourceRoot)
+  state.serverScenes = []
+  state.selectedServerScenePath = ''
+  state.serverSceneError = ''
+  resetSingleSceneCoverage()
 }
 
 async function loadPathPicker(path = '') {
@@ -354,6 +460,8 @@ async function openPathPicker(target = 'manual') {
     start = normalizePath(state.outputBaseDir)
   } else if (target === 'manual') {
     start = normalizePath(state.outputDirManual || outputDirResolved.value)
+  } else if (target === 'serverRoot') {
+    start = normalizePath(state.serverResourceRoot)
   }
 
   const ok = await loadPathPicker(start)
@@ -371,20 +479,33 @@ async function enterPath(path) {
   await loadPathPicker(path)
 }
 
-function selectCurrentPath() {
+async function selectCurrentPath() {
   const selected = normalizePath(state.pathPickerCurrent)
   if (!selected) return
+  const target = state.pathPickerTarget
+  let message = ''
 
-  if (state.pathPickerTarget === 'base') {
+  if (target === 'base') {
     state.outputBaseDir = selected
     state.outputMode = 'auto'
+    message = `已选择输出基路径：${selected}`
+  } else if (target === 'serverRoot') {
+    state.serverResourceRoot = selected
   } else {
     state.outputDirManual = selected
     state.outputMode = 'manual'
+    message = `已选择输出路径：${selected}`
   }
-  saveOutputPrefs()
+
+  if (target === 'base' || target === 'manual') {
+    saveOutputPrefs()
+  }
   closePathPicker()
-  setToast(`已选择输出路径：${selected}`, 'ok')
+  if (target === 'serverRoot') {
+    await scanServerScenes()
+    return
+  }
+  setToast(message, 'ok')
 }
 
 function onPickFile(event, type) {
@@ -430,10 +551,18 @@ function resetSingleClipPreview() {
 }
 
 function resetSingleSceneCoverage() {
+  singleCoverageRequestId += 1
   state.sceneCoverageGeoJson = null
   state.sceneCoverageBbox = null
   state.sceneCoverageLabel = ''
   state.sceneCoverageLoading = false
+  state.sceneCoverageError = ''
+}
+
+function applySingleSceneCoveragePayload(payload, fallbackLabel = '') {
+  state.sceneCoverageGeoJson = payload?.geojson || null
+  state.sceneCoverageBbox = normalizeBbox(payload?.bbox)
+  state.sceneCoverageLabel = payload?.label || fallbackLabel
   state.sceneCoverageError = ''
 }
 
@@ -535,6 +664,122 @@ async function loadSingleSceneCoverage(files = state.bands) {
   }
 }
 
+async function loadServerSceneCoverage(scene = selectedServerScene.value, { silent = false } = {}) {
+  const currentRequestId = ++singleCoverageRequestId
+  if (!scene?.path) {
+    resetSingleSceneCoverage()
+    return
+  }
+
+  const availableLevels = getSceneAvailableLevels(scene)
+  const preferredLevel = normalizeProductLevel(scene?.product_level, availableLevels[0] || activeProductLevel.value)
+  const targetLevel = sceneSupportsProductLevel(scene, activeProductLevel.value) ? activeProductLevel.value : preferredLevel
+  if (state.productLevel !== targetLevel) state.productLevel = targetLevel
+
+  state.sceneCoverageLoading = true
+  state.sceneCoverageError = ''
+  try {
+    const defaultFootprint = normalizeBbox(scene?.footprint_bbox)
+    const defaultLevel = normalizeProductLevel(scene?.product_level, targetLevel)
+    const sceneLabel = scene?.name || shortPath(scene?.path, 2)
+
+    if (defaultFootprint && defaultLevel === targetLevel) {
+      if (currentRequestId !== singleCoverageRequestId) return
+      applySingleSceneCoveragePayload({ bbox: defaultFootprint, label: sceneLabel }, sceneLabel)
+      return
+    }
+
+    const body = new FormData()
+    body.append('path', scene.path)
+    body.append('product_level', targetLevel)
+    const data = await request('/filesystem/raster_footprint', { method: 'POST', body })
+    if (currentRequestId !== singleCoverageRequestId) return
+    applySingleSceneCoveragePayload(data, sceneLabel)
+  } catch (error) {
+    if (currentRequestId !== singleCoverageRequestId) return
+    state.sceneCoverageGeoJson = null
+    state.sceneCoverageBbox = null
+    state.sceneCoverageLabel = ''
+    state.sceneCoverageError = error.message
+    if (!silent) setToast(`读取在线资源覆盖范围失败：${error.message}`, 'warn')
+  } finally {
+    if (currentRequestId === singleCoverageRequestId) {
+      state.sceneCoverageLoading = false
+    }
+  }
+}
+
+async function scanServerScenes(silent = false) {
+  const root = normalizePath(state.serverResourceRoot)
+  if (!root) {
+    if (!silent) setToast('请先选择资源根目录', 'warn')
+    return
+  }
+
+  state.serverScenesLoading = true
+  state.serverSceneError = ''
+  const previousSelection = state.selectedServerScenePath
+  try {
+    const data = await request(`/filesystem/scan_scenes?path=${encodeURIComponent(root)}`)
+    state.serverScenes = Array.isArray(data.scenes) ? data.scenes : []
+
+    const matchedScene = previousSelection
+      ? state.serverScenes.find((scene) => scene.path === previousSelection) || null
+      : null
+    if (matchedScene) {
+      await loadServerSceneCoverage(matchedScene, { silent: true })
+    } else {
+      state.selectedServerScenePath = ''
+      resetSingleSceneCoverage()
+    }
+
+    if (!silent) setToast(`在线资源扫描完成：${state.serverScenes.length} 景`, 'ok')
+  } catch (error) {
+    state.serverScenes = []
+    state.selectedServerScenePath = ''
+    resetSingleSceneCoverage()
+    state.serverSceneError = error.message
+    if (!silent) setToast(`扫描在线资源失败：${error.message}`, 'error')
+  } finally {
+    state.serverScenesLoading = false
+  }
+}
+
+function selectServerScene(scene) {
+  if (!scene?.path) return
+
+  state.selectedServerScenePath = scene.path
+  const availableLevels = getSceneAvailableLevels(scene)
+  const preferredLevel = normalizeProductLevel(scene?.product_level, availableLevels[0] || activeProductLevel.value)
+  if (!sceneSupportsProductLevel(scene, activeProductLevel.value)) {
+    state.productLevel = preferredLevel
+  }
+  void loadServerSceneCoverage(scene)
+}
+
+async function switchInputSource(source) {
+  if (!['upload', 'server'].includes(source) || state.inputSource === source) return
+
+  state.inputSource = source
+  if (source === 'server') {
+    await loadServerDownloadRoot({ silent: true })
+    if (!state.serverScenes.length && normalizePath(state.serverResourceRoot)) {
+      await scanServerScenes(true)
+    } else if (selectedServerScene.value) {
+      await loadServerSceneCoverage(selectedServerScene.value, { silent: true })
+    } else {
+      resetSingleSceneCoverage()
+    }
+    return
+  }
+
+  if (state.bands.length) {
+    await loadSingleSceneCoverage(state.bands)
+  } else {
+    resetSingleSceneCoverage()
+  }
+}
+
 function toggleComposite(type) {
   if (state.selectedComposites.includes(type)) {
     state.selectedComposites = state.selectedComposites.filter((item) => item !== type)
@@ -549,8 +794,8 @@ function switchOutputMode(mode) {
 }
 
 function useSceneHint() {
-  if (bandAnalysis.value.sceneHint) {
-    state.outputSceneName = bandAnalysis.value.sceneHint
+  if (suggestedOutputSceneName.value) {
+    state.outputSceneName = suggestedOutputSceneName.value
     saveOutputPrefs()
   }
 }
@@ -577,6 +822,7 @@ async function submitTask() {
   state.previewMeta = null
 
   try {
+    const targetProductLevel = activeProductLevel.value
     if (state.sceneCoverageLoading && singleClipRoiBbox.value) {
       setToast('正在读取影像覆盖范围，请稍候再提交', 'warn')
       return
@@ -587,16 +833,24 @@ async function submitTask() {
     }
 
     const body = new FormData()
-    state.bands.forEach((file) => body.append('bands', file))
-    if (state.mtlFile) body.append('mtl_file', state.mtlFile)
-    if (state.qaFile) body.append('qa_band', state.qaFile)
-    if (state.qaRadsatFile) body.append('qa_radsat_band', state.qaRadsatFile)
+    if (state.inputSource === 'server') {
+      if (!selectedServerScene.value?.path) {
+        setToast('请先选择在线资源场景', 'warn')
+        return
+      }
+      body.append('scene_path', selectedServerScene.value.path)
+    } else {
+      state.bands.forEach((file) => body.append('bands', file))
+      if (state.mtlFile) body.append('mtl_file', state.mtlFile)
+      if (state.qaFile) body.append('qa_band', state.qaFile)
+      if (state.qaRadsatFile) body.append('qa_radsat_band', state.qaRadsatFile)
+    }
     state.shapeFiles.forEach((file) => body.append('clip_shapefile', file))
 
     body.append('output_dir', outputDirResolved.value)
     body.append('apply_cloud_mask', String(state.applyCloudMask))
     body.append('atm_correction_method', state.atmMethod)
-    body.append('product_level', state.productLevel)
+    body.append('product_level', targetProductLevel)
 
     if (state.clipExtent.trim()) body.append('clip_extent', state.clipExtent.trim())
     if (state.selectedComposites.length) body.append('create_composites', state.selectedComposites.join(','))
@@ -605,7 +859,10 @@ async function submitTask() {
       if (state.customName.trim()) body.append('custom_name', state.customName.trim())
     }
 
-    const data = await request('/preprocess_landsat8_async', { method: 'POST', body })
+    const endpoint = state.inputSource === 'server'
+      ? '/filesystem/preprocess_landsat8_async'
+      : '/preprocess_landsat8_async'
+    const data = await request(endpoint, { method: 'POST', body })
     state.jobId = data.job_id
     state.manualJobId = data.job_id
     state.progress = { status: 'processing', progress: 0, detail: '任务已创建', steps: [] }
@@ -657,6 +914,7 @@ function resetForm() {
   state.mtlFile = null
   state.qaFile = null
   state.qaRadsatFile = null
+  state.selectedServerScenePath = ''
   state.shapeFiles = []
   state.productLevel = 'L1'
   state.clipExtent = ''
@@ -680,6 +938,8 @@ const singleCoverageValidation = computed(() => {
 })
 
 const singleClipStatusText = computed(() => {
+  if (state.inputSource === 'server' && !selectedServerScene.value) return '请先扫描并选择一个在线场景，再进行 ROI 校验'
+  if (state.inputSource === 'upload' && !state.bands.length && !state.sceneCoverageBbox) return '请先上传波段文件，再进行 ROI 校验'
   if (state.sceneCoverageLoading) return '正在加载影像覆盖范围...'
   if (state.sceneCoverageError) return `影像覆盖范围读取失败：${state.sceneCoverageError}`
   if (state.sceneCoverageBbox && singleClipRoiBbox.value) {
@@ -699,6 +959,7 @@ const singleClipStatusText = computed(() => {
 })
 
 const singleCoverageStateLabel = computed(() => {
+  if (state.inputSource === 'server' && !selectedServerScene.value) return '未选景'
   if (state.sceneCoverageLoading) return '加载中'
   if (state.sceneCoverageError) return '读取失败'
   if (!state.sceneCoverageBbox) return '未加载'
@@ -834,6 +1095,7 @@ async function useQuickPath(path) {
 onMounted(() => {
   state.apiBase = normalizedApiBase()
   loadMeta()
+  void loadServerDownloadRoot({ silent: true })
 
   // Close history dropdown when clicking outside
   document.addEventListener('click', (e) => {
@@ -853,7 +1115,7 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <main class="page" :class="state.currentTab === 'indices' || state.currentTab === 'download' ? 'scrollable' : 'no-scroll'">
+  <main class="page" :class="state.currentTab === 'indices' || state.currentTab === 'download' || state.currentTab === 'results' ? 'scrollable' : 'no-scroll'">
     <header class="top">
       <div>
         <h1>遥感预处理控制台</h1>
@@ -899,6 +1161,13 @@ onBeforeUnmount(() => {
       </button>
       <button
         class="tab-btn"
+        :class="{ active: state.currentTab === 'results' }"
+        @click="switchTab('results')"
+      >
+        结果下载
+      </button>
+      <button
+        class="tab-btn"
         :class="{ active: state.currentTab === 'indices' }"
         @click="switchTab('indices')"
       >
@@ -911,59 +1180,147 @@ onBeforeUnmount(() => {
       <article class="card form-card-compact">
         <div class="title-row-compact">
           <h2>任务配置</h2>
-          <small>{{ selectedBandCount }} 文件</small>
+          <small>{{ singleInputSummaryText }}</small>
         </div>
 
         <div class="form-grid-compact">
-          <!-- 波段文件 -->
-          <label class="field-compact full">
-            <span>波段文件（必选）</span>
-            <input type="file" multiple accept=".tif,.tiff,.img" @change="(e) => onPickFile(e, 'bands')" />
-          </label>
-
-          <!-- 波段识别信息（可折叠） -->
-          <div class="band-info-compact full">
-            <div class="info-summary" @click="state.showBandDetails = !state.showBandDetails">
-              <strong>识别波段：</strong>{{ bandAnalysis.recognized.map((item) => item.band).join(', ') || '无' }}
-              <span class="toggle-icon" :class="{ open: state.showBandDetails }" aria-hidden="true">
-                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-                  <path d="M5 3.5 10 8l-5 4.5" />
-                </svg>
-              </span>
-            </div>
-            <div v-if="state.showBandDetails" class="info-details">
-              <p v-if="bandAnalysis.missingCore.length" class="warn-line">
-                缺少核心波段：{{ bandAnalysis.missingCore.join(', ') }}
-              </p>
-              <p v-if="bandAnalysis.duplicates.length" class="err-line">
-                重复波段：{{ bandAnalysis.duplicates.map((item) => `${item.band}(${item.files.length})`).join(', ') }}
-              </p>
+          <div class="field-compact full">
+            <span>数据来源</span>
+            <div class="mode-row-compact">
+              <button class="btn-tiny" :class="{ active: state.inputSource === 'upload' }" type="button" @click="switchInputSource('upload')">
+                本地上传
+              </button>
+              <button class="btn-tiny" :class="{ active: state.inputSource === 'server' }" type="button" @click="switchInputSource('server')">
+                在线资源
+              </button>
             </div>
           </div>
 
-          <label class="field-compact">
-            <span>产品级别</span>
-            <select v-model="state.productLevel">
-              <option value="L1">L1: DN/辐射定标链</option>
-              <option value="L2">L2: 地表反射率直用</option>
-            </select>
-          </label>
+          <template v-if="state.inputSource === 'upload'">
+            <label class="field-compact full">
+              <span>波段文件（必选）</span>
+              <input type="file" multiple accept=".tif,.tiff,.img" @change="(e) => onPickFile(e, 'bands')" />
+            </label>
 
-          <!-- 可选文件 -->
-          <label class="field-compact">
-            <span>MTL 文件</span>
-            <input type="file" accept=".txt,.mtl" @change="(e) => onPickFile(e, 'mtl')" />
-          </label>
+            <div class="band-info-compact full">
+              <div class="info-summary" @click="state.showBandDetails = !state.showBandDetails">
+                <strong>识别波段：</strong>{{ bandAnalysis.recognized.map((item) => item.band).join(', ') || '无' }}
+                <span class="toggle-icon" :class="{ open: state.showBandDetails }" aria-hidden="true">
+                  <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M5 3.5 10 8l-5 4.5" />
+                  </svg>
+                </span>
+              </div>
+              <div v-if="state.showBandDetails" class="info-details">
+                <p v-if="bandAnalysis.missingCore.length" class="warn-line">
+                  缺少核心波段：{{ bandAnalysis.missingCore.join(', ') }}
+                </p>
+                <p v-if="bandAnalysis.duplicates.length" class="err-line">
+                  重复波段：{{ bandAnalysis.duplicates.map((item) => `${item.band}(${item.files.length})`).join(', ') }}
+                </p>
+              </div>
+            </div>
 
-          <label class="field-compact">
-            <span>QA 文件</span>
-            <input type="file" accept=".tif,.tiff,.img" @change="(e) => onPickFile(e, 'qa')" />
-          </label>
+            <label class="field-compact">
+              <span>产品级别</span>
+              <select v-model="state.productLevel">
+                <option value="L1">L1: DN/辐射定标链</option>
+                <option value="L2">L2: 地表反射率直用</option>
+              </select>
+            </label>
 
-          <label class="field-compact">
-            <span>QA_RADSAT</span>
-            <input type="file" accept=".tif,.tiff,.img" @change="(e) => onPickFile(e, 'qa_radsat')" />
-          </label>
+            <label class="field-compact">
+              <span>MTL 文件</span>
+              <input type="file" accept=".txt,.mtl" @change="(e) => onPickFile(e, 'mtl')" />
+            </label>
+
+            <label class="field-compact">
+              <span>QA 文件</span>
+              <input type="file" accept=".tif,.tiff,.img" @change="(e) => onPickFile(e, 'qa')" />
+            </label>
+
+            <label class="field-compact">
+              <span>QA_RADSAT</span>
+              <input type="file" accept=".tif,.tiff,.img" @change="(e) => onPickFile(e, 'qa_radsat')" />
+            </label>
+          </template>
+
+          <template v-else>
+            <label class="field-compact full">
+              <span>资源根目录</span>
+              <div class="input-row">
+                <input
+                  v-model="state.serverResourceRoot"
+                  type="text"
+                  placeholder="服务端白名单目录"
+                  @change="handleServerRootEdited"
+                />
+                <button class="btn-mini" type="button" @click="openPathPicker('serverRoot')">...</button>
+                <button
+                  class="btn-mini pri"
+                  type="button"
+                  :disabled="state.serverScenesLoading || state.serverRootLoading"
+                  @click="scanServerScenes()"
+                >
+                  {{ state.serverScenesLoading ? '扫描中...' : '扫描' }}
+                </button>
+              </div>
+            </label>
+
+            <div class="field-compact full">
+              <span>在线场景（单选）</span>
+              <p class="meta-compact server-root-meta" :class="{ placeholder: !state.serverResourceRoot }">
+                {{ state.serverRootLoading ? '正在读取下载目录...' : (state.serverResourceRoot || '未选择资源根目录') }}
+              </p>
+              <p v-if="state.serverSceneError" class="err-line">{{ state.serverSceneError }}</p>
+              <p v-else-if="state.serverScenesLoading" class="meta-line">扫描场景中...</p>
+              <div v-else-if="state.serverScenes.length" class="server-scene-list">
+                <button
+                  v-for="scene in state.serverScenes"
+                  :key="scene.path"
+                  class="server-scene-card"
+                  :class="{ active: state.selectedServerScenePath === scene.path }"
+                  type="button"
+                  @click="selectServerScene(scene)"
+                >
+                  <div class="server-scene-head">
+                    <strong>{{ scene.name }}</strong>
+                    <span class="server-scene-status">{{ state.selectedServerScenePath === scene.path ? '已选' : '选择' }}</span>
+                  </div>
+                  <p class="server-scene-path" :title="scene.path">{{ scene.path }}</p>
+                  <div class="server-scene-meta">
+                    <span class="scene-pill level">{{ getSceneAvailableLevels(scene).join('/') || normalizeProductLevel(scene.product_level) }}</span>
+                    <span class="scene-pill" :class="scene.mtl_file ? 'ok' : 'muted'">{{ scene.mtl_file ? 'MTL' : '无 MTL' }}</span>
+                    <span class="scene-pill" :class="scene.qa_band ? 'ok' : 'muted'">{{ scene.qa_band ? 'QA' : '无 QA' }}</span>
+                    <span class="scene-pill" :class="scene.footprint_bbox ? 'ok' : 'muted'">{{ scene.footprint_bbox ? 'Footprint' : '无范围' }}</span>
+                  </div>
+                </button>
+              </div>
+              <p v-else class="meta-line">当前目录未识别到可处理场景</p>
+            </div>
+
+            <label v-if="selectedServerScene" class="field-compact">
+              <span>处理级别</span>
+              <select
+                v-model="state.productLevel"
+                :disabled="serverSceneAvailableLevels.length <= 1"
+                @change="loadServerSceneCoverage(selectedServerScene)"
+              >
+                <option
+                  v-for="level in (serverSceneAvailableLevels.length ? serverSceneAvailableLevels : [activeProductLevel])"
+                  :key="level"
+                  :value="level"
+                >
+                  {{ level }}: {{ level === 'L2' ? '地表反射率直用' : 'DN/辐射定标链' }}
+                </option>
+              </select>
+            </label>
+
+            <label v-if="selectedServerScene" class="field-compact">
+              <span>当前场景</span>
+              <input :value="selectedServerScene.name || shortPath(selectedServerScene.path, 2)" type="text" readonly />
+            </label>
+          </template>
 
           <!-- 输出路径 -->
           <div class="field-compact full">
@@ -990,7 +1347,7 @@ onBeforeUnmount(() => {
               <span>场景名</span>
               <div class="input-row">
                 <input v-model="state.outputSceneName" type="text" @change="saveOutputPrefs" placeholder="LC08_..." />
-                <button class="btn-mini" @click="useSceneHint" :disabled="!bandAnalysis.sceneHint">识别</button>
+                <button class="btn-mini" @click="useSceneHint" :disabled="!suggestedOutputSceneName">识别</button>
               </div>
             </label>
           </template>
@@ -1092,7 +1449,7 @@ onBeforeUnmount(() => {
 
             <label class="field-compact">
               <span>大气校正</span>
-              <select v-model="state.atmMethod" :disabled="state.productLevel === 'L2'">
+              <select v-model="state.atmMethod" :disabled="activeProductLevel === 'L2'">
                 <option value="DOS">DOS</option>
                 <option value="6S">6S</option>
               </select>
@@ -1201,6 +1558,10 @@ onBeforeUnmount(() => {
       <LandsatDownload :api-base="normalizedApiBase()" @toast="handleBatchToast" />
     </section>
 
+    <section v-if="state.currentTab === 'results'" class="results-view">
+      <TaskAssetCenter :api-base="normalizedApiBase()" @toast="handleBatchToast" />
+    </section>
+
     <!-- Indices Encyclopedia View -->
     <section v-if="state.currentTab === 'indices'" class="indices-view">
       <IndicesInfo />
@@ -1211,7 +1572,7 @@ onBeforeUnmount(() => {
     <div v-if="state.pathPickerOpen" class="picker-mask" @click.self="closePathPicker">
       <div class="picker-dialog card">
         <div class="picker-head">
-          <h3>选择输出路径</h3>
+          <h3>{{ pathPickerTitle }}</h3>
           <button class="btn sub" type="button" @click="closePathPicker">关闭</button>
         </div>
 
@@ -1344,6 +1705,108 @@ onBeforeUnmount(() => {
 .btn-mini.ghost {
   background: #fff;
   color: #33564b;
+}
+
+.server-root-meta {
+  margin: 0;
+}
+
+.server-root-meta.placeholder {
+  color: var(--muted);
+}
+
+.server-scene-list {
+  display: grid;
+  gap: 8px;
+  max-height: 220px;
+  overflow-y: auto;
+}
+
+.server-scene-card {
+  width: 100%;
+  border: 1px solid #d5dfdc;
+  border-radius: 10px;
+  background: #fff;
+  padding: 10px 12px;
+  text-align: left;
+  cursor: pointer;
+  display: grid;
+  gap: 6px;
+  transition: border-color 0.18s ease, background 0.18s ease;
+}
+
+.server-scene-card:hover {
+  border-color: #9ac6ba;
+  background: #f8fbfa;
+}
+
+.server-scene-card.active {
+  border-color: var(--pri);
+  background: #eef8f5;
+}
+
+.server-scene-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 8px;
+}
+
+.server-scene-head strong {
+  font-size: 12px;
+  color: #1f312c;
+}
+
+.server-scene-status {
+  font-size: 11px;
+  color: var(--pri);
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.server-scene-path {
+  margin: 0;
+  font-size: 11px;
+  color: #5d716a;
+  font-family: var(--mono);
+  word-break: break-all;
+}
+
+.server-scene-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.scene-pill {
+  display: inline-flex;
+  align-items: center;
+  min-height: 22px;
+  padding: 0 8px;
+  border-radius: 999px;
+  border: 1px solid #d9e3e0;
+  background: #f5f9f7;
+  color: #5a6d67;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.scene-pill.level {
+  background: #edf4f9;
+  border-color: #d9e5ef;
+  color: #395a70;
+}
+
+.scene-pill.ok {
+  background: #e7f4f1;
+  border-color: #cce4dc;
+  color: #1d745b;
+}
+
+.scene-pill.muted {
+  background: #f7faf9;
+  border-color: #dde7e4;
+  color: #7d8c87;
 }
 
 @media (max-width: 900px) {

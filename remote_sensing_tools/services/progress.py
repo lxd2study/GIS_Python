@@ -133,6 +133,14 @@ class ProgressManager:
         with self.lock:
             return self.progress_tasks.get(job_id)
 
+    def list_progress_records(self, status: Optional[str] = None) -> list[ProgressRecord]:
+        """列出当前所有进度记录。"""
+        with self.lock:
+            records = list(self.progress_tasks.values())
+        if status is None:
+            return records
+        return [record for record in records if record.status == status]
+
     def remove_progress(self, job_id: str):
         """移除进度记录"""
         with self.lock:

@@ -31,6 +31,7 @@ from ..services.file_manager import FileManager
 from ..services.progress import ProgressManager
 from ..services.batch_manager import BatchJobManager
 from ..services.landsat_download import LandsatDownloadService
+from ..services.task_results import TaskResultService, write_task_manifest
 from ..services.templates import ProcessingTemplates
 from ..services.graph_executor import GraphExecutor
 from ..utils.file_utils import collect_band_paths, find_scene_support_files, infer_available_product_levels
@@ -286,6 +287,26 @@ def _complete_async_preprocess(
         detail="处理完成",
         result=result,
     )
+    task = progress_manager.get_progress(job_id)
+    if task:
+        title = (
+            str((result.get("metadata") or {}).get("scene_id") or "").strip()
+            or Path(output_dir).name
+        )
+        try:
+            write_task_manifest(
+                task_type="single",
+                title=title,
+                output_dir=output_dir,
+                result=result,
+                job_id=job_id,
+                batch_id=None,
+                created_at=task.created_at,
+                completed_at=task.updated_at,
+                summary=result.get("summary") or {},
+            )
+        except Exception as exc:
+            logger.warning("写入单任务结果清单失败，不影响任务成功状态: %s", exc, exc_info=True)
 
 
 def _run_async_preprocess_job(
@@ -698,6 +719,11 @@ def setup_routes(
         batch_manager = BatchJobManager(max_workers=settings.MAX_WORKERS)
     if landsat_download_service is None:
         landsat_download_service = LandsatDownloadService()
+    task_result_service = TaskResultService(
+        progress_manager=progress_manager,
+        batch_manager=batch_manager,
+        path_access=PATH_ACCESS,
+    )
 
     @app.get("/")
     def root_info() -> Dict:
@@ -750,6 +776,11 @@ def setup_routes(
                 "/landsat/proxy_download",
                 "/landsat/download",
                 "/landsat/download_tasks",
+            ],
+            "result_endpoints": [
+                "/results/tasks",
+                "/results/download/file",
+                "/results/download/archive",
             ],
         }
 
@@ -1305,6 +1336,160 @@ def setup_routes(
         if not task:
             raise HTTPException(status_code=404, detail="任务不存在或已超时")
         return task
+
+    @app.get("/results/tasks")
+    def list_result_tasks() -> Dict:
+        tasks = task_result_service.list_result_tasks()
+        return {"tasks": [task.model_dump() for task in tasks], "count": len(tasks)}
+
+    @app.get("/results/download/file")
+    def download_result_file(file_path: str):
+        try:
+            return task_result_service.build_file_response(file_path)
+        except PathAccessError as exc:
+            _raise_path_access_http_error(exc)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=f"文件不存在: {exc}")
+
+    @app.get("/results/download/archive")
+    def download_result_archive(output_dir: str):
+        try:
+            return task_result_service.build_archive_response(output_dir)
+        except PathAccessError as exc:
+            _raise_path_access_http_error(exc)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=f"文件不存在: {exc}")
+
+    @app.post("/filesystem/preprocess_landsat8_async")
+    async def preprocess_landsat8_from_filesystem_async(
+        scene_path: str = Form(..., description="服务端场景目录路径"),
+        output_dir: str = Form(..., description="输出目录路径"),
+        clip_extent: Optional[str] = Form(None, description="裁剪范围：xmin,ymin,xmax,ymax"),
+        clip_shapefile: Optional[List[UploadFile]] = File(None, description="裁剪矢量文件"),
+        create_composites: Optional[str] = Form(None, description="合成类型，如 true_color,false_color"),
+        custom_formula: Optional[str] = Form(None, description="自定义指数公式"),
+        custom_name: Optional[str] = Form(None, description="自定义指数名称"),
+        apply_cloud_mask: bool = Form(False, description="是否应用云掩膜"),
+        atm_correction_method: str = Form("DOS", description="大气校正方法: DOS 或 6S"),
+        product_level: str = Form("L1", description="输入产品级别: L1 或 L2"),
+    ) -> Dict:
+        normalized_level = str(product_level or "L1").strip().upper()
+        if normalized_level not in {"L1", "L2"}:
+            raise HTTPException(status_code=400, detail="product_level 仅支持 L1 或 L2")
+
+        try:
+            scene_dir = PATH_ACCESS.require_directory(
+                scene_path,
+                access_label="读取在线资源场景目录",
+            )
+        except PathAccessError as exc:
+            _raise_path_access_http_error(exc)
+
+        try:
+            output_dir = str(
+                PATH_ACCESS.require_directory(
+                    output_dir,
+                    access_label="写入输出目录",
+                    must_exist=False,
+                    allow_create=True,
+                )
+            )
+        except PathAccessError as exc:
+            _raise_path_access_http_error(exc)
+
+        job_id = str(uuid.uuid4())
+        progress_manager.init_progress(job_id)
+
+        temp_dir: Optional[str] = None
+        try:
+            band_paths = collect_band_paths(scene_dir, product_level=normalized_level)
+            band_paths = {
+                band_name: str(
+                    PATH_ACCESS.require_file(
+                        band_path,
+                        access_label="读取在线资源波段文件",
+                    )
+                )
+                for band_name, band_path in band_paths.items()
+            }
+
+            support_files = find_scene_support_files(scene_dir, product_level=normalized_level)
+            mtl_path = _optional_allowed_file(
+                support_files.get("mtl_file"),
+                access_label="读取在线资源 MTL 文件",
+            )
+            qa_path = _optional_allowed_file(
+                support_files.get("qa_band"),
+                access_label="读取在线资源 QA 文件",
+            )
+            qa_radsat_path = _optional_allowed_file(
+                support_files.get("qa_radsat_band"),
+                access_label="读取在线资源 QA_RADSAT 文件",
+            )
+
+            shapefile_path = None
+            if clip_shapefile:
+                temp_dir = file_manager.create_temp_dir(prefix=f"landsat8_scene_{job_id}_")
+                shape_dir = os.path.join(temp_dir, "shapefile")
+                os.makedirs(shape_dir, exist_ok=True)
+                shapefile_path = file_manager.save_shapefiles(clip_shapefile, shape_dir)
+
+            extent_list = file_manager.parse_extent(clip_extent)
+            composite_list = file_manager.parse_composites(create_composites)
+            Path(output_dir).mkdir(parents=True, exist_ok=True)
+
+            progress_manager.update_progress(
+                job_id,
+                status="processing",
+                step_id="upload",
+                step_status="completed",
+                progress=10,
+                detail=f"已加载在线场景: {scene_dir.name}",
+            )
+        except ValueError as exc:
+            if temp_dir:
+                file_manager.cleanup_temp_dir(temp_dir)
+            progress_manager.remove_progress(job_id)
+            raise HTTPException(status_code=400, detail=str(exc))
+        except HTTPException:
+            if temp_dir:
+                file_manager.cleanup_temp_dir(temp_dir)
+            progress_manager.remove_progress(job_id)
+            raise
+        except PathAccessError as exc:
+            if temp_dir:
+                file_manager.cleanup_temp_dir(temp_dir)
+            progress_manager.remove_progress(job_id)
+            _raise_path_access_http_error(exc)
+        except Exception as exc:
+            if temp_dir:
+                file_manager.cleanup_temp_dir(temp_dir)
+            progress_manager.remove_progress(job_id)
+            logger.error("在线资源预处理任务初始化失败: %s", exc, exc_info=True)
+            raise HTTPException(status_code=500, detail=f"任务初始化失败: {exc}")
+
+        _launch_async_preprocess(
+            progress_manager=progress_manager,
+            file_manager=file_manager,
+            job_id=job_id,
+            band_paths=band_paths,
+            output_dir=output_dir,
+            mtl_path=mtl_path,
+            qa_path=qa_path,
+            qa_radsat_path=qa_radsat_path,
+            extent_list=extent_list,
+            shapefile_path=shapefile_path,
+            composite_list=composite_list,
+            apply_cloud_mask=apply_cloud_mask,
+            atm_correction_method=atm_correction_method,
+            product_level=normalized_level,
+            custom_formula=custom_formula,
+            custom_name=custom_name,
+            cleanup_temp_dir=temp_dir,
+        )
+        return {"job_id": job_id, "status": "processing"}
 
     @app.post("/preprocess_landsat8_async")
     async def preprocess_landsat8_async(
