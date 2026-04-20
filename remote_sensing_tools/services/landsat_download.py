@@ -53,6 +53,7 @@ class LandsatDownloadService:
 
     SENSOR_TITLES = {
         "landsat": "Landsat",
+        "landsat-7": "Landsat 7",
         "sentinel-2": "Sentinel-2",
     }
 
@@ -67,7 +68,7 @@ class LandsatDownloadService:
                     "title": "Collection 2 Level-2",
                     "description": "已完成大气校正与表面反射率处理，适合直接分析。",
                     "auth_required": False,
-                    "platform_tokens": ("landsat-8",),
+                    "platform_tokens": ("landsat-8", "landsat-9"),
                 },
                 "L1": {
                     "url": "https://landsatlook.usgs.gov/stac-server",
@@ -76,7 +77,30 @@ class LandsatDownloadService:
                     "title": "Collection 2 Level-1",
                     "description": "原始级产品，适合保留完整原始数据链路。",
                     "auth_required": True,
-                    "platform_tokens": ("landsat-8",),
+                    "platform_tokens": ("landsat-8", "landsat-9"),
+                },
+            },
+        },
+        "landsat-7": {
+            "title": "Landsat 7",
+            "products": {
+                "L2": {
+                    "url": "https://planetarycomputer.microsoft.com/api/stac/v1",
+                    "collection": "landsat-c2-l2",
+                    "sign": True,
+                    "title": "Collection 2 Level-2",
+                    "description": "Landsat 7 Collection 2 Level-2，适合直接做表面反射率分析。",
+                    "auth_required": False,
+                    "platform_tokens": ("landsat-7",),
+                },
+                "L1": {
+                    "url": "https://landsatlook.usgs.gov/stac-server",
+                    "collection": "landsat-c2l1",
+                    "sign": False,
+                    "title": "Collection 2 Level-1",
+                    "description": "Landsat 7 原始级产品，保留 ETM+ 原始波段资产。",
+                    "auth_required": True,
+                    "platform_tokens": ("landsat-7",),
                 },
             },
         },
@@ -119,6 +143,35 @@ class LandsatDownloadService:
         "B9": "B9 - 卷云",
         "B10": "B10 - 热红外 TIRS1",
         "B11": "B11 - 热红外 TIRS2",
+        "QA_PIXEL": "QA_PIXEL - 质量评估",
+        "QA_RADSAT": "QA_RADSAT - 饱和质量评估",
+        "MTL.txt": "MTL.txt - 元数据文件",
+        "mtl.txt": "MTL.txt - 元数据文件",
+    }
+
+    LANDSAT7_ASSET_DISPLAY = {
+        "blue": "B1 - 蓝",
+        "green": "B2 - 绿",
+        "red": "B3 - 红",
+        "nir08": "B4 - 近红外",
+        "swir16": "B5 - SWIR1",
+        "swir22": "B7 - SWIR2",
+        "thermal": "B6 - 热红外",
+        "lwir": "B6 - 热红外",
+        "lwir11": "B6_VCID_1 - 热红外低增益",
+        "lwir12": "B6_VCID_2 - 热红外高增益",
+        "qa_pixel": "QA_PIXEL - 质量评估",
+        "qa_radsat": "QA_RADSAT - 饱和质量评估",
+        "B1": "B1 - 蓝",
+        "B2": "B2 - 绿",
+        "B3": "B3 - 红",
+        "B4": "B4 - 近红外",
+        "B5": "B5 - SWIR1",
+        "B6": "B6 - 热红外",
+        "B6_VCID_1": "B6_VCID_1 - 热红外低增益",
+        "B6_VCID_2": "B6_VCID_2 - 热红外高增益",
+        "B7": "B7 - SWIR2",
+        "B8": "B8 - 全色",
         "QA_PIXEL": "QA_PIXEL - 质量评估",
         "QA_RADSAT": "QA_RADSAT - 饱和质量评估",
         "MTL.txt": "MTL.txt - 元数据文件",
@@ -319,10 +372,12 @@ class LandsatDownloadService:
             normalized = str(candidate or "").strip().lower()
             if not normalized:
                 continue
+            if normalized == "landsat-7" or re.search(r"(^|[^a-z0-9])le07([^a-z0-9]|$)", normalized):
+                return "landsat-7"
             if "sentinel" in normalized or re.search(r"(^|[^a-z0-9])s2[a-c]?([^a-z0-9]|$)", normalized):
                 return "sentinel-2"
             if "landsat" in normalized or re.search(
-                r"(^|[^a-z0-9])(lc08|lc09|lo08|lo09|le07|lt05)([^a-z0-9]|$)",
+                r"(^|[^a-z0-9])(lc08|lc09|lo08|lo09|lt05)([^a-z0-9]|$)",
                 normalized,
             ):
                 return "landsat"
@@ -445,16 +500,218 @@ class LandsatDownloadService:
         )
         return self.get_proxy_status()
 
-    async def search(self, request: ImagerySearchRequest) -> Dict:
-        self._apply_proxy_env()
-        config = self._get_product_config(sensor=request.sensor, product=request.product)
-        catalog_kwargs = {"modifier": planetary_computer.sign_inplace} if config["sign"] else {}
-        catalog = pystac_client.Client.open(config["url"], **catalog_kwargs)
+    @staticmethod
+    def _normalize_search_mode(search_mode: Optional[str]) -> str:
+        return "scene_name" if str(search_mode or "").strip().lower() == "scene_name" else "spatial"
+
+    @staticmethod
+    def _normalize_scene_name_query(scene_name_query: Optional[str]) -> str:
+        return str(scene_name_query or "").strip().upper()
+
+    @classmethod
+    def _infer_sensor_from_scene_name(cls, scene_name_query: Optional[str]) -> Optional[str]:
+        normalized = cls._normalize_scene_name_query(scene_name_query).lower()
+        if not normalized:
+            return None
+        if "sentinel" in normalized or re.search(r"(^|[^a-z0-9])s2[a-c]?([^a-z0-9]|$)", normalized):
+            return "sentinel-2"
+        if normalized == "landsat-7" or re.search(r"(^|[^a-z0-9])le07([^a-z0-9]|$)", normalized):
+            return "landsat-7"
+        if "landsat" in normalized or re.search(r"(^|[^a-z0-9])(lc08|lc09|lo08|lo09|lt05)([^a-z0-9]|$)", normalized):
+            return "landsat"
+        return None
+
+    @classmethod
+    def _infer_product_from_scene_name(cls, sensor: str, scene_name_query: Optional[str]) -> Optional[str]:
+        normalized = cls._normalize_scene_name_query(scene_name_query)
+        if not normalized:
+            return None
+        if sensor == "sentinel-2":
+            if "L2A" in normalized or "SENTINEL-2-L2A" in normalized:
+                return "L2A"
+            return None
+        if "L2SP" in normalized or "_L2" in normalized or "LANDSAT-C2-L2" in normalized:
+            return "L2"
+        if any(token in normalized for token in ("L1TP", "L1GT", "L1GS", "_L1", "LANDSAT-C2L1")):
+            return "L1"
+        return None
+
+    @classmethod
+    def _validate_search_request(cls, request: ImagerySearchRequest) -> None:
+        search_mode = cls._normalize_search_mode(request.search_mode)
+        if search_mode == "scene_name":
+            if not cls._normalize_scene_name_query(request.scene_name_query):
+                raise ValueError("按影像名检索时请填写官方 scene ID / entity ID")
+            return
+
+        if not request.bbox or len(request.bbox) != 4:
+            raise ValueError("按范围检索时请先提供 AOI 范围")
+        if not request.start_date or not request.end_date:
+            raise ValueError("按范围检索时请填写完整日期范围")
+        if request.start_date > request.end_date:
+            raise ValueError("开始日期不能晚于结束日期")
+
+    @staticmethod
+    def _scene_name_search_max_items(limit: int) -> int:
+        return min(max(limit * 25, 200), 800)
+
+    @staticmethod
+    def _spatial_search_max_items(limit: int) -> int:
+        return min(max(limit * 20, 100), 1000)
+
+    @staticmethod
+    def _safe_int(value: Any) -> Optional[int]:
+        try:
+            if value is None or value == "":
+                return None
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    @classmethod
+    def _scene_identifier_candidates(cls, item) -> tuple[str, ...]:
+        props = item.properties or {}
+        values = [
+            item.id,
+            props.get("landsat:scene_id"),
+            props.get("landsat:landsat_scene_id"),
+            props.get("landsat:product_id"),
+            props.get("landsat:landsat_product_id"),
+            props.get("usgs:scene_id"),
+            props.get("usgs:product_id"),
+            props.get("scene_id"),
+            props.get("product_id"),
+            props.get("entity_id"),
+            props.get("sat:scene_id"),
+            props.get("s2:product_uri"),
+            props.get("s2:granule_id"),
+        ]
+        normalized: list[str] = []
+        for value in values:
+            candidate = str(value or "").strip().upper()
+            if candidate and candidate not in normalized:
+                normalized.append(candidate)
+        return tuple(normalized)
+
+    @classmethod
+    def _canonical_scene_name_forms(cls, scene_name: Optional[str]) -> tuple[str, ...]:
+        normalized = cls._normalize_scene_name_query(scene_name)
+        if not normalized:
+            return tuple()
+
+        variants = [normalized]
+        landsat_product_match = re.match(
+            r"^(L[A-Z0-9]{3}_[A-Z0-9]+_\d{6}_\d{8})_\d{8}_(\d{2}_T\d)$",
+            normalized,
+        )
+        if landsat_product_match:
+            variants.append(f"{landsat_product_match.group(1)}_{landsat_product_match.group(2)}")
+
+        deduped: list[str] = []
+        for variant in variants:
+            if variant and variant not in deduped:
+                deduped.append(variant)
+        return tuple(deduped)
+
+    @classmethod
+    def _matches_scene_name_query(cls, item, scene_name_query: str) -> bool:
+        queries = cls._canonical_scene_name_forms(scene_name_query)
+        if not queries:
+            return True
+        candidates = cls._scene_identifier_candidates(item)
+        return any(
+            candidate == query or candidate.startswith(query)
+            for query in queries
+            for candidate in candidates
+        )
+
+    @staticmethod
+    def _date_window_from_text(date_text: str) -> Optional[str]:
+        try:
+            date_value = datetime.strptime(date_text, "%Y%m%d").date()
+        except ValueError:
+            return None
+        iso_date = date_value.isoformat()
+        return f"{iso_date}/{iso_date}"
+
+    @staticmethod
+    def _julian_date_window(year_text: str, day_text: str) -> Optional[str]:
+        try:
+            date_value = datetime.strptime(f"{year_text}{day_text}", "%Y%j").date()
+        except ValueError:
+            return None
+        iso_date = date_value.isoformat()
+        return f"{iso_date}/{iso_date}"
+
+    @classmethod
+    def _scene_search_hints(cls, sensor: str, scene_name_query: str) -> Dict[str, Optional[int] | Optional[str]]:
+        query = cls._normalize_scene_name_query(scene_name_query)
+        hints: Dict[str, Optional[int] | Optional[str]] = {
+            "datetime": None,
+            "wrs_path": None,
+            "wrs_row": None,
+        }
+
+        if sensor in {"landsat", "landsat-7"}:
+            product_match = re.match(r"^[A-Z0-9]{4}_[A-Z0-9]+_(\d{3})(\d{3})_(\d{8})_", query)
+            if product_match:
+                path_text, row_text, date_text = product_match.groups()
+                hints["datetime"] = cls._date_window_from_text(date_text)
+                hints["wrs_path"] = cls._safe_int(path_text)
+                hints["wrs_row"] = cls._safe_int(row_text)
+                return hints
+
+            legacy_match = re.match(r"^[A-Z]{2}\d(\d{3})(\d{3})(\d{4})(\d{3})", query)
+            if legacy_match:
+                path_text, row_text, year_text, day_text = legacy_match.groups()
+                hints["datetime"] = cls._julian_date_window(year_text, day_text)
+                hints["wrs_path"] = cls._safe_int(path_text)
+                hints["wrs_row"] = cls._safe_int(row_text)
+                return hints
+
+        if sensor == "sentinel-2":
+            match = re.search(r"_(\d{8})T\d{6}", query)
+            if match:
+                hints["datetime"] = cls._date_window_from_text(match.group(1))
+
+        return hints
+
+    @classmethod
+    def _matches_scene_search_hints(cls, item, hints: Dict[str, Optional[int] | Optional[str]]) -> bool:
+        wrs_path = hints.get("wrs_path")
+        wrs_row = hints.get("wrs_row")
+        if wrs_path is not None and cls._safe_int(item.properties.get("landsat:wrs_path")) != wrs_path:
+            return False
+        if wrs_row is not None and cls._safe_int(item.properties.get("landsat:wrs_row")) != wrs_row:
+            return False
+        return True
+
+    @classmethod
+    def _build_scene_payload(cls, item, config: Dict, assets: Dict) -> Dict:
+        cloud_cover = cls._item_cloud_cover(item)
+        return {
+            "id": item.id,
+            "sensor": config["sensor"],
+            "sensor_title": config["sensor_title"],
+            "product": config["product"],
+            "collection": config["collection"],
+            "title": config["title"],
+            "auth_required": config["auth_required"],
+            "datetime": item.datetime.isoformat() if item.datetime else None,
+            "cloud_cover": round(cloud_cover, 1) if cloud_cover is not None else None,
+            "bbox": item.bbox,
+            "thumbnail": cls._pick_thumbnail(item),
+            "assets": assets,
+            "path": item.properties.get("landsat:wrs_path"),
+            "row": item.properties.get("landsat:wrs_row"),
+        }
+
+    def _search_spatial(self, catalog, config: Dict, request: ImagerySearchRequest) -> Dict:
         raw_search = catalog.search(
             collections=[config["collection"]],
             bbox=request.bbox,
             datetime=f"{request.start_date}/{request.end_date}",
-            max_items=request.limit * 5,
+            max_items=self._spatial_search_max_items(request.limit),
         )
 
         items = []
@@ -470,28 +727,83 @@ class LandsatDownloadService:
             if not assets:
                 continue
 
-            items.append(
-                {
-                    "id": item.id,
-                    "sensor": config["sensor"],
-                    "sensor_title": config["sensor_title"],
-                    "product": config["product"],
-                    "collection": config["collection"],
-                    "title": config["title"],
-                    "auth_required": config["auth_required"],
-                    "datetime": item.datetime.isoformat() if item.datetime else None,
-                    "cloud_cover": round(cloud_cover, 1) if cloud_cover is not None else None,
-                    "bbox": item.bbox,
-                    "thumbnail": self._pick_thumbnail(item),
-                    "assets": assets,
-                    "path": item.properties.get("landsat:wrs_path"),
-                    "row": item.properties.get("landsat:wrs_row"),
-                }
-            )
+            items.append(self._build_scene_payload(item, config, assets))
             if len(items) >= request.limit:
                 break
 
         return {"items": items, "count": len(items)}
+
+    def _search_scene_name(self, catalog, config: Dict, request: ImagerySearchRequest) -> Dict:
+        scene_name_query = self._normalize_scene_name_query(request.scene_name_query)
+
+        exact_search = catalog.search(
+            collections=[config["collection"]],
+            ids=[scene_name_query],
+            max_items=request.limit,
+        )
+        exact_items = []
+        for item in exact_search.items():
+            if not self._matches_platform(item, config):
+                continue
+            if not self._matches_scene_name_query(item, scene_name_query):
+                continue
+            assets = self._parse_assets(item, config)
+            if not assets:
+                continue
+            exact_items.append(self._build_scene_payload(item, config, assets))
+            if len(exact_items) >= request.limit:
+                break
+        if exact_items:
+            return {"items": exact_items, "count": len(exact_items)}
+
+        hints = self._scene_search_hints(config["sensor"], scene_name_query)
+        search_kwargs: Dict[str, Any] = {
+            "collections": [config["collection"]],
+            "max_items": self._scene_name_search_max_items(request.limit),
+        }
+        if hints.get("datetime"):
+            search_kwargs["datetime"] = hints["datetime"]
+
+        raw_search = catalog.search(**search_kwargs)
+        items = []
+        for item in raw_search.items():
+            if not self._matches_platform(item, config):
+                continue
+            if not self._matches_scene_search_hints(item, hints):
+                continue
+            if not self._matches_scene_name_query(item, scene_name_query):
+                continue
+
+            assets = self._parse_assets(item, config)
+            if not assets:
+                continue
+
+            items.append(self._build_scene_payload(item, config, assets))
+            if len(items) >= request.limit:
+                break
+
+        return {"items": items, "count": len(items)}
+
+    async def search(self, request: ImagerySearchRequest) -> Dict:
+        self._validate_search_request(request)
+        self._apply_proxy_env()
+        sensor = request.sensor
+        product = request.product
+        if self._normalize_search_mode(request.search_mode) == "scene_name":
+            inferred_sensor = self._infer_sensor_from_scene_name(request.scene_name_query)
+            if inferred_sensor:
+                sensor = inferred_sensor
+            inferred_product = self._infer_product_from_scene_name(sensor, request.scene_name_query)
+            if inferred_product:
+                product = inferred_product
+
+        config = self._get_product_config(sensor=sensor, product=product)
+        catalog_kwargs = {"modifier": planetary_computer.sign_inplace} if config["sign"] else {}
+        catalog = pystac_client.Client.open(config["url"], **catalog_kwargs)
+
+        if self._normalize_search_mode(request.search_mode) == "scene_name":
+            return self._search_scene_name(catalog, config, request)
+        return self._search_spatial(catalog, config, request)
 
     async def sign_url(self, url: str) -> Dict:
         if self._is_usgs_url(url):
@@ -551,7 +863,7 @@ class LandsatDownloadService:
                 "collection": item.collection or config["collection"],
                 "auth_required": config["auth_required"] if item.auth_required is None else bool(item.auth_required),
                 "scene_id": item.scene_id,
-                "level": product if sensor == "landsat" else None,
+                "level": product if sensor.startswith("landsat") else None,
                 "band": item.band,
                 "filename": item.filename,
                 "url": item.url,
@@ -858,23 +1170,37 @@ class LandsatDownloadService:
         return await self._try_login(self._eros_username, self._eros_password)
 
     async def _try_login(self, username: str, password: str) -> bool:
-        async with httpx.AsyncClient(
-            **self._build_httpx_client_kwargs(timeout=30, follow_redirects=True)
-        ) as client:
-            login_page = await client.get(self.EROS_LOGIN_URL)
-            csrf_token = self._extract_csrf_token(login_page.text)
-            payload = {
-                "username": username,
-                "password": password,
-                "csrf": csrf_token,
-            }
-            response = await client.post(self.EROS_LOGIN_URL, data=payload)
-            if "login" in str(response.url) or response.status_code != 200:
-                return False
+        try:
+            async with httpx.AsyncClient(
+                **self._build_httpx_client_kwargs(timeout=30, follow_redirects=True)
+            ) as client:
+                login_page = await client.get(self.EROS_LOGIN_URL)
+                login_page.raise_for_status()
+                csrf_token = self._extract_csrf_token(login_page.text)
+                payload = {
+                    "username": username,
+                    "password": password,
+                }
+                if csrf_token:
+                    payload["csrf"] = csrf_token
 
-            self._eros_cookies = dict(client.cookies)
-            self._eros_cookie_expires = self._utc_now() + timedelta(hours=1)
-            return True
+                response = await client.post(self.EROS_LOGIN_URL, data=payload)
+                response.raise_for_status()
+                if "login" in str(response.url).lower():
+                    return False
+
+                self._eros_cookies = dict(client.cookies)
+                self._eros_cookie_expires = self._utc_now() + timedelta(hours=1)
+                return True
+        except httpx.TimeoutException as exc:
+            raise ConnectionError("连接 EROS 登录服务超时，请检查网络或代理配置") from exc
+        except httpx.HTTPStatusError as exc:
+            status_code = exc.response.status_code if exc.response is not None else None
+            if status_code in {401, 403}:
+                return False
+            raise ConnectionError(f"EROS 登录服务返回异常状态: {status_code}") from exc
+        except httpx.RequestError as exc:
+            raise ConnectionError(f"无法连接 EROS 登录服务: {exc}") from exc
 
     def _build_httpx_client_kwargs(
         self,
@@ -1028,6 +1354,8 @@ class LandsatDownloadService:
     def _asset_display_map(cls, sensor: str) -> Dict[str, str]:
         if sensor == "sentinel-2":
             return cls.SENTINEL_ASSET_DISPLAY
+        if sensor == "landsat-7":
+            return cls.LANDSAT7_ASSET_DISPLAY
         return cls.LANDSAT_ASSET_DISPLAY
 
     @classmethod

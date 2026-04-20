@@ -1,6 +1,6 @@
 """数据模型和类型定义"""
 
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Literal, Optional, Union
 from enum import Enum
 from pydantic import BaseModel, Field
 
@@ -260,9 +260,11 @@ class ImagerySearchRequest(BaseModel):
     """通用影像场景检索请求。"""
     sensor: str = Field("landsat", min_length=1, description="传感器类型，例如 landsat、sentinel-2")
     product: str = Field("L2", min_length=1, description="产品级别，例如 L1、L2、L2A")
-    bbox: List[float] = Field(..., min_length=4, max_length=4, description="[west, south, east, north]")
-    start_date: str = Field(..., description="开始日期 YYYY-MM-DD")
-    end_date: str = Field(..., description="结束日期 YYYY-MM-DD")
+    search_mode: Literal["spatial", "scene_name"] = Field("spatial", description="检索模式：范围或影像名")
+    scene_name_query: str = Field("", description="官方影像名 / scene ID / entity ID 查询词")
+    bbox: Optional[List[float]] = Field(None, min_length=4, max_length=4, description="[west, south, east, north]")
+    start_date: Optional[str] = Field(None, description="开始日期 YYYY-MM-DD")
+    end_date: Optional[str] = Field(None, description="结束日期 YYYY-MM-DD")
     max_cloud_cover: int = Field(100, ge=0, le=100, description="最大云量百分比")
     limit: int = Field(20, ge=1, le=100, description="最大返回景数")
 
@@ -287,9 +289,12 @@ class ImageryDownloadTaskCreateRequest(BaseModel):
 
 class LandsatSearchRequest(BaseModel):
     """Landsat 场景检索请求。"""
-    bbox: List[float] = Field(..., min_length=4, max_length=4, description="[west, south, east, north]")
-    start_date: str = Field(..., description="开始日期 YYYY-MM-DD")
-    end_date: str = Field(..., description="结束日期 YYYY-MM-DD")
+    sensor: str = Field("landsat", min_length=1, description="兼容传感器类型，例如 landsat、landsat-7")
+    search_mode: Literal["spatial", "scene_name"] = Field("spatial", description="检索模式：范围或影像名")
+    scene_name_query: str = Field("", description="官方影像名 / scene ID / entity ID 查询词")
+    bbox: Optional[List[float]] = Field(None, min_length=4, max_length=4, description="[west, south, east, north]")
+    start_date: Optional[str] = Field(None, description="开始日期 YYYY-MM-DD")
+    end_date: Optional[str] = Field(None, description="结束日期 YYYY-MM-DD")
     max_cloud_cover: int = Field(100, ge=0, le=100, description="最大云量百分比")
     level: str = Field("L2", pattern="^(L1|L2)$", description="数据级别")
     limit: int = Field(20, ge=1, le=100, description="最大返回景数")

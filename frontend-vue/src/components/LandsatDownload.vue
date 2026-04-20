@@ -39,6 +39,7 @@ const RETRYABLE_DOWNLOAD_PATTERNS = [
 ]
 const SENSOR_LABELS = {
   landsat: 'Landsat',
+  'landsat-7': 'Landsat 7',
   'sentinel-2': 'Sentinel-2',
 }
 const PRODUCT_PRESETS = {
@@ -46,6 +47,16 @@ const PRODUCT_PRESETS = {
     L1: {
       rgb: ['B4', 'B3', 'B2'],
       vegetation: ['B5', 'B4', 'B3'],
+    },
+    L2: {
+      rgb: ['red', 'green', 'blue'],
+      vegetation: ['nir08', 'red', 'green'],
+    },
+  },
+  'landsat-7': {
+    L1: {
+      rgb: ['B3', 'B2', 'B1'],
+      vegetation: ['B4', 'B3', 'B2'],
     },
     L2: {
       rgb: ['red', 'green', 'blue'],
@@ -79,6 +90,8 @@ const state = reactive({
   proxyStatus: { enabled: false, configured: false, proxy_url: '', no_proxy: '' },
   sensor: 'landsat',
   product: 'L2',
+  searchMode: 'spatial',
+  sceneNameQuery: '',
   startDate: offsetDay(-90),
   endDate: offsetDay(0),
   maxCloudCover: 20,
@@ -150,6 +163,8 @@ const productOptions = computed(() => state.collections.filter((collection) => c
 const activeCollection = computed(() => productOptions.value.find((collection) => collection.product === state.product) || null)
 const localPanel = computed(() => buildTaskPanelData(localTaskList.value, state.taskPanels.local))
 const serverPanel = computed(() => buildTaskPanelData(state.serverTasks, state.taskPanels.server))
+const isSceneNameSearch = computed(() => state.searchMode === 'scene_name')
+const searchResultsEmptyText = computed(() => isSceneNameSearch.value ? '还没有检索结果。先输入官方 scene ID / entity ID，再点击“开始检索”。' : '还没有检索结果。先画框或上传矢量选区，再点击“开始检索”。')
 function offsetDay(days) { const d = new Date(); d.setDate(d.getDate() + days); return d.toISOString().slice(0, 10) }
 function apiBase() { return (props.apiBase || '').trim().replace(/\/+$/, '') || 'http://127.0.0.1:5001' }
 function toast(message, type = 'idle') { emit('toast', { message, type }) }
@@ -182,7 +197,7 @@ function productBadgeClass(product) { return `level-${String(product || 'default
 function hasPathRow(scene) { return scene?.path !== null && scene?.path !== undefined && scene?.row !== null && scene?.row !== undefined }
 function sceneMetaLine(scene) { return [sceneDate(scene?.datetime), sensorLabel(scene?.sensor)].filter(Boolean).join(' · ') }
 function sceneDetailLine(scene) { return hasPathRow(scene) ? `${pathRow(scene)} · ${scene.collection}` : (scene.collection || '未提供 collection') }
-function sceneThumbFallback(scene) { return scene?.sensor === 'sentinel-2' ? 'S2' : 'L8' }
+function sceneThumbFallback(scene) { return scene?.sensor === 'sentinel-2' ? 'S2' : scene?.sensor === 'landsat-7' ? 'L7' : 'L8' }
 function taskSummaryLine(task) { return `${sensorLabel(taskSensor(task))} / ${taskProduct(task)} / ${task.scene_id || '--'}` }
 function taskTargetDir(task) {
   if (task?.target_dir) return task.target_dir
@@ -347,6 +362,15 @@ watch(() => state.sensor, (next, prev) => {
 watch(() => state.product, (next, prev) => {
   if (prev !== undefined && next !== prev) resetSearchState()
 })
+watch(() => state.searchMode, async (next, prev) => {
+  if (prev !== undefined && next !== prev) {
+    resetSearchState()
+    if (next !== 'scene_name') {
+      await nextTick()
+      map && map.updateSize()
+    }
+  }
+})
 
 function initMap() {
   footprintLayer = new VectorLayer({
@@ -476,12 +500,27 @@ function handleVisibilityChange() {
 }
 
 async function searchScenes() {
-  if (!state.bbox) return toast('请先绘制矩形或上传 GeoJSON / Shapefile 选区', 'warn')
-  if (!state.startDate || !state.endDate) return toast('请填写完整日期范围', 'warn')
-  if (state.startDate > state.endDate) return toast('开始日期不能晚于结束日期', 'warn')
+  if (state.searchMode === 'scene_name') {
+    if (!state.sceneNameQuery.trim()) return toast('请先填写官方 scene ID / entity ID', 'warn')
+  } else {
+    if (!state.bbox) return toast('请先绘制矩形或上传 GeoJSON / Shapefile 选区', 'warn')
+    if (!state.startDate || !state.endDate) return toast('请填写完整日期范围', 'warn')
+    if (state.startDate > state.endDate) return toast('开始日期不能晚于结束日期', 'warn')
+  }
   state.searchLoading = true
   try {
-    const data = await request('/imagery/search', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ sensor: state.sensor, product: state.product, bbox: state.bbox, start_date: state.startDate, end_date: state.endDate, max_cloud_cover: Number(state.maxCloudCover), limit: Number(state.limit) }) })
+    const payload = {
+      sensor: state.sensor,
+      product: state.product,
+      search_mode: state.searchMode,
+      scene_name_query: state.searchMode === 'scene_name' ? state.sceneNameQuery.trim() : '',
+      bbox: state.searchMode === 'scene_name' ? null : state.bbox,
+      start_date: state.searchMode === 'scene_name' ? null : state.startDate,
+      end_date: state.searchMode === 'scene_name' ? null : state.endDate,
+      max_cloud_cover: Number(state.maxCloudCover),
+      limit: Number(state.limit),
+    }
+    const data = await request('/imagery/search', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) })
     state.searchResults = data.items || []
     state.selectedScenes = {}
     state.hoveredSceneId = ''
@@ -583,23 +622,34 @@ onBeforeUnmount(() => {
         <div class="sensor-switch"><button v-for="sensor in sensorOptions" :key="sensor.sensor" class="pill sensor-pill" :class="{ active: state.sensor === sensor.sensor }" type="button" @click="state.sensor = sensor.sensor">{{ sensor.title }}</button></div>
         <div class="collections"><button v-for="collection in productOptions" :key="`${collection.sensor}:${collection.product}`" class="collection-chip" :class="{ active: state.product === collection.product }" type="button" @click="state.product = collection.product"><strong>{{ collection.product }}</strong><span>{{ collection.title }}</span></button></div>
         <div class="fields">
-          <label><span>开始日期</span><input v-model="state.startDate" type="date" /></label>
-          <label><span>结束日期</span><input v-model="state.endDate" type="date" /></label>
-          <label class="full"><span>最大云量 {{ state.maxCloudCover }}%</span><input v-model.number="state.maxCloudCover" type="range" min="0" max="100" step="1" /></label>
-          <label><span>返回上限</span><input v-model.number="state.limit" type="number" min="1" max="100" /></label>
-          <div><span>下载模式</span><div class="mode-switch"><button class="pill" :class="{ active: state.downloadMode === 'server' }" type="button" @click="state.downloadMode = 'server'">服务端</button><button class="pill" :class="{ active: state.downloadMode === 'local' }" type="button" @click="state.downloadMode = 'local'">浏览器</button></div></div>
+          <div class="full"><span>检索模式</span><div class="mode-switch"><button class="pill" :class="{ active: state.searchMode === 'spatial' }" type="button" @click="state.searchMode = 'spatial'">按范围</button><button class="pill" :class="{ active: state.searchMode === 'scene_name' }" type="button" @click="state.searchMode = 'scene_name'">按影像名</button></div></div>
+          <template v-if="state.searchMode === 'scene_name'">
+            <label class="full"><span>影像名 / Scene ID</span><input v-model.trim="state.sceneNameQuery" type="text" placeholder="例如 LE07_L2SP_123032_20200415_20200509_02_T1 或 LE71230322020106EDC00" /></label>
+            <label><span>返回上限</span><input v-model.number="state.limit" type="number" min="1" max="100" /></label>
+            <div><span>下载模式</span><div class="mode-switch"><button class="pill" :class="{ active: state.downloadMode === 'server' }" type="button" @click="state.downloadMode = 'server'">服务端</button><button class="pill" :class="{ active: state.downloadMode === 'local' }" type="button" @click="state.downloadMode = 'local'">浏览器</button></div></div>
+          </template>
+          <template v-else>
+            <label><span>开始日期</span><input v-model="state.startDate" type="date" /></label>
+            <label><span>结束日期</span><input v-model="state.endDate" type="date" /></label>
+            <label class="full"><span>最大云量 {{ state.maxCloudCover }}%</span><input v-model.number="state.maxCloudCover" type="range" min="0" max="100" step="1" /></label>
+            <label><span>返回上限</span><input v-model.number="state.limit" type="number" min="1" max="100" /></label>
+            <div><span>下载模式</span><div class="mode-switch"><button class="pill" :class="{ active: state.downloadMode === 'server' }" type="button" @click="state.downloadMode = 'server'">服务端</button><button class="pill" :class="{ active: state.downloadMode === 'local' }" type="button" @click="state.downloadMode = 'local'">浏览器</button></div></div>
+          </template>
         </div>
         <p v-if="activeCollection" class="root-hint">当前产品：{{ sensorLabel(state.sensor) }} / {{ state.product }}</p>
         <p v-if="activeCollection?.auth_required" class="root-hint">需要 EarthData / EROS 认证</p>
-        <div class="bbox-box"><div><span>当前范围</span><strong>{{ bboxText() }}</strong><p class="aoi-hint">{{ aoiStatusText() }}</p></div><div class="row"><button class="btn" type="button" @click="drawBox">{{ state.drawActive ? '重新框选中...' : '绘制矩形' }}</button><button class="btn sub" type="button" :disabled="state.aoiParsing" @click="triggerAoiUpload">{{ state.aoiParsing ? '解析中...' : '上传矢量' }}</button><button class="btn sub" type="button" @click="clearBox">清空</button></div></div>
-        <input ref="aoiFileInput" class="hidden-file-input" type="file" multiple accept=".geojson,.json,.shp,.dbf,.shx,.prj,.cpg,.sbn,.sbx" @change="handleAoiUpload" />
-        <p class="root-hint">支持 GeoJSON / Shapefile，Shapefile 建议同时选择 `.dbf`、`.shx`、`.prj`。</p>
+        <p v-if="state.searchMode === 'scene_name'" class="root-hint">影像名模式支持官方 scene ID / entity ID 的精确匹配和前缀匹配，不再要求 AOI、日期和云量条件。</p>
+        <template v-else>
+          <div class="bbox-box"><div><span>当前范围</span><strong>{{ bboxText() }}</strong><p class="aoi-hint">{{ aoiStatusText() }}</p></div><div class="row"><button class="btn" type="button" @click="drawBox">{{ state.drawActive ? '重新框选中...' : '绘制矩形' }}</button><button class="btn sub" type="button" :disabled="state.aoiParsing" @click="triggerAoiUpload">{{ state.aoiParsing ? '解析中...' : '上传矢量' }}</button><button class="btn sub" type="button" @click="clearBox">清空</button></div></div>
+          <input ref="aoiFileInput" class="hidden-file-input" type="file" multiple accept=".geojson,.json,.shp,.dbf,.shx,.prj,.cpg,.sbn,.sbx" @change="handleAoiUpload" />
+          <p class="root-hint">支持 GeoJSON / Shapefile，Shapefile 建议同时选择 `.dbf`、`.shx`、`.prj`。</p>
+        </template>
         <button class="btn main" type="button" :disabled="state.searchLoading" @click="searchScenes">{{ state.searchLoading ? '检索中...' : '开始检索' }}</button>
       </article>
-      <article class="card"><div class="head"><div><h3>地图范围</h3><p>{{ state.searchResults.length }} 景，{{ selectedSceneCount }} 已选</p></div></div><div ref="mapTarget" class="map"></div></article>
+      <article v-show="state.searchMode !== 'scene_name'" class="card"><div class="head"><div><h3>地图范围</h3><p>{{ state.searchResults.length }} 景，{{ selectedSceneCount }} 已选</p></div></div><div ref="mapTarget" class="map"></div></article>
       <article class="card span-all">
         <div class="head"><div><h3>检索结果</h3></div><div class="row"><button class="btn sub" type="button" @click="toggleAll(true)">全选</button><button class="btn sub" type="button" @click="toggleAll(false)">清空</button><button class="btn" type="button" @click="downloadSelected">下载所选景全部资产</button></div></div>
-        <div v-if="!state.searchResults.length" class="empty">还没有检索结果。先画框或上传矢量选区，再点击“开始检索”。</div>
+        <div v-if="!state.searchResults.length" class="empty">{{ searchResultsEmptyText }}</div>
         <div v-else class="scene-grid">
           <article v-for="scene in state.searchResults" :key="`${scene.sensor}:${scene.id}`" class="scene-card" :class="{ selected: state.selectedScenes[scene.id] }" @mouseenter="state.hoveredSceneId = scene.id" @mouseleave="state.hoveredSceneId = ''">
             <div class="scene-top"><div class="thumb"><img v-if="scene.thumbnail" :src="scene.thumbnail" :alt="scene.id" loading="lazy" /><span v-else>{{ sceneThumbFallback(scene) }}</span></div><div class="scene-text"><div class="between"><h4>{{ scene.id }}</h4><span class="badge" :class="productBadgeClass(scene.product)">{{ scene.product }}</span></div><p>{{ sceneMetaLine(scene) }}</p><p>{{ sceneDetailLine(scene) }}</p><p>云量 {{ cloudText(scene.cloud_cover) }} · {{ Object.keys(scene.assets || {}).length }} 个资产</p></div><label class="checker"><input :checked="!!state.selectedScenes[scene.id]" type="checkbox" @change="setScene(scene.id, $event.target.checked)" /><span>{{ state.selectedScenes[scene.id] ? '已选' : '选择' }}</span></label></div>

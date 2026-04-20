@@ -678,9 +678,16 @@ def _landsat_task_payload(task: Dict) -> Dict:
 
 
 def _build_imagery_search_request_from_landsat(request: LandsatSearchRequest) -> ImagerySearchRequest:
+    inferred_sensor = LandsatDownloadService._normalize_sensor(explicit_sensor=request.sensor)
+    if str(request.search_mode or "").strip().lower() == "scene_name":
+        scene_sensor = LandsatDownloadService._normalize_sensor(scene_id=request.scene_name_query or "")
+        if inferred_sensor == "landsat" and scene_sensor == "landsat-7":
+            inferred_sensor = scene_sensor
     return ImagerySearchRequest(
-        sensor="landsat",
+        sensor=inferred_sensor,
         product=request.level,
+        search_mode=request.search_mode,
+        scene_name_query=request.scene_name_query,
         bbox=request.bbox,
         start_date=request.start_date,
         end_date=request.end_date,
@@ -694,7 +701,11 @@ def _build_imagery_download_request_from_landsat(
 ) -> ImageryDownloadTaskCreateRequest:
     items = [
         ImageryDownloadItem(
-            sensor="landsat",
+            sensor=LandsatDownloadService._normalize_sensor(
+                scene_id=item.scene_id,
+                filename=item.filename,
+                url=item.url,
+            ),
             product=item.level,
             scene_id=item.scene_id,
             band=item.band,
@@ -833,6 +844,8 @@ def setup_routes(
             raise HTTPException(status_code=400, detail=str(exc))
         except PermissionError as exc:
             raise HTTPException(status_code=401, detail=str(exc))
+        except ConnectionError as exc:
+            raise HTTPException(status_code=502, detail=str(exc))
         except Exception as exc:
             logger.error("EarthData 认证失败: %s", exc, exc_info=True)
             raise HTTPException(status_code=500, detail=f"认证失败: {exc}")
@@ -953,7 +966,17 @@ def setup_routes(
 
     @app.get("/landsat/collections")
     def landsat_collections() -> Dict:
-        payload = landsat_download_service.list_collections(sensor="landsat")
+        payload = landsat_download_service.list_collections()
+        payload["collections"] = [
+            collection
+            for collection in payload["collections"]
+            if collection.get("sensor") in {"landsat", "landsat-7"}
+        ]
+        payload["sensors"] = [
+            sensor
+            for sensor in payload["sensors"]
+            if sensor.get("sensor") in {"landsat", "landsat-7"}
+        ]
         payload.update(_download_dir_payload())
         payload["collections"] = [_landsat_collection_payload(collection) for collection in payload["collections"]]
         return payload
@@ -974,6 +997,8 @@ def setup_routes(
             raise HTTPException(status_code=400, detail=str(exc))
         except PermissionError as exc:
             raise HTTPException(status_code=401, detail=str(exc))
+        except ConnectionError as exc:
+            raise HTTPException(status_code=502, detail=str(exc))
         except Exception as exc:
             logger.error("EarthData 认证失败: %s", exc, exc_info=True)
             raise HTTPException(status_code=500, detail=f"认证失败: {exc}")
