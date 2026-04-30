@@ -351,6 +351,13 @@ function syncCollectionSelection() {
 
 watch(() => state.hoveredSceneId, () => footprintLayer && footprintLayer.changed())
 watch(() => state.selectedScenes, () => footprintLayer && footprintLayer.changed(), { deep: true })
+watch(
+  () => state.serverTasks.map((task) => `${task.id}:${task.status}`).join('|'),
+  () => {
+    updateFailedServerRetryBar()
+  },
+)
+
 watch(() => props.apiBase, async () => {
   stopServerPoll()
   await Promise.all([loadCollections(true), loadAuthStatus(true), loadProxyStatus(true), loadServerTasks(true)])
@@ -557,7 +564,105 @@ async function downloadLocalTask(task) { if (!task || task.status === 'cancelled
 // 浏览器模式顺序下载，避免多景并发时把内存和网络同时拉满。
 async function processLocalQueue() { if (state.localBusy || !state.localQueue.length) return; state.localBusy = true; try { while (state.localQueue.length) { const taskId = state.localQueue.shift(); const task = state.localTasks[taskId]; if (!task || task.status === 'cancelled') continue; await downloadLocalTask(task) } } finally { state.localBusy = false; if (state.localQueue.length) window.setTimeout(() => processLocalQueue(), 0) } }
 function cancelLocal(taskId) { const task = state.localTasks[taskId]; if (!task) return; task.status = 'cancelled'; task.controller?.abort(); state.localQueue = state.localQueue.filter((item) => item !== taskId) }
+let failedServerRetryBar = null
+
+function removeFailedServerRetryBar() {
+  if (!failedServerRetryBar) return
+  failedServerRetryBar.remove()
+  failedServerRetryBar = null
+}
+
+function updateFailedServerRetryBar() {
+  if (typeof document === 'undefined') return
+  const failedCount = state.serverTasks.filter((task) => task.status === 'failed').length
+  if (!failedCount) {
+    removeFailedServerRetryBar()
+    return
+  }
+
+  if (!failedServerRetryBar) {
+    const container = document.createElement('div')
+    container.style.position = 'fixed'
+    container.style.right = '20px'
+    container.style.bottom = '20px'
+    container.style.zIndex = '50'
+    container.style.display = 'flex'
+    container.style.alignItems = 'center'
+    container.style.gap = '12px'
+    container.style.padding = '12px 14px'
+    container.style.borderRadius = '12px'
+    container.style.background = 'rgba(16, 24, 40, 0.94)'
+    container.style.color = '#f8fafc'
+    container.style.boxShadow = '0 18px 40px rgba(15, 23, 42, 0.28)'
+
+    const label = document.createElement('span')
+    label.dataset.role = 'label'
+    label.style.fontSize = '13px'
+    label.style.fontWeight = '600'
+    container.appendChild(label)
+
+    const button = document.createElement('button')
+    button.type = 'button'
+    button.textContent = '重新下载'
+    button.style.border = '0'
+    button.style.borderRadius = '10px'
+    button.style.padding = '8px 12px'
+    button.style.cursor = 'pointer'
+    button.style.background = '#f97316'
+    button.style.color = '#fff7ed'
+    button.style.fontSize = '12px'
+    button.style.fontWeight = '700'
+    button.addEventListener('click', () => {
+      void retryFailedServerTasks()
+    })
+    container.appendChild(button)
+
+    document.body.appendChild(container)
+    failedServerRetryBar = container
+  }
+
+  const label = failedServerRetryBar.querySelector('[data-role="label"]')
+  if (label) {
+    label.textContent = `${failedCount} 个服务端失败任务`
+  }
+}
+
+async function retryFailedServerTasks() {
+  const failedTasks = state.serverTasks.filter((task) => task.status === 'failed')
+  if (!failedTasks.length) return
+
+  const button = failedServerRetryBar?.querySelector('button')
+  if (button) button.disabled = true
+
+  try {
+    for (const task of failedTasks) {
+      await request(`/imagery/download_tasks/${encodeURIComponent(task.id)}/retry`, {
+        method: 'POST',
+      })
+    }
+    await loadServerTasks(true)
+    scheduleServerPoll()
+  } finally {
+    if (button) button.disabled = false
+    updateFailedServerRetryBar()
+  }
+}
+
+function retryLocal(taskId) {
+  const task = state.localTasks[taskId]
+  if (!task || task.status !== 'failed') return
+  task.status = 'pending'
+  task.error = ''
+  task.last_error = ''
+  task.retry_count = 0
+  task.createdAt = Date.now()
+  resetLocalTaskProgress(task)
+  if (!state.localQueue.includes(taskId)) state.localQueue.push(taskId)
+  toast(`已重新加入浏览器下载：${task.filename}`, 'ok')
+  processLocalQueue()
+}
 async function cancelServer(taskId) { try { await request(`/imagery/download_tasks/${encodeURIComponent(taskId)}`, { method: 'DELETE' }); await loadServerTasks(true) } catch (error) { toast(`取消失败：${error.message}`, 'error') } }
+async function retryServer(taskId) { try { await request(`/imagery/download_tasks/${encodeURIComponent(taskId)}/retry`, { method: 'POST' }); await loadServerTasks(true); toast('服务端失败任务已重新加入下载', 'ok') } catch (error) { toast(`重新下载失败：${error.message}`, 'error') } }
 function saveServer(task) { const link = document.createElement('a'); link.href = `${apiBase()}/imagery/download_tasks/${encodeURIComponent(task.id)}/file`; link.target = '_blank'; link.rel = 'noopener'; document.body.appendChild(link); link.click(); link.remove() }
 async function clearServer() { try { await request('/imagery/download_tasks/completed', { method: 'DELETE' }); await loadServerTasks(true) } catch (error) { toast(`清理失败：${error.message}`, 'error') } }
 function clearLocal() { Object.entries(state.localTasks).forEach(([id, task]) => { if (['completed', 'failed', 'cancelled'].includes(task.status)) delete state.localTasks[id] }) }
@@ -599,6 +704,7 @@ async function saveProxy() { const payload = { enabled: !!state.proxyForm.enable
 async function disableProxy() { state.proxyForm.enabled = false; state.proxyForm.proxy_url = ''; state.proxyForm.no_proxy = ''; await saveProxy() }
 
 onMounted(async () => {
+  updateFailedServerRetryBar()
   await nextTick()
   initMap()
   document.addEventListener('visibilitychange', handleVisibilityChange)
@@ -606,6 +712,7 @@ onMounted(async () => {
   await Promise.all([loadCollections(true), loadAuthStatus(true), loadProxyStatus(true), loadServerTasks(true)])
 })
 onBeforeUnmount(() => {
+  removeFailedServerRetryBar()
   document.removeEventListener('visibilitychange', handleVisibilityChange)
   stopServerPoll()
   removeDraw()

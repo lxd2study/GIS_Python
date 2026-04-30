@@ -22,7 +22,9 @@ const TOAST_DURATION = {
 }
 
 const CORE_BANDS = ['B2', 'B3', 'B4', 'B5']
+const SENTINEL_CORE_BANDS = ['B01', 'B04', 'B08', 'B12']
 const ALL_BANDS = Array.from({ length: 11 }, (_, i) => `B${i + 1}`)
+const SENTINEL_ALL_BANDS = ['B01', 'B02', 'B03', 'B04', 'B05', 'B06', 'B07', 'B08', 'B8A', 'B09', 'B11', 'B12']
 
 const fallbackComposites = [
   // RGB合成 (6种)
@@ -50,9 +52,25 @@ const fallbackComposites = [
   { type: 'ndbai', name: 'NDBaI - 归一化裸地与建筑指数' },
   { type: 'ui', name: 'UI - 城市指数' },
   // 其他指数 (3种)
+  { type: 'apgi', name: 'APGI - 大棚指数' },
   { type: 'nbr', name: 'NBR - 归一化燃烧指数' },
   { type: 'bsi', name: 'BSI - 裸土指数' },
   { type: 'ndsi', name: 'NDSI - 归一化积雪指数' }
+]
+
+const SENTINEL_COMPOSITE_ORDER = [
+  'apgi',
+  'true_color',
+  'false_color',
+  'agriculture',
+  'urban',
+  'natural_color',
+  'swir',
+  'ndvi',
+  'evi',
+  'ndwi',
+  'mndwi',
+  'ndbi'
 ]
 
 function loadHistory() {
@@ -68,6 +86,7 @@ const state = reactive({
   apiBase: localStorage.getItem(API_KEY) || ENV_API || 'http://127.0.0.1:5001',
   currentTab: 'single',
   health: null,
+  sensor: 'landsat',
   inputSource: 'upload',
   composites: [],
   serverResourceRoot: '',
@@ -124,10 +143,17 @@ const state = reactive({
   manualJobId: '',
   progress: null,
   polling: true,
+  derivedResults: [],
   previewPath: '',
   previewSize: 768,
   previewImage: '',
-  previewMeta: null
+  previewMeta: null,
+  binaryThreshold: '0',
+  binaryUpperThreshold: '',
+  binaryComparison: 'gte',
+  binaryOutputPath: '',
+  binaryRunning: false,
+  binaryResult: null
 })
 
 let timer = null
@@ -139,8 +165,19 @@ function normalizedApiBase() {
   return value || 'http://127.0.0.1:5001'
 }
 
-function detectBandName(filename) {
-  const match = filename.toUpperCase().match(/(?:^|[_-])B(1[0-1]|[1-9])(?:[_\-.]|$)/)
+function bandSortValue(band) {
+  if (band === 'B8A') return 8.5
+  return Number(String(band || '').replace(/^B0?/, '')) || 999
+}
+
+function detectBandName(filename, sensor = state.sensor) {
+  const upper = filename.toUpperCase()
+  if (sensor === 'sentinel-2') {
+    const match = upper.match(/(?:^|[_-])B(0[1-9]|1[0-2]|8A)(?:[_\-.]|$)/)
+    if (!match) return null
+    return match[1] === '8A' ? 'B8A' : `B${match[1]}`
+  }
+  const match = upper.match(/(?:^|[_-])B(1[0-1]|[1-9])(?:[_\-.]|$)/)
   return match ? `B${Number(match[1])}` : null
 }
 
@@ -148,7 +185,7 @@ function inferSceneName(files) {
   const counts = new Map()
   for (const file of files) {
     const name = file.name.replace(/\.[^.]+$/, '')
-    const match = name.match(/(.+?)_B(?:1[0-1]|[1-9])(?:_|$)/i)
+    const match = name.match(/(.+?)_B(?:0[1-9]|1[0-2]|8A|1[0-1]|[1-9])(?:_|$)/i)
     const scene = sanitizeSceneName(match ? match[1] : name.split('_')[0])
     if (!scene) continue
     counts.set(scene, (counts.get(scene) || 0) + 1)
@@ -184,7 +221,7 @@ function joinPath(base, child) {
 
 function normalizeProductLevel(value, fallback = 'L1') {
   const normalized = String(value || '').trim().toUpperCase()
-  if (normalized === 'L1' || normalized === 'L2') return normalized
+  if (normalized === 'L1' || normalized === 'L2' || normalized === 'L2A') return normalized
   return fallback
 }
 
@@ -217,6 +254,20 @@ function saveOutputPrefs() {
   localStorage.setItem(OUTPUT_MODE_KEY, state.outputMode)
   localStorage.setItem(OUTPUT_BASE_KEY, state.outputBaseDir.trim())
   localStorage.setItem(OUTPUT_MANUAL_KEY, state.outputDirManual.trim())
+}
+
+function setProcessingSensor(sensor) {
+  if (!['landsat', 'sentinel-2'].includes(sensor) || state.sensor === sensor) return
+  state.sensor = sensor
+  state.productLevel = sensor === 'sentinel-2' ? 'L2A' : 'L1'
+  state.selectedComposites = sensor === 'sentinel-2' ? ['apgi'] : ['true_color', 'ndvi']
+  state.mtlFile = null
+  state.qaFile = null
+  state.qaRadsatFile = null
+  state.applyCloudMask = false
+  state.atmMethod = sensor === 'sentinel-2' ? 'NONE' : 'DOS'
+  resetSingleSceneCoverage()
+  if (state.bands.length) void loadSingleSceneCoverage(state.bands)
 }
 
 function normalizePath(path) {
@@ -264,7 +315,7 @@ const bandAnalysis = computed(() => {
   const map = new Map()
   const unknown = []
   state.bands.forEach((file) => {
-    const band = detectBandName(file.name)
+    const band = detectBandName(file.name, state.sensor)
     if (!band) {
       unknown.push(file.name)
       return
@@ -275,12 +326,14 @@ const bandAnalysis = computed(() => {
 
   const recognized = [...map.entries()]
     .map(([band, files]) => ({ band, files }))
-    .sort((a, b) => Number(a.band.slice(1)) - Number(b.band.slice(1)))
+    .sort((a, b) => bandSortValue(a.band) - bandSortValue(b.band))
 
   const duplicates = recognized.filter((item) => item.files.length > 1)
   const recognizedBands = new Set(recognized.map((item) => item.band))
-  const missingCore = CORE_BANDS.filter((band) => !recognizedBands.has(band))
-  const missingAll = ALL_BANDS.filter((band) => !recognizedBands.has(band))
+  const requiredCore = state.sensor === 'sentinel-2' ? SENTINEL_CORE_BANDS : CORE_BANDS
+  const allBands = state.sensor === 'sentinel-2' ? SENTINEL_ALL_BANDS : ALL_BANDS
+  const missingCore = requiredCore.filter((band) => !recognizedBands.has(band))
+  const missingAll = allBands.filter((band) => !recognizedBands.has(band))
   const sceneHint = inferSceneName(state.bands)
 
   return {
@@ -300,6 +353,19 @@ const selectedServerScene = computed(() => {
 const serverSceneAvailableLevels = computed(() => getSceneAvailableLevels(selectedServerScene.value))
 
 const activeProductLevel = computed(() => normalizeProductLevel(state.productLevel))
+const isSentinel2Mode = computed(() => state.sensor === 'sentinel-2')
+const compositeOptions = computed(() => {
+  const options = state.composites.length ? state.composites : fallbackComposites
+  if (!isSentinel2Mode.value) return options.filter((item) => item.type !== 'apgi')
+
+  const order = new Map(SENTINEL_COMPOSITE_ORDER.map((type, index) => [type, index]))
+  return [...options].sort((a, b) => {
+    const aOrder = order.has(a.type) ? order.get(a.type) : 100
+    const bOrder = order.has(b.type) ? order.get(b.type) : 100
+    if (aOrder !== bOrder) return aOrder - bOrder
+    return a.name.localeCompare(b.name, 'zh-CN')
+  })
+})
 
 const outputSceneResolved = computed(() => {
   const fallbackSceneName = state.inputSource === 'server'
@@ -363,6 +429,9 @@ const resultItems = computed(() => {
   if (result.cloud_mask) {
     list.push({ label: 'cloud_mask', path: result.cloud_mask, group: 'mask' })
   }
+  state.derivedResults.forEach((item) => {
+    list.push({ label: item.label, path: item.path, group: item.group || 'derived' })
+  })
   return list
 })
 
@@ -749,6 +818,18 @@ function selectServerScene(scene) {
   if (!scene?.path) return
 
   state.selectedServerScenePath = scene.path
+  if (scene.sensor === 'sentinel-2') {
+    state.sensor = 'sentinel-2'
+    state.productLevel = 'L2A'
+    if (!state.selectedComposites.includes('apgi')) state.selectedComposites = ['apgi']
+  } else if (scene.sensor && scene.sensor !== state.sensor) {
+    state.sensor = 'landsat'
+    if (state.productLevel === 'L2A') state.productLevel = 'L1'
+    state.selectedComposites = state.selectedComposites.filter((type) => type !== 'apgi')
+    if (!state.selectedComposites.length) {
+      state.selectedComposites = ['true_color', 'ndvi']
+    }
+  }
   const availableLevels = getSceneAvailableLevels(scene)
   const preferredLevel = normalizeProductLevel(scene?.product_level, availableLevels[0] || activeProductLevel.value)
   if (!sceneSupportsProductLevel(scene, activeProductLevel.value)) {
@@ -781,6 +862,7 @@ async function switchInputSource(source) {
 }
 
 function toggleComposite(type) {
+  if (!isSentinel2Mode.value && type === 'apgi') return
   if (state.selectedComposites.includes(type)) {
     state.selectedComposites = state.selectedComposites.filter((item) => item !== type)
   } else {
@@ -823,6 +905,9 @@ async function submitTask() {
 
   try {
     const targetProductLevel = activeProductLevel.value
+    const sentinelMode = isSentinel2Mode.value
+    state.derivedResults = []
+    state.binaryResult = null
     if (state.sceneCoverageLoading && singleClipRoiBbox.value) {
       setToast('正在读取影像覆盖范围，请稍候再提交', 'warn')
       return
@@ -841,15 +926,15 @@ async function submitTask() {
       body.append('scene_path', selectedServerScene.value.path)
     } else {
       state.bands.forEach((file) => body.append('bands', file))
-      if (state.mtlFile) body.append('mtl_file', state.mtlFile)
-      if (state.qaFile) body.append('qa_band', state.qaFile)
-      if (state.qaRadsatFile) body.append('qa_radsat_band', state.qaRadsatFile)
+      if (!sentinelMode && state.mtlFile) body.append('mtl_file', state.mtlFile)
+      if (!sentinelMode && state.qaFile) body.append('qa_band', state.qaFile)
+      if (!sentinelMode && state.qaRadsatFile) body.append('qa_radsat_band', state.qaRadsatFile)
     }
     state.shapeFiles.forEach((file) => body.append('clip_shapefile', file))
 
     body.append('output_dir', outputDirResolved.value)
-    body.append('apply_cloud_mask', String(state.applyCloudMask))
-    body.append('atm_correction_method', state.atmMethod)
+    body.append('apply_cloud_mask', String(!sentinelMode && state.applyCloudMask))
+    body.append('atm_correction_method', sentinelMode ? 'NONE' : state.atmMethod)
     body.append('product_level', targetProductLevel)
 
     if (state.clipExtent.trim()) body.append('clip_extent', state.clipExtent.trim())
@@ -860,8 +945,8 @@ async function submitTask() {
     }
 
     const endpoint = state.inputSource === 'server'
-      ? '/filesystem/preprocess_landsat8_async'
-      : '/preprocess_landsat8_async'
+      ? (sentinelMode ? '/filesystem/preprocess_sentinel2_async' : '/filesystem/preprocess_landsat8_async')
+      : (sentinelMode ? '/preprocess_sentinel2_async' : '/preprocess_landsat8_async')
     const data = await request(endpoint, { method: 'POST', body })
     state.jobId = data.job_id
     state.manualJobId = data.job_id
@@ -916,16 +1001,19 @@ function resetForm() {
   state.qaRadsatFile = null
   state.selectedServerScenePath = ''
   state.shapeFiles = []
-  state.productLevel = 'L1'
+  state.productLevel = isSentinel2Mode.value ? 'L2A' : 'L1'
   state.clipExtent = ''
   resetSingleClipPreview()
   resetSingleSceneCoverage()
   if (clipFileInput.value) clipFileInput.value.value = ''
-  state.selectedComposites = ['true_color', 'ndvi']
+  state.selectedComposites = isSentinel2Mode.value ? ['apgi'] : ['true_color', 'ndvi']
   state.customFormula = ''
   state.customName = ''
   state.applyCloudMask = false
-  state.atmMethod = 'DOS'
+  state.atmMethod = isSentinel2Mode.value ? 'NONE' : 'DOS'
+  state.derivedResults = []
+  state.binaryResult = null
+  state.binaryOutputPath = ''
   setToast('表单已重置', 'idle')
 }
 
@@ -976,7 +1064,29 @@ const singleClipFileSummary = computed(() => {
   return `${state.shapeFiles[0].name} 等 ${state.shapeFiles.length} 个文件`
 })
 
-async function loadPreview(path = '') {
+function fileStem(path) {
+  const filename = String(path || '').split(/[\\/]/).pop() || ''
+  return filename.replace(/\.[^.]+$/, '') || 'binary'
+}
+
+function binaryNeedsUpperThreshold() {
+  return ['between', 'outside'].includes(state.binaryComparison)
+}
+
+function formatNumber(value, digits = 2) {
+  if (value === null || value === undefined || Number.isNaN(Number(value))) return '--'
+  return Number(value).toLocaleString('zh-CN', {
+    maximumFractionDigits: digits,
+    minimumFractionDigits: 0,
+  })
+}
+
+function formatPercent(value) {
+  if (value === null || value === undefined || Number.isNaN(Number(value))) return '--'
+  return `${(Number(value) * 100).toFixed(2)}%`
+}
+
+async function loadPreview(path = '', options = {}) {
   const targetPath = (path || state.previewPath).trim()
   if (!targetPath) {
     setToast('请输入预览文件路径', 'warn')
@@ -988,12 +1098,61 @@ async function loadPreview(path = '') {
     body.append('file_path', targetPath)
     body.append('max_size', String(Math.max(128, Math.min(2048, Number(state.previewSize) || 768))))
     const data = await request('/preview_raster', { method: 'POST', body })
+    if (!options.preserveBinaryResult && targetPath !== state.previewPath) {
+      state.binaryResult = null
+      state.binaryOutputPath = ''
+    }
     state.previewPath = targetPath
     state.previewMeta = data.preview
     state.previewImage = `data:image/png;base64,${data.preview.base64}`
     setToast('预览加载完成', 'ok')
   } catch (error) {
     setToast(`预览失败：${error.message}`, 'error')
+  }
+}
+
+async function runBinarization() {
+  const targetPath = state.previewPath.trim()
+  if (!targetPath) {
+    setToast('请先选择或加载一个栅格结果', 'warn')
+    return
+  }
+
+  const threshold = Number(state.binaryThreshold)
+  if (!Number.isFinite(threshold)) {
+    setToast('请输入有效阈值', 'warn')
+    return
+  }
+
+  const upperText = String(state.binaryUpperThreshold).trim()
+  const upperThreshold = Number(upperText)
+  if (binaryNeedsUpperThreshold() && (!upperText || !Number.isFinite(upperThreshold))) {
+    setToast('请输入有效上限阈值', 'warn')
+    return
+  }
+
+  state.binaryRunning = true
+  try {
+    const body = new FormData()
+    body.append('file_path', targetPath)
+    body.append('threshold', String(threshold))
+    body.append('comparison', state.binaryComparison)
+    if (binaryNeedsUpperThreshold()) body.append('upper_threshold', String(upperThreshold))
+    if (state.binaryOutputPath.trim()) body.append('output_path', state.binaryOutputPath.trim())
+
+    const result = await request('/raster/binarize', { method: 'POST', body })
+    state.binaryResult = result
+    state.binaryOutputPath = ''
+    state.derivedResults = [
+      { label: `${fileStem(result.output_path)}`, path: result.output_path, group: 'binary' },
+      ...state.derivedResults.filter((item) => item.path !== result.output_path),
+    ].slice(0, 8)
+    await loadPreview(result.output_path, { preserveBinaryResult: true })
+    setToast('二值化与面积统计完成', 'ok')
+  } catch (error) {
+    setToast(`二值化失败：${error.message}`, 'error')
+  } finally {
+    state.binaryRunning = false
   }
 }
 
@@ -1196,6 +1355,18 @@ onBeforeUnmount(() => {
             </div>
           </div>
 
+          <div class="field-compact full">
+            <span>处理类型</span>
+            <div class="mode-row-compact">
+              <button class="btn-tiny" :class="{ active: state.sensor === 'landsat' }" type="button" @click="setProcessingSensor('landsat')">
+                Landsat
+              </button>
+              <button class="btn-tiny" :class="{ active: state.sensor === 'sentinel-2' }" type="button" @click="setProcessingSensor('sentinel-2')">
+                Sentinel-2 L2A
+              </button>
+            </div>
+          </div>
+
           <template v-if="state.inputSource === 'upload'">
             <label class="field-compact full">
               <span>波段文件（必选）</span>
@@ -1223,23 +1394,24 @@ onBeforeUnmount(() => {
 
             <label class="field-compact">
               <span>产品级别</span>
-              <select v-model="state.productLevel">
+              <select v-model="state.productLevel" :disabled="isSentinel2Mode">
+                <option v-if="isSentinel2Mode" value="L2A">L2A: Sentinel-2 地表反射率</option>
                 <option value="L1">L1: DN/辐射定标链</option>
                 <option value="L2">L2: 地表反射率直用</option>
               </select>
             </label>
 
-            <label class="field-compact">
+            <label v-if="!isSentinel2Mode" class="field-compact">
               <span>MTL 文件</span>
               <input type="file" accept=".txt,.mtl" @change="(e) => onPickFile(e, 'mtl')" />
             </label>
 
-            <label class="field-compact">
+            <label v-if="!isSentinel2Mode" class="field-compact">
               <span>QA 文件</span>
               <input type="file" accept=".tif,.tiff,.img" @change="(e) => onPickFile(e, 'qa')" />
             </label>
 
-            <label class="field-compact">
+            <label v-if="!isSentinel2Mode" class="field-compact">
               <span>QA_RADSAT</span>
               <input type="file" accept=".tif,.tiff,.img" @change="(e) => onPickFile(e, 'qa_radsat')" />
             </label>
@@ -1289,9 +1461,11 @@ onBeforeUnmount(() => {
                   </div>
                   <p class="server-scene-path" :title="scene.path">{{ scene.path }}</p>
                   <div class="server-scene-meta">
+                    <span class="scene-pill level">{{ scene.sensor === 'sentinel-2' ? 'Sentinel-2' : 'Landsat' }}</span>
                     <span class="scene-pill level">{{ getSceneAvailableLevels(scene).join('/') || normalizeProductLevel(scene.product_level) }}</span>
                     <span class="scene-pill" :class="scene.mtl_file ? 'ok' : 'muted'">{{ scene.mtl_file ? 'MTL' : '无 MTL' }}</span>
                     <span class="scene-pill" :class="scene.qa_band ? 'ok' : 'muted'">{{ scene.qa_band ? 'QA' : '无 QA' }}</span>
+                    <span v-if="scene.sensor === 'sentinel-2'" class="scene-pill" :class="scene.scl_file ? 'ok' : 'muted'">{{ scene.scl_file ? 'SCL' : '无 SCL' }}</span>
                     <span class="scene-pill" :class="scene.footprint_bbox ? 'ok' : 'muted'">{{ scene.footprint_bbox ? 'Footprint' : '无范围' }}</span>
                   </div>
                 </button>
@@ -1311,7 +1485,7 @@ onBeforeUnmount(() => {
                   :key="level"
                   :value="level"
                 >
-                  {{ level }}: {{ level === 'L2' ? '地表反射率直用' : 'DN/辐射定标链' }}
+                  {{ level }}: {{ level === 'L2A' ? 'Sentinel-2 地表反射率' : (level === 'L2' ? '地表反射率直用' : 'DN/辐射定标链') }}
                 </option>
               </select>
             </label>
@@ -1447,7 +1621,7 @@ onBeforeUnmount(() => {
               />
             </label>
 
-            <label class="field-compact">
+            <label v-if="!isSentinel2Mode" class="field-compact">
               <span>大气校正</span>
               <select v-model="state.atmMethod" :disabled="activeProductLevel === 'L2'">
                 <option value="DOS">DOS</option>
@@ -1455,7 +1629,7 @@ onBeforeUnmount(() => {
               </select>
             </label>
 
-            <label class="field-compact checkfield">
+            <label v-if="!isSentinel2Mode" class="field-compact checkfield">
               <input v-model="state.applyCloudMask" type="checkbox" />
               <span>云掩膜</span>
             </label>
@@ -1466,7 +1640,7 @@ onBeforeUnmount(() => {
             <span>合成类型（{{ state.selectedComposites.length }} 个）</span>
             <div class="chips-compact">
               <button
-                v-for="item in state.composites.slice(0, 12)"
+                v-for="item in compositeOptions.slice(0, 12)"
                 :key="item.type"
                 class="chip-compact"
                 :class="{ active: state.selectedComposites.includes(item.type) }"
@@ -1474,8 +1648,8 @@ onBeforeUnmount(() => {
               >
                 {{ item.name }}
               </button>
-              <button v-if="state.composites.length > 12" class="chip-compact more" @click="switchTab('indices')">
-                +{{ state.composites.length - 12 }} 更多...
+              <button v-if="compositeOptions.length > 12" class="chip-compact more" @click="switchTab('indices')">
+                +{{ compositeOptions.length - 12 }} 更多...
               </button>
             </div>
           </div>
@@ -1540,6 +1714,40 @@ onBeforeUnmount(() => {
           <input v-model="state.previewPath" type="text" placeholder="路径" />
           <input v-model="state.previewSize" type="number" min="128" max="1024" style="width: 70px;" />
           <button class="btn-mini pri" @click="loadPreview()">加载</button>
+        </div>
+
+        <div class="binary-panel-compact">
+          <div class="binary-head-compact">
+            <strong>二值化与面积统计</strong>
+            <button class="btn-mini pri" :disabled="state.binaryRunning || !state.previewPath" @click="runBinarization">
+              {{ state.binaryRunning ? '处理中...' : '生成' }}
+            </button>
+          </div>
+          <div class="binary-controls-compact" :class="{ range: binaryNeedsUpperThreshold() }">
+            <select v-model="state.binaryComparison">
+              <option value="gte">≥ 阈值</option>
+              <option value="gt">&gt; 阈值</option>
+              <option value="lte">≤ 阈值</option>
+              <option value="lt">&lt; 阈值</option>
+              <option value="between">区间内</option>
+              <option value="outside">区间外</option>
+            </select>
+            <input v-model="state.binaryThreshold" type="number" step="0.0001" placeholder="阈值" />
+            <input
+              v-if="binaryNeedsUpperThreshold()"
+              v-model="state.binaryUpperThreshold"
+              type="number"
+              step="0.0001"
+              placeholder="上限"
+            />
+            <input v-model="state.binaryOutputPath" type="text" placeholder="输出路径（可选）" />
+          </div>
+          <div v-if="state.binaryResult" class="binary-stats-compact">
+            <span><strong>目标像元</strong>{{ formatNumber(state.binaryResult.stats.target_pixels, 0) }}</span>
+            <span><strong>占比</strong>{{ formatPercent(state.binaryResult.stats.target_ratio) }}</span>
+            <span><strong>面积</strong>{{ formatNumber(state.binaryResult.stats.target_area_ha) }} ha</span>
+            <span><strong>折合</strong>{{ formatNumber(state.binaryResult.stats.target_area_mu) }} 亩</span>
+          </div>
         </div>
 
         <div class="preview-frame-compact">
@@ -1705,6 +1913,72 @@ onBeforeUnmount(() => {
 .btn-mini.ghost {
   background: #fff;
   color: #33564b;
+}
+
+.binary-panel-compact {
+  display: grid;
+  gap: 10px;
+  padding: 10px;
+  border: 1px solid #d8e3df;
+  border-radius: 8px;
+  background: #f8fbfa;
+}
+
+.binary-head-compact {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.binary-head-compact strong {
+  font-size: 13px;
+  color: #1f312c;
+}
+
+.binary-controls-compact {
+  display: grid;
+  grid-template-columns: minmax(92px, 0.7fr) minmax(86px, 0.7fr) minmax(0, 1.6fr);
+  gap: 8px;
+}
+
+.binary-controls-compact.range {
+  grid-template-columns: minmax(92px, 0.7fr) minmax(86px, 0.6fr) minmax(86px, 0.6fr) minmax(0, 1.5fr);
+}
+
+.binary-controls-compact select,
+.binary-controls-compact input {
+  min-width: 0;
+  height: 34px;
+  border: 1px solid #d2dfdb;
+  border-radius: 8px;
+  padding: 0 9px;
+  background: #fff;
+  color: #20352f;
+}
+
+.binary-stats-compact {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.binary-stats-compact span {
+  min-width: 0;
+  padding: 8px 9px;
+  border-radius: 8px;
+  background: #fff;
+  border: 1px solid #e1e9e6;
+  color: #243932;
+  font-size: 12px;
+  word-break: break-word;
+}
+
+.binary-stats-compact strong {
+  display: block;
+  margin-bottom: 3px;
+  font-size: 10px;
+  color: #657871;
 }
 
 .server-root-meta {

@@ -37,6 +37,8 @@ frontend-vue/.vite-temp/
 # Docs - internal / thesis materials
 docs/proposal/
 docs/school/
+docs/standard/
+docs/thesis-prep/
 docs/figures/
 docs/archive/
 docs/*论文*
@@ -44,6 +46,7 @@ docs/*开题*
 docs/*答辩*
 docs/*proposal*
 docs/*thesis*
+tools/build_thesis_*.py
 
 # OS
 Thumbs.db

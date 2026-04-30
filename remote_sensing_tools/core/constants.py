@@ -30,6 +30,11 @@ OPTIONAL_OPTICAL_BANDS = ['B8', 'B9']  # B8全色, B9卷云
 # 热红外波段（需要不同的处理流程：DN->Radiance->Brightness Temperature）
 THERMAL_BANDS = ['B10', 'B11']
 
+# Sentinel-2 MSI L2A 表面反射率波段
+SENTINEL2_OPTICAL_BANDS = ['B01', 'B02', 'B03', 'B04', 'B05', 'B06', 'B07', 'B08', 'B8A', 'B09', 'B11', 'B12']
+SENTINEL2_CORE_L2A_BANDS = ['B01', 'B02', 'B03', 'B04', 'B08', 'B11', 'B12']
+SENTINEL2_CLASSIFICATION_BANDS = ['SCL']
+
 # Landsat 8 TIRS 热红外定标常数
 # 用于亮温计算: BT = K2 / ln(K1/L + 1)
 THERMAL_CONSTANTS = {
@@ -108,6 +113,9 @@ COMPOSITE_MAP = {
     'nbr': ['B5', 'B7'],                   # NBR: 归一化燃烧指数
     'bsi': ['B2', 'B4', 'B5', 'B6'],       # BSI: 裸土指数
     'ndsi': ['B3', 'B6'],                  # NDSI: 归一化积雪指数
+
+    # 大棚指数
+    'apgi': ['B01', 'B04', 'B08', 'B12'],  # APGI: Sentinel-2 塑料大棚指数
 }
 
 # 波段信息

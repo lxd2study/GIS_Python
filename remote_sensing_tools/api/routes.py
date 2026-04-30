@@ -13,7 +13,7 @@ from osgeo import gdal, ogr, osr
 
 from ..core.config import settings
 from ..core.constants import BAND_INFO, COMPOSITE_MAP
-from ..core.processor import Landsat8Processor
+from ..core.processor import Landsat8Processor, Sentinel2Processor
 from ..core.models import (
     BatchSubmitRequest,
     GraphSubmitRequest,
@@ -27,6 +27,7 @@ from ..core.models import (
     LandsatSearchRequest,
     TaskQueueItem,
 )
+from ..operations.raster_analysis import binarize_raster
 from ..services.file_manager import FileManager
 from ..services.progress import ProgressManager
 from ..services.batch_manager import BatchJobManager
@@ -34,11 +35,20 @@ from ..services.landsat_download import LandsatDownloadService
 from ..services.task_results import TaskResultService, write_task_manifest
 from ..services.templates import ProcessingTemplates
 from ..services.graph_executor import GraphExecutor
-from ..utils.file_utils import collect_band_paths, find_scene_support_files, infer_available_product_levels
+from ..utils.file_utils import (
+    collect_band_paths,
+    collect_sentinel2_band_paths,
+    detect_sensor_from_path,
+    detect_sentinel2_band_name,
+    find_scene_support_files,
+    find_sentinel2_support_files,
+    infer_available_product_levels,
+)
 from ..utils.path_policy import PathAccessController, PathAccessError
 
 logger = logging.getLogger(__name__)
 RASTER_PREVIEW_EXTENSIONS = (".tif", ".tiff", ".img", ".png")
+RASTER_WRITE_EXTENSIONS = (".tif", ".tiff", ".img")
 VECTOR_PREVIEW_EXTENSIONS = (".shp", ".geojson", ".json")
 # 单次写入 1MB，避免大文件上传时把整个文件一次性读入内存。
 UPLOAD_CHUNK_SIZE = 1024 * 1024
@@ -77,6 +87,9 @@ COMPOSITE_DESCRIPTIONS = {
     "nbr": ("NBR", "归一化燃烧指数 (NIR-SWIR2)/(NIR+SWIR2)", "火灾监测与燃烧程度评估"),
     "bsi": ("BSI", "裸土指数，用于裸土识别", "土壤侵蚀监测，裸地提取"),
     "ndsi": ("NDSI", "归一化积雪指数 (Green-SWIR1)/(Green+SWIR1)", "雪盖监测，冰川变化分析"),
+
+    # 大棚指数
+    "apgi": ("APGI", "Sentinel-2 大棚指数，使用 Coastal/Red/NIR/SWIR2", "塑料大棚提取与设施农业识别"),
 }
 
 
@@ -93,16 +106,34 @@ def _detect_upload_band_name(filename: str) -> Optional[str]:
     return None
 
 
+def _detect_upload_sentinel2_band_name(filename: str) -> Optional[str]:
+    return detect_sentinel2_band_name(filename)
+
+
 def _infer_product_level(name: str, filenames: Optional[List[str]] = None) -> str:
     normalized = (name or "").upper()
+    if "SENTINEL" in normalized or "L2A" in normalized or normalized.startswith(("S2A", "S2B", "S2C")):
+        return "L2A"
     if "_L2" in normalized or "L2SP" in normalized:
         return "L2"
 
     for filename in filenames or []:
         upper_name = filename.upper()
+        if "L2A" in upper_name or _detect_upload_sentinel2_band_name(filename):
+            return "L2A"
         if any(token in upper_name for token in ("_SR_B", "_ST_B", "_L2", "L2SP", "SURFACE_REFLECTANCE")):
             return "L2"
     return "L1"
+
+
+def _infer_sensor(name: str, filenames: Optional[List[str]] = None) -> str:
+    candidates = [name or "", *(filenames or [])]
+    for candidate in candidates:
+        path = Path(candidate)
+        sensor = detect_sensor_from_path(path)
+        if sensor:
+            return sensor
+    return "landsat"
 
 
 def _find_first_matching_file(scene_path: Path, patterns: List[str]) -> Optional[str]:
@@ -123,12 +154,16 @@ async def _save_upload(upload: UploadFile, target_path: str) -> None:
             file_obj.write(chunk)
 
 
-async def _save_band_uploads(bands: List[UploadFile], target_dir: str) -> Dict[str, str]:
+async def _save_band_uploads(bands: List[UploadFile], target_dir: str, *, sensor: str = "landsat") -> Dict[str, str]:
     """Save uploaded band files and return a {band_name: file_path} mapping."""
     band_paths: Dict[str, str] = {}
     for band_file in bands:
         filename = band_file.filename or ""
-        band_name = _detect_upload_band_name(filename)
+        band_name = (
+            _detect_upload_sentinel2_band_name(filename)
+            if sensor == "sentinel-2"
+            else _detect_upload_band_name(filename)
+        )
         if not band_name:
             logger.warning("无法识别波段编号，已跳过: %s", filename)
             continue
@@ -158,6 +193,7 @@ def _build_summary(
         "output_directory": os.path.normpath(output_dir),
         "product_level": result.get("product_level"),
         "processing_mode": result.get("processing_mode"),
+        "sensor": result.get("sensor"),
     }
 
 
@@ -203,12 +239,14 @@ async def _prepare_async_preprocess_inputs(
     shape_dir: str,
     file_manager: FileManager,
     progress_manager: ProgressManager,
+    sensor: str = "landsat",
 ) -> Dict:
-    band_paths = await _save_band_uploads(bands, band_dir)
+    band_paths = await _save_band_uploads(bands, band_dir, sensor=sensor)
     if not band_paths:
+        expected = "B01/B02/B03/B04/B08/B11/B12" if sensor == "sentinel-2" else "B1-B11"
         raise HTTPException(
             status_code=400,
-            detail="未识别到有效波段文件，请确保文件名中含有 B1-B11 标识",
+            detail=f"未识别到有效波段文件，请确保文件名中含有 {expected} 标识",
         )
 
     progress_manager.update_progress(
@@ -328,8 +366,9 @@ def _run_async_preprocess_job(
     custom_formula: Optional[str],
     custom_name: Optional[str],
     cleanup_temp_dir: Optional[str],
+    processor_class=Landsat8Processor,
 ) -> None:
-    processor = Landsat8Processor()
+    processor = processor_class()
 
     try:
         result = processor.one_click_preprocess(
@@ -555,14 +594,42 @@ def _resolve_raster_preview_target(path_value: str, product_level: Optional[str]
         )
 
     target_dir = PATH_ACCESS.require_directory(path_value, access_label="读取场景目录")
-    band_paths = collect_band_paths(target_dir, product_level=product_level)
-    preferred_band = next((band_paths.get(band) for band in ("B4", "B3", "B2", "B5") if band_paths.get(band)), None)
+    normalized_level = str(product_level or "").strip().upper()
+    if normalized_level == "L2A" or detect_sensor_from_path(target_dir) == "sentinel-2":
+        band_paths = collect_sentinel2_band_paths(target_dir, product_level="L2A")
+        preferred_band = next((band_paths.get(band) for band in ("B04", "B03", "B02", "B08") if band_paths.get(band)), None)
+    else:
+        band_paths = collect_band_paths(target_dir, product_level=product_level)
+        preferred_band = next((band_paths.get(band) for band in ("B4", "B3", "B2", "B5") if band_paths.get(band)), None)
     raster_path = preferred_band or next(iter(sorted(band_paths.values())))
     return PATH_ACCESS.require_file(
         raster_path,
         access_label="读取场景代表波段",
         allowed_suffixes=RASTER_PREVIEW_EXTENSIONS,
     )
+
+
+def _resolve_raster_output_path(input_path: Path, output_path: Optional[str], default_suffix: str) -> Path:
+    if output_path and str(output_path).strip():
+        candidate = Path(str(output_path).strip())
+        if not candidate.suffix:
+            candidate = candidate.with_suffix(".tif")
+        if candidate.suffix.lower() not in RASTER_WRITE_EXTENSIONS:
+            raise PathAccessError(
+                f"不支持的输出文件类型: {candidate.suffix}。允许的扩展名: {', '.join(RASTER_WRITE_EXTENSIONS)}",
+                status_code=400,
+            )
+
+        output_dir_raw = candidate.parent if str(candidate.parent) not in {"", "."} else input_path.parent
+        output_dir = PATH_ACCESS.require_directory(
+            output_dir_raw,
+            access_label="写入二值化结果目录",
+            must_exist=False,
+            allow_create=True,
+        )
+        return output_dir / candidate.name
+
+    return input_path.with_name(f"{input_path.stem}{default_suffix}.tif")
 
 
 def _raster_dataset_payload(raster_path: str, *, label: str) -> Dict:
@@ -747,10 +814,12 @@ def setup_routes(
             "usage": "可通过 frontend-vue 前端项目调用 API，或通过 /docs 调用 API",
             "core_endpoints": [
                 "/preprocess_landsat8_async",
+                "/preprocess_sentinel2_async",
                 "/preprocess_landsat8_status/{job_id}",
                 "/composite_types",
                 "/band_info",
                 "/preview_raster",
+                "/raster/binarize",
                 "/filesystem/list_dirs",
             ],
             "batch_endpoints": [
@@ -950,6 +1019,18 @@ def setup_routes(
         except KeyError:
             raise HTTPException(status_code=404, detail=f"下载任务不存在: {task_id}")
 
+    @app.post("/imagery/download_tasks/{task_id}/retry")
+    def imagery_retry_download(task_id: str) -> Dict:
+        try:
+            return landsat_download_service.retry_download_task(task_id)
+        except KeyError:
+            raise HTTPException(status_code=404, detail=f"下载任务不存在: {task_id}")
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        except Exception as exc:
+            logger.error("重新启动影像下载任务失败: %s", exc, exc_info=True)
+            raise HTTPException(status_code=500, detail=f"重新下载失败: {exc}")
+
     @app.get("/imagery/download_tasks/{task_id}/file")
     async def imagery_download_task_file(task_id: str):
         try:
@@ -1105,6 +1186,18 @@ def setup_routes(
             return landsat_download_service.cancel_download_task(task_id, sensor="landsat")
         except KeyError:
             raise HTTPException(status_code=404, detail=f"下载任务不存在: {task_id}")
+
+    @app.post("/landsat/download_tasks/{task_id}/retry")
+    def landsat_retry_download(task_id: str) -> Dict:
+        try:
+            return landsat_download_service.retry_download_task(task_id, sensor="landsat")
+        except KeyError:
+            raise HTTPException(status_code=404, detail=f"下载任务不存在: {task_id}")
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        except Exception as exc:
+            logger.error("重新启动 Landsat 下载任务失败: %s", exc, exc_info=True)
+            raise HTTPException(status_code=500, detail=f"重新下载失败: {exc}")
 
     @app.get("/landsat/download_tasks/{task_id}/file")
     async def landsat_download_task_file(task_id: str):
@@ -1283,25 +1376,47 @@ def setup_routes(
                                 has_shp = True
                                 shp_file = normalized_shp
                                 break
+                    filenames = [str(child.relative_to(scene_path)) for child in scene_path.rglob("*") if child.is_file()]
+                    sensor = detect_sensor_from_path(scene_path) or _infer_sensor(entry.name, filenames)
                     available_product_levels = infer_available_product_levels(scene_path)
+                    if sensor == "sentinel-2" and "L2A" not in available_product_levels:
+                        available_product_levels = [*available_product_levels, "L2A"]
+
                     if available_product_levels:
-                        product_level = "L2" if "L2" in available_product_levels else available_product_levels[0]
+                        if "L2A" in available_product_levels:
+                            product_level = "L2A"
+                        elif "L2" in available_product_levels:
+                            product_level = "L2"
+                        else:
+                            product_level = available_product_levels[0]
                     else:
-                        filenames = [child.name for child in scene_path.iterdir() if child.is_file()]
                         product_level = _infer_product_level(entry.name, filenames)
                         available_product_levels = [product_level]
 
-                    product_files = {
-                        level: {
+                    product_files = {}
+                    for level in available_product_levels:
+                        support_lookup = (
+                            find_sentinel2_support_files(scene_path, product_level=level)
+                            if level == "L2A"
+                            else find_scene_support_files(scene_path, product_level=level)
+                        )
+                        product_files[level] = {
                             key: _optional_allowed_file(
                                 value,
                                 access_label=f"读取场景 {level} 辅助文件",
                             )
-                            for key, value in find_scene_support_files(scene_path, product_level=level).items()
+                            for key, value in support_lookup.items()
                         }
-                        for level in available_product_levels
-                    }
                     scene_files = product_files.get(product_level, {})
+                    available_bands = []
+                    try:
+                        if product_level == "L2A":
+                            available_bands = sorted(collect_sentinel2_band_paths(scene_path, product_level="L2A").keys())
+                        else:
+                            available_bands = sorted(collect_band_paths(scene_path, product_level=product_level).keys())
+                    except Exception as exc:
+                        logger.warning("场景 %s 波段列表读取失败: %s", scene_path, exc)
+
                     footprint_bbox = None
                     footprint_raster_path = None
                     try:
@@ -1316,13 +1431,16 @@ def setup_routes(
                         "id": str(scene_path),
                         "name": entry.name,
                         "path": str(scene_path),
+                        "sensor": sensor,
                         "has_shp": has_shp,
                         "shp_file": shp_file,
                         "mtl_file": scene_files.get("mtl_file"),
                         "qa_band": scene_files.get("qa_band"),
                         "qa_radsat_band": scene_files.get("qa_radsat_band"),
+                        "scl_file": scene_files.get("scl_file"),
                         "product_level": product_level,
                         "available_product_levels": available_product_levels,
+                        "available_bands": available_bands,
                         "product_files": product_files,
                         "footprint_bbox": footprint_bbox,
                         "footprint_raster_path": footprint_raster_path,
@@ -1355,8 +1473,51 @@ def setup_routes(
             logger.error("预览栅格失败: %s", exc)
             raise HTTPException(status_code=500, detail=f"预览失败: {exc}")
 
+    @app.post("/raster/binarize")
+    def binarize_raster_endpoint(
+        file_path: str = Form(..., description="待二值化 GeoTIFF/IMG 文件路径"),
+        threshold: float = Form(..., description="阈值或下限阈值"),
+        comparison: str = Form("gte", description="比较方式: gt/gte/lt/lte/eq/between/outside"),
+        upper_threshold: Optional[float] = Form(None, description="between/outside 使用的上限阈值"),
+        output_path: Optional[str] = Form(None, description="可选输出路径，默认写入输入文件同目录"),
+    ) -> Dict:
+        try:
+            raster_path = PATH_ACCESS.require_file(
+                file_path,
+                access_label="读取二值化输入栅格",
+                allowed_suffixes=RASTER_WRITE_EXTENSIONS,
+            )
+            binary_output_path = _resolve_raster_output_path(
+                raster_path,
+                output_path,
+                default_suffix="_binary",
+            )
+        except PathAccessError as exc:
+            _raise_path_access_http_error(exc)
+
+        try:
+            return binarize_raster(
+                str(raster_path),
+                str(binary_output_path),
+                threshold=threshold,
+                comparison=comparison,
+                upper_threshold=upper_threshold,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        except Exception as exc:
+            logger.error("栅格二值化失败: %s", exc, exc_info=True)
+            raise HTTPException(status_code=500, detail=f"栅格二值化失败: {exc}")
+
     @app.get("/preprocess_landsat8_status/{job_id}")
     def preprocess_landsat8_status(job_id: str):
+        task = progress_manager.get_progress(job_id)
+        if not task:
+            raise HTTPException(status_code=404, detail="任务不存在或已超时")
+        return task
+
+    @app.get("/preprocess_sentinel2_status/{job_id}")
+    def preprocess_sentinel2_status(job_id: str):
         task = progress_manager.get_progress(job_id)
         if not task:
             raise HTTPException(status_code=404, detail="任务不存在或已超时")
@@ -1602,6 +1763,207 @@ def setup_routes(
             custom_formula=custom_formula,
             custom_name=custom_name,
             cleanup_temp_dir=temp_dir,
+        )
+        return {"job_id": job_id, "status": "processing"}
+
+    @app.post("/filesystem/preprocess_sentinel2_async")
+    async def preprocess_sentinel2_from_filesystem_async(
+        scene_path: str = Form(..., description="服务端 Sentinel-2 L2A 场景目录路径"),
+        output_dir: str = Form(..., description="输出目录路径"),
+        clip_extent: Optional[str] = Form(None, description="裁剪范围：xmin,ymin,xmax,ymax"),
+        clip_shapefile: Optional[List[UploadFile]] = File(None, description="裁剪矢量文件"),
+        create_composites: Optional[str] = Form(None, description="合成类型，如 true_color,apgi"),
+        custom_formula: Optional[str] = Form(None, description="自定义指数公式"),
+        custom_name: Optional[str] = Form(None, description="自定义指数名称"),
+        product_level: str = Form("L2A", description="Sentinel-2 产品级别，当前仅支持 L2A"),
+    ) -> Dict:
+        if str(product_level or "L2A").strip().upper() != "L2A":
+            raise HTTPException(status_code=400, detail="Sentinel-2 当前仅支持 L2A")
+
+        try:
+            scene_dir = PATH_ACCESS.require_directory(
+                scene_path,
+                access_label="读取 Sentinel-2 场景目录",
+            )
+        except PathAccessError as exc:
+            _raise_path_access_http_error(exc)
+
+        try:
+            output_dir = str(
+                PATH_ACCESS.require_directory(
+                    output_dir,
+                    access_label="写入输出目录",
+                    must_exist=False,
+                    allow_create=True,
+                )
+            )
+        except PathAccessError as exc:
+            _raise_path_access_http_error(exc)
+
+        job_id = str(uuid.uuid4())
+        progress_manager.init_progress(job_id)
+
+        temp_dir: Optional[str] = None
+        try:
+            band_paths = collect_sentinel2_band_paths(scene_dir, product_level="L2A")
+            band_paths = {
+                band_name: str(
+                    PATH_ACCESS.require_file(
+                        band_path,
+                        access_label="读取 Sentinel-2 波段文件",
+                    )
+                )
+                for band_name, band_path in band_paths.items()
+            }
+
+            shapefile_path = None
+            if clip_shapefile:
+                temp_dir = file_manager.create_temp_dir(prefix=f"sentinel2_scene_{job_id}_")
+                shape_dir = os.path.join(temp_dir, "shapefile")
+                os.makedirs(shape_dir, exist_ok=True)
+                shapefile_path = file_manager.save_shapefiles(clip_shapefile, shape_dir)
+
+            extent_list = file_manager.parse_extent(clip_extent)
+            composite_list = file_manager.parse_composites(create_composites)
+            Path(output_dir).mkdir(parents=True, exist_ok=True)
+
+            progress_manager.update_progress(
+                job_id,
+                status="processing",
+                step_id="upload",
+                step_status="completed",
+                progress=10,
+                detail=f"已加载 Sentinel-2 场景: {scene_dir.name}",
+            )
+        except ValueError as exc:
+            if temp_dir:
+                file_manager.cleanup_temp_dir(temp_dir)
+            progress_manager.remove_progress(job_id)
+            raise HTTPException(status_code=400, detail=str(exc))
+        except HTTPException:
+            if temp_dir:
+                file_manager.cleanup_temp_dir(temp_dir)
+            progress_manager.remove_progress(job_id)
+            raise
+        except PathAccessError as exc:
+            if temp_dir:
+                file_manager.cleanup_temp_dir(temp_dir)
+            progress_manager.remove_progress(job_id)
+            _raise_path_access_http_error(exc)
+        except Exception as exc:
+            if temp_dir:
+                file_manager.cleanup_temp_dir(temp_dir)
+            progress_manager.remove_progress(job_id)
+            logger.error("Sentinel-2 目录任务初始化失败: %s", exc, exc_info=True)
+            raise HTTPException(status_code=500, detail=f"任务初始化失败: {exc}")
+
+        _launch_async_preprocess(
+            progress_manager=progress_manager,
+            file_manager=file_manager,
+            job_id=job_id,
+            band_paths=band_paths,
+            output_dir=output_dir,
+            mtl_path=None,
+            qa_path=None,
+            qa_radsat_path=None,
+            extent_list=extent_list,
+            shapefile_path=shapefile_path,
+            composite_list=composite_list,
+            apply_cloud_mask=False,
+            atm_correction_method="NONE",
+            product_level="L2A",
+            custom_formula=custom_formula,
+            custom_name=custom_name,
+            cleanup_temp_dir=temp_dir,
+            processor_class=Sentinel2Processor,
+        )
+        return {"job_id": job_id, "status": "processing"}
+
+    @app.post("/preprocess_sentinel2_async")
+    async def preprocess_sentinel2_async(
+        bands: List[UploadFile] = File(..., description="Sentinel-2 L2A 波段文件列表"),
+        output_dir: str = Form(..., description="输出目录路径"),
+        clip_extent: Optional[str] = Form(None, description="裁剪范围：xmin,ymin,xmax,ymax"),
+        clip_shapefile: Optional[List[UploadFile]] = File(None, description="裁剪矢量文件"),
+        create_composites: Optional[str] = Form(None, description="合成类型，如 true_color,apgi"),
+        custom_formula: Optional[str] = Form(None, description="自定义指数公式"),
+        custom_name: Optional[str] = Form(None, description="自定义指数名称"),
+        product_level: str = Form("L2A", description="Sentinel-2 产品级别，当前仅支持 L2A"),
+    ) -> Dict:
+        if not bands:
+            raise HTTPException(status_code=400, detail="必须上传至少一个 Sentinel-2 波段文件")
+        if str(product_level or "L2A").strip().upper() != "L2A":
+            raise HTTPException(status_code=400, detail="Sentinel-2 当前仅支持 L2A")
+
+        try:
+            output_dir = str(
+                PATH_ACCESS.require_directory(
+                    output_dir,
+                    access_label="写入输出目录",
+                    must_exist=False,
+                    allow_create=True,
+                )
+            )
+        except PathAccessError as exc:
+            _raise_path_access_http_error(exc)
+
+        job_id = str(uuid.uuid4())
+        progress_manager.init_progress(job_id)
+
+        temp_dir = file_manager.create_temp_dir(prefix=f"sentinel2_{job_id}_")
+        band_dir = os.path.join(temp_dir, "bands")
+        shape_dir = os.path.join(temp_dir, "shapefile")
+        os.makedirs(band_dir, exist_ok=True)
+        os.makedirs(shape_dir, exist_ok=True)
+
+        try:
+            preprocess_inputs = await _prepare_async_preprocess_inputs(
+                job_id=job_id,
+                bands=bands,
+                mtl_file=None,
+                qa_band=None,
+                qa_radsat_band=None,
+                output_dir=output_dir,
+                clip_extent=clip_extent,
+                clip_shapefile=clip_shapefile,
+                create_composites=create_composites,
+                temp_dir=temp_dir,
+                band_dir=band_dir,
+                shape_dir=shape_dir,
+                file_manager=file_manager,
+                progress_manager=progress_manager,
+                sensor="sentinel-2",
+            )
+        except HTTPException:
+            _cleanup_failed_preprocess_setup(file_manager, progress_manager, temp_dir, job_id)
+            raise
+        except ValueError as exc:
+            _cleanup_failed_preprocess_setup(file_manager, progress_manager, temp_dir, job_id)
+            raise HTTPException(status_code=400, detail=str(exc))
+        except Exception as exc:
+            _cleanup_failed_preprocess_setup(file_manager, progress_manager, temp_dir, job_id)
+            logger.error("Sentinel-2 上传任务初始化失败: %s", exc, exc_info=True)
+            raise HTTPException(status_code=500, detail=f"任务初始化失败: {exc}")
+
+        _launch_async_preprocess(
+            progress_manager=progress_manager,
+            file_manager=file_manager,
+            job_id=job_id,
+            band_paths=preprocess_inputs["band_paths"],
+            output_dir=output_dir,
+            mtl_path=None,
+            qa_path=None,
+            qa_radsat_path=None,
+            extent_list=preprocess_inputs["extent_list"],
+            shapefile_path=preprocess_inputs["shapefile_path"],
+            composite_list=preprocess_inputs["composite_list"],
+            apply_cloud_mask=False,
+            atm_correction_method="NONE",
+            product_level="L2A",
+            custom_formula=custom_formula,
+            custom_name=custom_name,
+            cleanup_temp_dir=temp_dir,
+            processor_class=Sentinel2Processor,
         )
         return {"job_id": job_id, "status": "processing"}
 

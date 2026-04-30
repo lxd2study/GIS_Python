@@ -10,6 +10,50 @@ from typing import Dict, List
 from ..core.constants import COMPOSITE_MAP
 
 
+SENTINEL2_BANDS = {'B01', 'B02', 'B03', 'B04', 'B05', 'B06', 'B07', 'B08', 'B8A', 'B09', 'B11', 'B12'}
+
+SENTINEL2_COMPOSITE_MAP = {
+    'true_color': ['B04', 'B03', 'B02'],
+    'false_color': ['B08', 'B04', 'B03'],
+    'agriculture': ['B11', 'B08', 'B02'],
+    'urban': ['B12', 'B11', 'B04'],
+    'natural_color': ['B04', 'B03', 'B02'],
+    'swir': ['B12', 'B08', 'B03'],
+    'ndvi': ['B08', 'B04'],
+    'evi': ['B08', 'B04', 'B02'],
+    'savi': ['B08', 'B04'],
+    'msavi': ['B08', 'B04'],
+    'arvi': ['B08', 'B04', 'B02'],
+    'rvi': ['B08', 'B04'],
+    'ndwi': ['B03', 'B08'],
+    'mndwi': ['B03', 'B11'],
+    'awei': ['B02', 'B03', 'B08', 'B11', 'B12'],
+    'wri': ['B03', 'B04', 'B08', 'B11'],
+    'ndbi': ['B11', 'B08'],
+    'ibi': ['B02', 'B03', 'B04', 'B08', 'B11'],
+    'ndbai': ['B11', 'B12'],
+    'ui': ['B12', 'B08'],
+    'nbr': ['B08', 'B12'],
+    'bsi': ['B02', 'B04', 'B08', 'B11'],
+    'ndsi': ['B03', 'B11'],
+    'apgi': ['B01', 'B04', 'B08', 'B12'],
+}
+
+
+def _is_sentinel2_band_set(band_paths: Dict[str, str]) -> bool:
+    return any(str(band_name).upper() in SENTINEL2_BANDS for band_name in band_paths)
+
+
+def _resolve_composite_bands(composite_type: str, band_paths: Dict[str, str]) -> List[str]:
+    if _is_sentinel2_band_set(band_paths):
+        return SENTINEL2_COMPOSITE_MAP.get(composite_type, COMPOSITE_MAP[composite_type])
+    return COMPOSITE_MAP[composite_type]
+
+
+def _resolve_band_name(band_paths: Dict[str, str], landsat_band: str, sentinel2_band: str) -> str:
+    return sentinel2_band if _is_sentinel2_band_set(band_paths) else landsat_band
+
+
 def create_composite(band_paths: Dict[str, str],
                     output_path: str,
                     composite_type: str = 'true_color') -> str:
@@ -27,7 +71,7 @@ def create_composite(band_paths: Dict[str, str],
     if composite_type not in COMPOSITE_MAP:
         raise Exception(f"不支持的合成类型: {composite_type}")
 
-    bands_to_use = COMPOSITE_MAP[composite_type]
+    bands_to_use = _resolve_composite_bands(composite_type, band_paths)
 
     # Special handling for indices
     index_types = (
@@ -35,7 +79,8 @@ def create_composite(band_paths: Dict[str, str],
         'savi', 'msavi', 'arvi', 'rvi',
         'mndwi', 'awei', 'wri',
         'ibi', 'ndbai', 'ui',
-        'nbr', 'bsi', 'ndsi'
+        'nbr', 'bsi', 'ndsi',
+        'apgi',
     )
 
     if composite_type in index_types:
@@ -57,6 +102,7 @@ def create_composite(band_paths: Dict[str, str],
             'nbr': create_nbr,
             'bsi': create_bsi,
             'ndsi': create_ndsi,
+            'apgi': create_apgi,
         }
         return index_creators[composite_type](band_paths, output_path)
 
@@ -160,7 +206,7 @@ def create_composite(band_paths: Dict[str, str],
     return output_path
 
 
-BAND_NAME_RE = re.compile(r'^B(?:[1-9]|1[0-1])$')
+BAND_NAME_RE = re.compile(r'^B(?:0[1-9]|1[0-2]|8A|[1-9]|1[0-1])$')
 ALLOWED_FUNCTIONS = {
     'abs': np.abs,
     'sqrt': np.sqrt,
@@ -181,6 +227,60 @@ def _get_processed_band_path(band_paths: Dict[str, str], band_name: str) -> str:
     return band_path
 
 
+def _get_index_band_path(band_paths: Dict[str, str], landsat_band: str, sentinel2_band: str) -> str:
+    return _get_processed_band_path(
+        band_paths,
+        _resolve_band_name(band_paths, landsat_band, sentinel2_band),
+    )
+
+
+def _reference_output_bounds(reference_ds: gdal.Dataset):
+    geo_transform = reference_ds.GetGeoTransform(can_return_null=True)
+    if geo_transform is None:
+        return None
+
+    width = reference_ds.RasterXSize
+    height = reference_ds.RasterYSize
+    corners = [
+        (0, 0),
+        (width, 0),
+        (width, height),
+        (0, height),
+    ]
+    xs = [
+        geo_transform[0] + pixel_x * geo_transform[1] + pixel_y * geo_transform[2]
+        for pixel_x, pixel_y in corners
+    ]
+    ys = [
+        geo_transform[3] + pixel_x * geo_transform[4] + pixel_y * geo_transform[5]
+        for pixel_x, pixel_y in corners
+    ]
+    return (min(xs), min(ys), max(xs), max(ys))
+
+
+def _same_geotransform(first, second, tolerance: float = 1e-9) -> bool:
+    if first is None or second is None:
+        return first is None and second is None
+    return all(abs(float(a) - float(b)) <= tolerance for a, b in zip(first, second))
+
+
+def _matches_reference_grid(dataset: gdal.Dataset, reference_ds: gdal.Dataset) -> bool:
+    if dataset.RasterXSize != reference_ds.RasterXSize or dataset.RasterYSize != reference_ds.RasterYSize:
+        return False
+
+    dataset_gt = dataset.GetGeoTransform(can_return_null=True)
+    reference_gt = reference_ds.GetGeoTransform(can_return_null=True)
+    if not _same_geotransform(dataset_gt, reference_gt):
+        return False
+
+    dataset_projection = dataset.GetProjection()
+    reference_projection = reference_ds.GetProjection()
+    if dataset_projection and reference_projection and dataset_projection != reference_projection:
+        return False
+
+    return True
+
+
 def _read_band_array(band_path: str, reference_ds: gdal.Dataset = None) -> np.ndarray:
     dataset = gdal.Open(band_path)
     if dataset is None:
@@ -189,16 +289,19 @@ def _read_band_array(band_path: str, reference_ds: gdal.Dataset = None) -> np.nd
     band = dataset.GetRasterBand(1)
     nodata = band.GetNoDataValue()
 
-    if reference_ds and (
-        dataset.RasterXSize != reference_ds.RasterXSize
-        or dataset.RasterYSize != reference_ds.RasterYSize
-    ):
+    if reference_ds and not _matches_reference_grid(dataset, reference_ds):
         warp_kwargs = {
             'format': 'MEM',
             'width': reference_ds.RasterXSize,
             'height': reference_ds.RasterYSize,
             'resampleAlg': gdal.GRA_Bilinear,
         }
+        output_bounds = _reference_output_bounds(reference_ds)
+        if output_bounds:
+            warp_kwargs['outputBounds'] = output_bounds
+        reference_projection = reference_ds.GetProjection()
+        if reference_projection:
+            warp_kwargs['dstSRS'] = reference_projection
         if nodata is not None:
             warp_kwargs['srcNodata'] = nodata
             warp_kwargs['dstNodata'] = nodata
@@ -316,17 +419,29 @@ def _normalized_difference_index(band_paths: Dict[str, str], output_path: str,
 
 
 def create_ndwi(band_paths: Dict[str, str], output_path: str) -> str:
-    return _normalized_difference_index(band_paths, output_path, 'B3', 'B5', 'NDWI')
+    return _normalized_difference_index(
+        band_paths,
+        output_path,
+        _resolve_band_name(band_paths, 'B3', 'B03'),
+        _resolve_band_name(band_paths, 'B5', 'B08'),
+        'NDWI',
+    )
 
 
 def create_ndbi(band_paths: Dict[str, str], output_path: str) -> str:
-    return _normalized_difference_index(band_paths, output_path, 'B6', 'B5', 'NDBI')
+    return _normalized_difference_index(
+        band_paths,
+        output_path,
+        _resolve_band_name(band_paths, 'B6', 'B11'),
+        _resolve_band_name(band_paths, 'B5', 'B08'),
+        'NDBI',
+    )
 
 
 def create_evi(band_paths: Dict[str, str], output_path: str) -> str:
-    nir_path = _get_processed_band_path(band_paths, 'B5')
-    red_path = _get_processed_band_path(band_paths, 'B4')
-    blue_path = _get_processed_band_path(band_paths, 'B2')
+    nir_path = _get_index_band_path(band_paths, 'B5', 'B08')
+    red_path = _get_index_band_path(band_paths, 'B4', 'B04')
+    blue_path = _get_index_band_path(band_paths, 'B2', 'B02')
 
     reference_ds = gdal.Open(nir_path)
     if reference_ds is None:
@@ -456,7 +571,13 @@ def create_custom_index(band_paths: Dict[str, str], output_path: str, formula: s
 
 def create_ndvi(band_paths: Dict[str, str], output_path: str) -> str:
     """创建NDVI (归一化植被指数) -- NDVI = (NIR - Red) / (NIR + Red)"""
-    return _normalized_difference_index(band_paths, output_path, 'B5', 'B4', 'NDVI')
+    return _normalized_difference_index(
+        band_paths,
+        output_path,
+        _resolve_band_name(band_paths, 'B5', 'B08'),
+        _resolve_band_name(band_paths, 'B4', 'B04'),
+        'NDVI',
+    )
 
 
 # ============================================================================
@@ -475,8 +596,8 @@ def create_savi(band_paths: Dict[str, str], output_path: str, L: float = 0.5) ->
 
     用途：在植被稀疏、土壤背景影响大的区域，SAVI比NDVI更准确
     """
-    nir_path = _get_processed_band_path(band_paths, 'B5')
-    red_path = _get_processed_band_path(band_paths, 'B4')
+    nir_path = _get_index_band_path(band_paths, 'B5', 'B08')
+    red_path = _get_index_band_path(band_paths, 'B4', 'B04')
 
     reference_ds = gdal.Open(nir_path)
     if reference_ds is None:
@@ -507,8 +628,8 @@ def create_msavi(band_paths: Dict[str, str], output_path: str) -> str:
     相比SAVI，MSAVI不需要人工设定L参数，可自适应土壤背景
     用途：植被覆盖度变化大的区域，比SAVI和NDVI更稳健
     """
-    nir_path = _get_processed_band_path(band_paths, 'B5')
-    red_path = _get_processed_band_path(band_paths, 'B4')
+    nir_path = _get_index_band_path(band_paths, 'B5', 'B08')
+    red_path = _get_index_band_path(band_paths, 'B4', 'B04')
 
     reference_ds = gdal.Open(nir_path)
     if reference_ds is None:
@@ -539,9 +660,9 @@ def create_arvi(band_paths: Dict[str, str], output_path: str, gamma: float = 1.0
 
     用途：大气效应明显的区域（薄雾、气溶胶），比NDVI更抗干扰
     """
-    nir_path = _get_processed_band_path(band_paths, 'B5')
-    red_path = _get_processed_band_path(band_paths, 'B4')
-    blue_path = _get_processed_band_path(band_paths, 'B2')
+    nir_path = _get_index_band_path(band_paths, 'B5', 'B08')
+    red_path = _get_index_band_path(band_paths, 'B4', 'B04')
+    blue_path = _get_index_band_path(band_paths, 'B2', 'B02')
 
     reference_ds = gdal.Open(nir_path)
     if reference_ds is None:
@@ -574,8 +695,8 @@ def create_rvi(band_paths: Dict[str, str], output_path: str) -> str:
     用途：植被监测，简单直观，但对土壤背景敏感
     注意：无归一化，值域为[0, +∞)
     """
-    nir_path = _get_processed_band_path(band_paths, 'B5')
-    red_path = _get_processed_band_path(band_paths, 'B4')
+    nir_path = _get_index_band_path(band_paths, 'B5', 'B08')
+    red_path = _get_index_band_path(band_paths, 'B4', 'B04')
 
     reference_ds = gdal.Open(nir_path)
     if reference_ds is None:
@@ -605,7 +726,13 @@ def create_mndwi(band_paths: Dict[str, str], output_path: str) -> str:
     相比NDWI，MNDWI使用SWIR1代替NIR，更能抑制建筑物噪声
     用途：城市区域水体提取，比NDWI更准确
     """
-    return _normalized_difference_index(band_paths, output_path, 'B3', 'B6', 'MNDWI')
+    return _normalized_difference_index(
+        band_paths,
+        output_path,
+        _resolve_band_name(band_paths, 'B3', 'B03'),
+        _resolve_band_name(band_paths, 'B6', 'B11'),
+        'MNDWI',
+    )
 
 
 def create_awei(band_paths: Dict[str, str], output_path: str, use_shadow: bool = False) -> str:
@@ -617,8 +744,8 @@ def create_awei(band_paths: Dict[str, str], output_path: str, use_shadow: bool =
 
     用途：自动化水体提取，特别适合有阴影的复杂场景
     """
-    green_path = _get_processed_band_path(band_paths, 'B3')
-    swir1_path = _get_processed_band_path(band_paths, 'B6')
+    green_path = _get_index_band_path(band_paths, 'B3', 'B03')
+    swir1_path = _get_index_band_path(band_paths, 'B6', 'B11')
 
     reference_ds = gdal.Open(green_path)
     if reference_ds is None:
@@ -629,9 +756,9 @@ def create_awei(band_paths: Dict[str, str], output_path: str, use_shadow: bool =
 
     if use_shadow:
         # AWEI_sh
-        blue_path = _get_processed_band_path(band_paths, 'B2')
-        nir_path = _get_processed_band_path(band_paths, 'B5')
-        swir2_path = _get_processed_band_path(band_paths, 'B7')
+        blue_path = _get_index_band_path(band_paths, 'B2', 'B02')
+        nir_path = _get_index_band_path(band_paths, 'B5', 'B08')
+        swir2_path = _get_index_band_path(band_paths, 'B7', 'B12')
 
         blue = _read_band_array(blue_path, reference_ds)
         nir = _read_band_array(nir_path, reference_ds)
@@ -640,8 +767,8 @@ def create_awei(band_paths: Dict[str, str], output_path: str, use_shadow: bool =
         awei = blue + 2.5 * green - 1.5 * (nir + swir1) - 0.25 * swir2
     else:
         # AWEI_nsh
-        nir_path = _get_processed_band_path(band_paths, 'B5')
-        swir2_path = _get_processed_band_path(band_paths, 'B7')
+        nir_path = _get_index_band_path(band_paths, 'B5', 'B08')
+        swir2_path = _get_index_band_path(band_paths, 'B7', 'B12')
 
         nir = _read_band_array(nir_path, reference_ds)
         swir2 = _read_band_array(swir2_path, reference_ds)
@@ -663,10 +790,10 @@ def create_wri(band_paths: Dict[str, str], output_path: str) -> str:
 
     用途：水体识别，对浅水和浑浊水体效果好
     """
-    green_path = _get_processed_band_path(band_paths, 'B3')
-    red_path = _get_processed_band_path(band_paths, 'B4')
-    nir_path = _get_processed_band_path(band_paths, 'B5')
-    swir1_path = _get_processed_band_path(band_paths, 'B6')
+    green_path = _get_index_band_path(band_paths, 'B3', 'B03')
+    red_path = _get_index_band_path(band_paths, 'B4', 'B04')
+    nir_path = _get_index_band_path(band_paths, 'B5', 'B08')
+    swir1_path = _get_index_band_path(band_paths, 'B6', 'B11')
 
     reference_ds = gdal.Open(green_path)
     if reference_ds is None:
@@ -700,10 +827,10 @@ def create_ibi(band_paths: Dict[str, str], output_path: str) -> str:
     用途：城市建筑区提取，比单一NDBI更准确
     """
     # 先计算NDBI
-    swir1_path = _get_processed_band_path(band_paths, 'B6')
-    nir_path = _get_processed_band_path(band_paths, 'B5')
-    red_path = _get_processed_band_path(band_paths, 'B4')
-    green_path = _get_processed_band_path(band_paths, 'B3')
+    swir1_path = _get_index_band_path(band_paths, 'B6', 'B11')
+    nir_path = _get_index_band_path(band_paths, 'B5', 'B08')
+    red_path = _get_index_band_path(band_paths, 'B4', 'B04')
+    green_path = _get_index_band_path(band_paths, 'B3', 'B03')
 
     reference_ds = gdal.Open(swir1_path)
     if reference_ds is None:
@@ -756,13 +883,19 @@ def create_ndbai(band_paths: Dict[str, str], output_path: str) -> str:
     注意：需要热红外波段B10或B11，如果没有则使用SWIR2代替
     用途：裸地和建筑区识别
     """
-    swir1_path = _get_processed_band_path(band_paths, 'B6')
+    swir1_path = _get_index_band_path(band_paths, 'B6', 'B11')
 
     # B10/B11 是热红外波段，不经过辐射定标预处理，_get_processed_band_path 无法找到其处理后路径
     # 因此始终使用 SWIR2（B7）作为 TIR 代替波段
-    tir_band = 'B7'
+    tir_band = _resolve_band_name(band_paths, 'B7', 'B12')
 
-    return _normalized_difference_index(band_paths, output_path, 'B6', tir_band, 'NDBaI')
+    return _normalized_difference_index(
+        band_paths,
+        output_path,
+        _resolve_band_name(band_paths, 'B6', 'B11'),
+        tir_band,
+        'NDBaI',
+    )
 
 
 def create_ui(band_paths: Dict[str, str], output_path: str) -> str:
@@ -773,7 +906,13 @@ def create_ui(band_paths: Dict[str, str], output_path: str) -> str:
 
     用途：城市区域识别，简单高效
     """
-    return _normalized_difference_index(band_paths, output_path, 'B7', 'B5', 'UI')
+    return _normalized_difference_index(
+        band_paths,
+        output_path,
+        _resolve_band_name(band_paths, 'B7', 'B12'),
+        _resolve_band_name(band_paths, 'B5', 'B08'),
+        'UI',
+    )
 
 
 def create_nbr(band_paths: Dict[str, str], output_path: str) -> str:
@@ -785,7 +924,13 @@ def create_nbr(band_paths: Dict[str, str], output_path: str) -> str:
     用途：火灾监测、燃烧程度评估
     通过对比火灾前后NBR值，可计算dNBR评估火灾严重程度
     """
-    return _normalized_difference_index(band_paths, output_path, 'B5', 'B7', 'NBR')
+    return _normalized_difference_index(
+        band_paths,
+        output_path,
+        _resolve_band_name(band_paths, 'B5', 'B08'),
+        _resolve_band_name(band_paths, 'B7', 'B12'),
+        'NBR',
+    )
 
 
 def create_bsi(band_paths: Dict[str, str], output_path: str) -> str:
@@ -796,10 +941,10 @@ def create_bsi(band_paths: Dict[str, str], output_path: str) -> str:
 
     用途：裸土识别、土壤侵蚀监测
     """
-    swir1_path = _get_processed_band_path(band_paths, 'B6')
-    red_path = _get_processed_band_path(band_paths, 'B4')
-    nir_path = _get_processed_band_path(band_paths, 'B5')
-    blue_path = _get_processed_band_path(band_paths, 'B2')
+    swir1_path = _get_index_band_path(band_paths, 'B6', 'B11')
+    red_path = _get_index_band_path(band_paths, 'B4', 'B04')
+    nir_path = _get_index_band_path(band_paths, 'B5', 'B08')
+    blue_path = _get_index_band_path(band_paths, 'B2', 'B02')
 
     reference_ds = gdal.Open(swir1_path)
     if reference_ds is None:
@@ -834,4 +979,48 @@ def create_ndsi(band_paths: Dict[str, str], output_path: str) -> str:
     用途：雪盖监测、冰川变化分析
     NDSI > 0.4 通常表示积雪
     """
-    return _normalized_difference_index(band_paths, output_path, 'B3', 'B6', 'NDSI')
+    return _normalized_difference_index(
+        band_paths,
+        output_path,
+        _resolve_band_name(band_paths, 'B3', 'B03'),
+        _resolve_band_name(band_paths, 'B6', 'B11'),
+        'NDSI',
+    )
+
+
+def create_apgi(band_paths: Dict[str, str], output_path: str) -> str:
+    """
+    创建 APGI (Advanced Plastic Greenhouse Index)
+
+    APGI = 100 * Coastal * Red * (2*NIR - Red - SWIR2) / (2*NIR + Red + SWIR2)
+
+    该指数面向 Sentinel-2 L2A 塑料大棚提取，使用 B01/B04/B08/B12。
+    B01 与 B12 会自动重采样到 B08 参考网格。
+    """
+    if not _is_sentinel2_band_set(band_paths):
+        raise Exception("APGI 仅支持 Sentinel-2 L2A 波段: B01, B04, B08, B12")
+
+    coastal_path = _get_processed_band_path(band_paths, 'B01')
+    red_path = _get_processed_band_path(band_paths, 'B04')
+    nir_path = _get_processed_band_path(band_paths, 'B08')
+    swir2_path = _get_processed_band_path(band_paths, 'B12')
+
+    reference_ds = gdal.Open(nir_path)
+    if reference_ds is None:
+        raise Exception("Unable to open reference band for APGI")
+
+    coastal = _read_band_array(coastal_path, reference_ds)
+    red = _read_band_array(red_path, reference_ds)
+    nir = _read_band_array(nir_path, reference_ds)
+    swir2 = _read_band_array(swir2_path, reference_ds)
+
+    with np.errstate(divide='ignore', invalid='ignore'):
+        numerator = 100.0 * coastal * red * (2.0 * nir - red - swir2)
+        denom = 2.0 * nir + red + swir2
+        denom = np.where(denom == 0, np.nan, denom)
+        apgi = numerator / denom
+
+    apgi = np.where(np.isfinite(apgi), apgi, -999)
+    output_path = _write_float_raster(output_path, reference_ds, apgi, nodata_value=-999)
+    reference_ds = None
+    return output_path

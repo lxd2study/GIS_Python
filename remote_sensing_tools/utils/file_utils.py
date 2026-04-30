@@ -12,9 +12,12 @@ from ..utils.logger import logger
 
 
 _BAND_RE = re.compile(r"(?:^|[_\-])B(1[0-1]|[1-9])(?:[_\-.]|$)", re.IGNORECASE)
+_SENTINEL2_BAND_RE = re.compile(r"(?:^|[_\-])B(0[1-9]|1[0-2]|8A)(?:[_\-.]|$)", re.IGNORECASE)
 _RASTER_SUFFIXES = {".tif", ".tiff", ".img"}
 _L2_FILE_HINTS = ("_SR_B", "_ST_B", "_L2", "L2SP", "SURFACE_REFLECTANCE")
 _L1_FILE_HINTS = ("_L1", "L1TP", "L1GT", "L1GS", "BQA")
+_SENTINEL2_HINTS = ("SENTINEL-2", "SENTINEL_2", "SENTINEL2", "S2A", "S2B", "S2C", "SENTINEL-2-L2A")
+_SENTINEL2_L2A_HINTS = ("L2A", "SENTINEL-2-L2A", "SENTINEL_2_L2A")
 
 
 def _detect_band_name(filename: str) -> Optional[str]:
@@ -25,16 +28,40 @@ def _detect_band_name(filename: str) -> Optional[str]:
     return f"B{int(match.group(1))}"
 
 
+def detect_sentinel2_band_name(filename: str) -> Optional[str]:
+    """从文件名中解析 Sentinel-2 波段名称 (B01-B12/B8A)。"""
+    match = _SENTINEL2_BAND_RE.search(filename)
+    if not match:
+        return None
+    value = match.group(1).upper()
+    return "B8A" if value == "8A" else f"B{value}"
+
+
+def detect_sensor_from_path(path: Path) -> Optional[str]:
+    """根据路径或文件名推断传感器。"""
+    upper_path = str(path).upper()
+    if any(token in upper_path for token in _SENTINEL2_HINTS):
+        return "sentinel-2"
+    if detect_sentinel2_band_name(path.name):
+        return "sentinel-2"
+    if _detect_band_name(path.name) or any(token in upper_path for token in (*_L1_FILE_HINTS, *_L2_FILE_HINTS)):
+        return "landsat"
+    return None
+
+
 def _normalize_product_level(product_level: Optional[str]) -> Optional[str]:
     if not product_level:
         return None
     normalized = str(product_level).upper()
-    return normalized if normalized in {"L1", "L2"} else None
+    return normalized if normalized in {"L1", "L2", "L2A"} else None
 
 
 def detect_product_level_from_path(path: Path) -> Optional[str]:
     """根据文件路径推断产品级别。"""
     upper_path = str(path).upper()
+    if any(token in upper_path for token in _SENTINEL2_L2A_HINTS) or detect_sentinel2_band_name(path.name):
+        return "L2A"
+
     if any(token in upper_path for token in _L2_FILE_HINTS):
         return "L2"
 
@@ -116,7 +143,7 @@ def infer_available_product_levels(scene_dir) -> List[str]:
         if level:
             levels.add(level)
 
-    return [level for level in ("L1", "L2") if level in levels]
+    return [level for level in ("L1", "L2", "L2A") if level in levels]
 
 
 def find_scene_support_files(scene_dir, product_level: Optional[str] = None) -> Dict[str, Optional[str]]:
@@ -152,6 +179,24 @@ def find_scene_support_files(scene_dir, product_level: Optional[str] = None) -> 
             recursive=True,
             fallback_to_any=True,
         ),
+    }
+
+
+def find_sentinel2_support_files(scene_dir, product_level: Optional[str] = "L2A") -> Dict[str, Optional[str]]:
+    """查找 Sentinel-2 L2A 场景中的 SCL 分类层。"""
+    scene_dir = Path(scene_dir)
+    if not scene_dir.exists() or not scene_dir.is_dir():
+        raise ValueError(f"场景目录不存在或不是目录: {scene_dir}")
+
+    normalized_level = _normalize_product_level(product_level)
+    return {
+        "scl_file": _choose_scene_file(
+            scene_dir,
+            ["*SCL*.tif", "*SCL*.TIF", "*SCL*.tiff", "*SCL*.TIFF"],
+            product_level=normalized_level,
+            recursive=True,
+            fallback_to_any=True,
+        )
     }
 
 
@@ -225,6 +270,63 @@ def collect_band_paths(
         if normalized_level:
             raise ValueError(f"未在目录中识别到 {normalized_level} 产品的 B1-B11 波段文件")
         raise ValueError("未在目录中识别到 B1-B11 波段文件")
+
+    return band_paths
+
+
+def collect_sentinel2_band_paths(
+    band_dir,
+    on_duplicate: str = "warn",
+    product_level: Optional[str] = "L2A",
+    recursive: bool = True,
+) -> Dict[str, str]:
+    """收集目录中的 Sentinel-2 L2A 反射率波段文件路径。"""
+    band_dir = Path(band_dir)
+    if not band_dir.exists():
+        raise ValueError(f"波段目录不存在: {band_dir}")
+    if not band_dir.is_dir():
+        raise ValueError(f"不是目录: {band_dir}")
+
+    band_candidates: Dict[str, List[Path]] = {}
+    for file_path in _iter_files(band_dir, recursive=recursive):
+        if file_path.suffix.lower() not in _RASTER_SUFFIXES:
+            continue
+
+        band_name = detect_sentinel2_band_name(file_path.name)
+        if not band_name:
+            continue
+
+        band_candidates.setdefault(band_name, []).append(file_path)
+
+    band_paths: Dict[str, str] = {}
+    normalized_level = _normalize_product_level(product_level)
+    for band_name, candidates in sorted(band_candidates.items()):
+        if len(candidates) > 1 and on_duplicate == "raise":
+            raise ValueError(
+                f"Sentinel-2 波段重复: {band_name} ({'；'.join(str(path) for path in candidates)})"
+            )
+
+        preferred = _preferred_candidates(candidates, band_dir, normalized_level)
+        if not preferred:
+            logger.warning(
+                "Sentinel-2 波段 %s 未找到匹配 %s 的候选文件，已跳过该波段",
+                band_name,
+                normalized_level,
+            )
+            continue
+
+        selected = preferred[0]
+        if len(candidates) > 1:
+            logger.warning(
+                "发现重复 Sentinel-2 波段文件，已选择更匹配的候选: %s -> %s",
+                band_name,
+                selected,
+            )
+
+        band_paths[band_name] = str(selected)
+
+    if not band_paths:
+        raise ValueError("未在目录中识别到 Sentinel-2 L2A 波段文件")
 
     return band_paths
 

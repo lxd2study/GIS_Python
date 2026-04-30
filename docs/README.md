@@ -1,40 +1,20 @@
-﻿# 项目文档目录
+# 项目文档目录
 
-## 用户文档
+## 当前保留的项目文档
 
-### 批量处理
-- [batch_processing_guide.md](batch_processing_guide.md) - 批量处理完整指南
 - [batch_processing_quickstart.md](batch_processing_quickstart.md) - 批量处理快速入门
-- [batch_processing_test_report.md](batch_processing_test_report.md) - 批量处理测试报告
-
-### 遥感指数
+- [batch_processing_guide.md](batch_processing_guide.md) - 批量处理完整指南
 - [indices_usage_guide.md](indices_usage_guide.md) - 遥感指数使用指南
-- [indices_extension_report.md](indices_extension_report.md) - 遥感指数扩展报告
+- [project_structure.md](project_structure.md) - 当前项目结构与交付边界说明
 
-### 科学分析
-- [PREPROCESSING_SCIENTIFIC_ANALYSIS.md](PREPROCESSING_SCIENTIFIC_ANALYSIS.md) - 预处理科学分析
+## 本地资料目录
 
-## 项目维护
+- `archive/` - 历史开发记录、阶段性测试记录和清理报告，默认不参与源码交付
+- `thesis-prep/` - 论文草稿、截图、文献核验材料，默认忽略提交
+- `standard/` - 学校模板或写作规范文件，默认忽略提交
 
-- [project_structure.md](project_structure.md) - 当前项目目录结构与模块说明
+## 维护说明
 
-## 开题文档
-- [proposal/](proposal/) - 开题报告和相关文档
-  - landsat8_web_preprocess_proposal.md - 开题报告
-  - 开题答辩演讲稿.md
-  - 英文文献补充建议.md
-
-## 开发文档归档
-- [archive/](archive/) - 开发过程中的任务记录和测试报告
-  - CLEANUP_REPORT_2026-03-14.md - 历史清理记录
-  - TASK*.md - 任务完成记录
-  - TESTING*.md - 测试报告
-  - FRONTEND*.md - 前端开发记录
-  - 其他开发过程文档
-
-## 文档说明
-
-- **用户文档**: 面向最终用户的使用指南和功能说明
-- **项目维护**: 当前项目结构和维护信息
-- **开题文档**: 毕业设计开题相关材料
-- **开发文档归档**: 开发过程中的临时文档, 已归档保存
+- 说明文档以当前源码和根目录 [README.md](../README.md) 为准。
+- 运行数据、下载结果、缓存、临时文件和前端构建产物不属于源码文档。
+- 若需要交付论文材料，应单独打包 `docs/thesis-prep/`，不要与源码压缩包混放。

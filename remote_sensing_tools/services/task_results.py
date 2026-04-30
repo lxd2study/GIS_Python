@@ -76,6 +76,8 @@ def _category_from_path(file_path: Path) -> str:
     stem = file_path.stem
     if stem.lower() == "cloud_mask":
         return "mask"
+    if stem.lower().endswith("_binary"):
+        return "mask"
     if PROCESSED_PATTERN.match(stem):
         return "processed"
     if stem in COMPOSITE_NAMES:

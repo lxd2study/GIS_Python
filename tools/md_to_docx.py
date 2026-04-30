@@ -52,6 +52,11 @@ def set_font(run, name_cn="宋体", name_en="Times New Roman", size_pt=12, bold=
     rPr.insert(0, rFonts)
 
 
+def clear_run_color(run):
+    if run.font.color:
+        run.font.color.rgb = None
+
+
 def set_paragraph_format(para, first_indent_chars=2, space_before=0,
                           space_after=6, line_spacing_pt=None,
                           alignment=WD_ALIGN_PARAGRAPH.JUSTIFY):
@@ -72,18 +77,20 @@ def add_heading(doc, text, level):
     para = doc.add_paragraph(style=style)
     run = para.add_run(text)
 
-    size_map = {1: 16, 2: 14, 3: 13, 4: 12}
+    size_map = {1: 15, 2: 14, 3: 13, 4: 12}
     bold_map = {1: True, 2: True, 3: True, 4: True}
-    font_map = {1: "黑体", 2: "黑体", 3: "黑体", 4: "宋体"}
+    font_map = {1: "黑体", 2: "黑体", 3: "黑体", 4: "黑体"}
+    en_font = "Arial" if level == 1 and text == "ABSTRACT" else "Times New Roman"
 
-    set_font(run, name_cn=font_map[level], name_en="Times New Roman",
+    set_font(run, name_cn=font_map[level], name_en=en_font,
              size_pt=size_map[level], bold=bold_map[level])
 
     pf = para.paragraph_format
     pf.first_line_indent = Pt(0)
-    pf.space_before = Pt({1: 18, 2: 12, 3: 9, 4: 6}[level])
-    pf.space_after = Pt({1: 12, 2: 9, 3: 6, 4: 4}[level])
-    pf.alignment = WD_ALIGN_PARAGRAPH.LEFT
+    pf.space_before = Pt({1: 40, 2: 24, 3: 12, 4: 12}[level])
+    pf.space_after = Pt({1: 20, 2: 6, 3: 6, 4: 6}[level])
+    pf.line_spacing = Pt(20)
+    pf.alignment = WD_ALIGN_PARAGRAPH.CENTER if level == 1 else WD_ALIGN_PARAGRAPH.LEFT
     return para
 
 
@@ -92,41 +99,166 @@ def add_body_paragraph(doc, text, first_indent=2):
     para = doc.add_paragraph()
     _apply_inline(para, text, size_pt=12)
     set_paragraph_format(para, first_indent_chars=first_indent,
-                         space_before=0, space_after=4, line_spacing_pt=20)
+                         space_before=0, space_after=0, line_spacing_pt=20)
     return para
 
 
-def add_caption(doc, text):
-    """图/表标注行（居中，宋体10pt）。"""
+def add_special_paragraph(doc, text, section_name="", first_indent=2):
+    if section_name == "参考文献" and re.match(r"^\[\d+\]", text):
+        para = doc.add_paragraph()
+        _apply_inline(para, text, size_pt=10.5)
+        pf = para.paragraph_format
+        pf.first_line_indent = Pt(0)
+        pf.left_indent = Pt(21)
+        pf.first_line_indent = Pt(-21)
+        pf.space_before = Pt(3)
+        pf.space_after = Pt(0)
+        pf.line_spacing = Pt(16)
+        pf.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+        return para
+
+    if section_name in {"摘 要", "ABSTRACT"}:
+        size = 12
+        cn_font = "宋体"
+        en_font = "Times New Roman"
+        para = doc.add_paragraph()
+        _apply_inline(para, text, size_pt=size)
+        pf = para.paragraph_format
+        pf.first_line_indent = Pt(0 if first_indent == 0 else 24)
+        pf.space_before = Pt(0)
+        pf.space_after = Pt(0)
+        pf.line_spacing = Pt(20)
+        pf.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+        for run in para.runs:
+            set_font(run, name_cn=cn_font, name_en=en_font, size_pt=size, bold=run.font.bold)
+        return para
+
+    return add_body_paragraph(doc, text, first_indent=first_indent)
+
+
+def add_caption(doc, text, before_pt=6, after_pt=12, caption_type="figure"):
+    """图表题注（居中，黑体11pt）。"""
     para = doc.add_paragraph()
     run = para.add_run(text)
-    set_font(run, name_cn="宋体", name_en="Times New Roman", size_pt=10)
+    set_font(run, name_cn="黑体", name_en="Times New Roman", size_pt=11)
     para.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    para.paragraph_format.space_before = Pt(2)
-    para.paragraph_format.space_after = Pt(8)
+    if caption_type == "table":
+        para.paragraph_format.space_before = Pt(12)
+        para.paragraph_format.space_after = Pt(6)
+    else:
+        para.paragraph_format.space_before = Pt(before_pt)
+        para.paragraph_format.space_after = Pt(after_pt)
     para.paragraph_format.first_line_indent = Pt(0)
+    para.paragraph_format.line_spacing = Pt(12)
     return para
 
 
 def add_placeholder_box(doc, caption_text):
     """插入灰色占位图框 + 图标注。"""
-    # 占位段落（灰底、居中）
+    # 占位段落（居中，正式稿默认黑色）
     para = doc.add_paragraph()
     run = para.add_run(f"[ {caption_text} ]")
-    set_font(run, name_cn="黑体", name_en="Arial", size_pt=11,
-             color=RGBColor(0x80, 0x80, 0x80))
+    set_font(run, name_cn="黑体", name_en="Arial", size_pt=11)
     para.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.CENTER
     para.paragraph_format.space_before = Pt(6)
     para.paragraph_format.space_after = Pt(2)
     para.paragraph_format.first_line_indent = Pt(0)
-    # 给段落加灰色底纹
-    pPr = para._p.get_or_add_pPr()
-    shd = OxmlElement('w:shd')
-    shd.set(qn('w:val'), 'clear')
-    shd.set(qn('w:color'), 'auto')
-    shd.set(qn('w:fill'), 'EEEEEE')
-    pPr.append(shd)
     return para
+
+
+def add_image_with_caption(doc, image_path: Path, caption_text: str):
+    """插入图片并添加图题；图片缺失时退回占位框。"""
+    if image_path.exists():
+        para = doc.add_paragraph()
+        para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        para.paragraph_format.first_line_indent = Pt(0)
+        try:
+            run = para.add_run()
+            run.add_picture(str(image_path), width=Cm(14.5))
+        except Exception:
+            add_placeholder_box(doc, caption_text)
+    else:
+        add_placeholder_box(doc, caption_text)
+    add_caption(doc, caption_text)
+
+
+def normalize_heading_text(text):
+    """清洗章节标题中的说明性后缀，保留正式标题文本。"""
+    cleaned = text.strip()
+    cleaned = re.sub(r'[（(](说明|占位)[^）)]*[）)]$', '', cleaned).strip()
+    if cleaned in {"摘要", "摘 要", "摘  要"}:
+        return "摘  要"
+    if cleaned.upper() == "ABSTRACT":
+        return "ABSTRACT"
+    if cleaned.startswith("目 录") or cleaned.startswith("目  录") or cleaned.startswith("目录"):
+        return "目  录"
+    return cleaned
+
+
+def extract_table_caption(text):
+    """识别表题，兼容表1.1 / 表1-1 形式。"""
+    match = re.match(r'^\*{0,2}(表\d+(?:[.-]\d+)+(?:\s+.*)?)\*{0,2}$', text.strip())
+    return match.group(1).strip() if match else None
+
+
+def extract_figure_caption(text):
+    """识别 blockquote 形式的占位图题。"""
+    cleaned = text.strip()
+    if cleaned.startswith('>'):
+        cleaned = cleaned.lstrip('> ').strip().strip('*')
+    match = re.match(r'^(图\d+(?:[.-]\d+)+(?:\s+.*)?)$', cleaned)
+    if not match:
+        return None
+    caption = match.group(1).strip()
+    caption = re.split(r'[（(]占位图', caption, maxsplit=1)[0].strip()
+    return caption
+
+
+def extract_cover_info(lines):
+    """从 Markdown 总稿中提取封面信息，未提供时留空。"""
+    cover_info = {
+        "题目": "",
+        "英文题目": "",
+        "学生姓名": "",
+        "学号": "",
+        "指导教师": "",
+        "专业名称": "",
+        "所在学院": "",
+        "完成日期": "",
+        "打印日期": "",
+    }
+
+    table_key_map = {
+        "学生姓名": "学生姓名",
+        "学号": "学号",
+        "指导教师": "指导教师",
+        "专业": "专业名称",
+        "专业名称": "专业名称",
+        "院（系）": "所在学院",
+        "学院": "所在学院",
+        "所在学院": "所在学院",
+        "完成日期": "完成日期",
+        "打印日期": "打印日期",
+    }
+
+    for raw_line in lines[:80]:
+        line = raw_line.strip()
+        if line.startswith("论文题目："):
+            cover_info["题目"] = line.split("：", 1)[1].strip()
+            continue
+        if line.startswith("英文题目："):
+            cover_info["英文题目"] = line.split("：", 1)[1].strip()
+            continue
+        if re.match(r'^\|.*\|.*\|$', line):
+            cells = parse_table_line(line)
+            if len(cells) >= 2:
+                key = cells[0].strip()
+                value = cells[1].strip()
+                mapped_key = table_key_map.get(key)
+                if mapped_key and value not in {"", "内容", "[待填写]"}:
+                    cover_info[mapped_key] = value
+
+    return cover_info
 
 
 def add_code_block(doc, code_text):
@@ -136,7 +268,6 @@ def add_code_block(doc, code_text):
         run = para.add_run(line if line else ' ')
         run.font.name = 'Courier New'
         run.font.size = Pt(9)
-        run.font.color.rgb = RGBColor(0x1E, 0x1E, 0x1E)
         para.paragraph_format.first_line_indent = Pt(0)
         para.paragraph_format.left_indent = Cm(0.5)
         para.paragraph_format.space_before = Pt(0)
@@ -167,8 +298,8 @@ def add_table(doc, header_row, data_rows):
     """插入带表头的表格（三线表风格）。"""
     col_count = len(header_row)
     table = doc.add_table(rows=1 + len(data_rows), cols=col_count)
-    table.style = 'Table Grid'
     table.alignment = WD_TABLE_ALIGNMENT.CENTER
+    clear_table_borders(table)
 
     # 表头
     hdr_cells = table.rows[0].cells
@@ -177,8 +308,10 @@ def add_table(doc, header_row, data_rows):
         hdr_cells[i].text = ''
         run = hdr_cells[i].paragraphs[0].add_run(cell_text)
         set_font(run, name_cn="黑体", name_en="Times New Roman",
-                 size_pt=10, bold=True)
+                 size_pt=11, bold=True)
         hdr_cells[i].paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.CENTER
+        hdr_cells[i].paragraphs[0].paragraph_format.space_before = Pt(3)
+        hdr_cells[i].paragraphs[0].paragraph_format.space_after = Pt(3)
 
     # 数据行
     for row_idx, row_data in enumerate(data_rows):
@@ -187,12 +320,59 @@ def add_table(doc, header_row, data_rows):
             cell_text = cell_text.strip()
             row_cells[col_idx].text = ''
             run = row_cells[col_idx].paragraphs[0].add_run(cell_text)
-            set_font(run, name_cn="宋体", name_en="Times New Roman", size_pt=9)
+            set_font(run, name_cn="宋体", name_en="Times New Roman", size_pt=11)
             row_cells[col_idx].paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.CENTER
+            row_cells[col_idx].paragraphs[0].paragraph_format.space_before = Pt(3)
+            row_cells[col_idx].paragraphs[0].paragraph_format.space_after = Pt(3)
+
+    set_table_border(table, "top", "single", "000000", "12")
+    set_table_border(table, "bottom", "single", "000000", "12")
+    if len(table.rows) > 1:
+        set_row_bottom_border(table.rows[0], "single", "000000", "8")
 
     # 表格上下加空行
     doc.add_paragraph()
     return table
+
+
+def clear_table_borders(table):
+    tbl_pr = table._tbl.tblPr
+    borders = tbl_pr.first_child_found_in("w:tblBorders")
+    if borders is not None:
+        tbl_pr.remove(borders)
+
+
+def set_table_border(table, edge, val, color, size):
+    tbl_pr = table._tbl.tblPr
+    borders = tbl_pr.first_child_found_in("w:tblBorders")
+    if borders is None:
+        borders = OxmlElement("w:tblBorders")
+        tbl_pr.append(borders)
+    element = borders.find(qn(f"w:{edge}"))
+    if element is None:
+        element = OxmlElement(f"w:{edge}")
+        borders.append(element)
+    element.set(qn("w:val"), val)
+    element.set(qn("w:sz"), size)
+    element.set(qn("w:space"), "0")
+    element.set(qn("w:color"), color)
+
+
+def set_row_bottom_border(row, val, color, size):
+    for cell in row.cells:
+        tc_pr = cell._tc.get_or_add_tcPr()
+        borders = tc_pr.first_child_found_in("w:tcBorders")
+        if borders is None:
+            borders = OxmlElement("w:tcBorders")
+            tc_pr.append(borders)
+        bottom = borders.find(qn("w:bottom"))
+        if bottom is None:
+            bottom = OxmlElement("w:bottom")
+            borders.append(bottom)
+        bottom.set(qn("w:val"), val)
+        bottom.set(qn("w:sz"), size)
+        bottom.set(qn("w:space"), "0")
+        bottom.set(qn("w:color"), color)
 
 
 def _apply_inline(para, text, size_pt=12, base_bold=False):
@@ -220,8 +400,8 @@ def add_list_item(doc, text, ordered=False, number=1, level=0):
     else:
         prefix = "• "
     run_prefix = para.add_run(prefix)
-    set_font(run_prefix, name_cn="宋体", name_en="Times New Roman", size_pt=11)
-    _apply_inline(para, text, size_pt=11)
+    set_font(run_prefix, name_cn="宋体", name_en="Times New Roman", size_pt=12)
+    _apply_inline(para, text, size_pt=12)
     para.paragraph_format.first_line_indent = Pt(0)
     para.paragraph_format.left_indent = Cm(indent_cm)
     para.paragraph_format.space_before = Pt(1)
@@ -247,7 +427,7 @@ def add_page_number(doc):
     run._r.append(fldChar1)
     run._r.append(instrText)
     run._r.append(fldChar2)
-    run.font.size = Pt(10)
+    run.font.size = Pt(10.5)
     run.font.name = 'Times New Roman'
 
 
@@ -256,13 +436,27 @@ def setup_page(doc):
     section = doc.sections[0]
     section.page_width = Cm(21)
     section.page_height = Cm(29.7)
-    section.left_margin = Cm(3.0)
-    section.right_margin = Cm(2.5)
+    section.left_margin = Cm(2.0)
+    section.right_margin = Cm(2.0)
     section.top_margin = Cm(2.5)
-    section.bottom_margin = Cm(2.5)
+    section.bottom_margin = Cm(2.0)
+    section.header_distance = Cm(1.5)
+    section.footer_distance = Cm(1.75)
+    section.different_first_page_header_footer = True
 
 
-def add_title_page(doc, title, author, advisor, major, college, date):
+def add_header(doc, header_text="河北水利电力学院本科毕业设计"):
+    """添加页眉（封面页除外）。"""
+    section = doc.sections[0]
+    header = section.header
+    para = header.paragraphs[0]
+    para.clear()
+    para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    run = para.add_run(header_text)
+    set_font(run, name_cn="宋体", name_en="Times New Roman", size_pt=10.5)
+
+
+def add_title_page(doc, title, author, advisor, major, college, date, title_en="", student_id="", print_date=""):
     """生成封面页。"""
     doc.add_paragraph()
     doc.add_paragraph()
@@ -270,25 +464,41 @@ def add_title_page(doc, title, author, advisor, major, college, date):
 
     p_title = doc.add_paragraph()
     run = p_title.add_run(title)
-    set_font(run, name_cn="黑体", name_en="Times New Roman", size_pt=18, bold=True)
+    set_font(run, name_cn="黑体", name_en="Times New Roman", size_pt=26, bold=True)
     p_title.alignment = WD_ALIGN_PARAGRAPH.CENTER
     p_title.paragraph_format.space_after = Pt(36)
     p_title.paragraph_format.first_line_indent = Pt(0)
+    p_title.paragraph_format.line_spacing = Pt(24)
+
+    if title_en:
+        p_title_en = doc.add_paragraph()
+        run_en = p_title_en.add_run(title_en)
+        set_font(run_en, name_cn="Times New Roman", name_en="Times New Roman",
+                 size_pt=22, bold=True)
+        p_title_en.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        p_title_en.paragraph_format.space_after = Pt(28)
+        p_title_en.paragraph_format.first_line_indent = Pt(0)
+        p_title_en.paragraph_format.line_spacing = Pt(20)
 
     for label, value in [
         ("学生姓名", author),
+        ("学号", student_id),
+        ("院（系）", college),
+        ("专业", major),
         ("指导教师", advisor),
-        ("专业名称", major),
-        ("所在学院", college),
         ("完成日期", date),
+        ("打印日期", print_date),
     ]:
         p = doc.add_paragraph()
         run_label = p.add_run(f"{label}：")
-        set_font(run_label, name_cn="宋体", name_en="Times New Roman",
-                 size_pt=14, bold=True)
+        font_cn = "宋体" if label in {"完成日期", "打印日期"} else "仿宋"
+        if label == "学号":
+            font_cn = "Times New Roman"
+        set_font(run_label, name_cn=font_cn, name_en="Times New Roman",
+                 size_pt=16, bold=True)
         run_value = p.add_run(value)
-        set_font(run_value, name_cn="宋体", name_en="Times New Roman",
-                 size_pt=14, bold=False)
+        set_font(run_value, name_cn=font_cn, name_en="Times New Roman",
+                 size_pt=16, bold=False)
         p.alignment = WD_ALIGN_PARAGRAPH.CENTER
         p.paragraph_format.space_after = Pt(8)
         p.paragraph_format.first_line_indent = Pt(0)
@@ -317,45 +527,62 @@ def is_table_separator(line):
 def convert_md_to_docx(md_path: str, docx_path: str):
     doc = Document()
     setup_page(doc)
+    add_header(doc)
     add_page_number(doc)
 
     lines = Path(md_path).read_text(encoding='utf-8').splitlines()
+    md_dir = Path(md_path).resolve().parent
+
+    cover_info = extract_cover_info(lines)
+    output_path = Path(docx_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
 
     # 状态机
     in_code_block = False
     code_lang = ''
     code_lines = []
+    pending_diagram_caption = None
     in_table = False
     table_header = []
     table_data_rows = []
     ordered_counters = {}   # indent_level -> count
-    skip_cover_meta = True  # 跳过封面 | | | 表格
-
-    # 封面元信息（从 MD 文件顶部的 | | | 表格中读取）
-    cover_info = {
-        "题目": "基于Web的Landsat 8遥感影像在线预处理系统设计与实现",
-        "学生姓名": "李旭东",
-        "指导教师": "（待填写）",
-        "专业名称": "（待填写）",
-        "所在学院": "（待填写）",
-        "完成日期": "2026年4月",
-    }
+    skip_cover_section = True
+    skip_toc_body = False
+    level1_count = 0
+    current_section = ""
 
     # 生成封面
     add_title_page(
         doc,
         title=cover_info["题目"],
+        title_en=cover_info["英文题目"],
         author=cover_info["学生姓名"],
+        student_id=cover_info["学号"],
         advisor=cover_info["指导教师"],
         major=cover_info["专业名称"],
         college=cover_info["所在学院"],
         date=cover_info["完成日期"],
+        print_date=cover_info["打印日期"],
     )
 
     i = 0
     while i < len(lines):
         line = lines[i]
         raw = line
+        stripped = line.strip()
+
+        if skip_cover_section:
+            if re.match(r'^#\s+原创性声明与使用授权', stripped):
+                skip_cover_section = False
+            else:
+                i += 1
+                continue
+
+        if skip_toc_body and not re.match(r'^#\s+', stripped):
+            i += 1
+            continue
+        if skip_toc_body and re.match(r'^#\s+', stripped):
+            skip_toc_body = False
 
         # ── 代码块 ──────────────────────────────────────
         if line.strip().startswith('```'):
@@ -365,8 +592,11 @@ def convert_md_to_docx(md_path: str, docx_path: str):
                 code_lines = []
             else:
                 in_code_block = False
-                add_code_block(doc, '\n'.join(code_lines))
-                doc.add_paragraph()  # 代码块后空行
+                if code_lang.lower() in {'mermaid', 'plantuml'}:
+                    pending_diagram_caption = "待渲染流程图"
+                else:
+                    add_code_block(doc, '\n'.join(code_lines))
+                    doc.add_paragraph()  # 代码块后空行
             i += 1
             continue
 
@@ -375,49 +605,38 @@ def convert_md_to_docx(md_path: str, docx_path: str):
             i += 1
             continue
 
-        # ── 跳过封面信息区的 | | | 元表格 ───────────────
-        if skip_cover_meta and re.match(r'^\|.*\|.*\|', line):
-            # 封面元表格结束标志：出现第一个正式 # 标题后停止跳过
-            i += 1
-            continue
-
         # ── 标题 ─────────────────────────────────────────
         heading_match = re.match(r'^(#{1,4})\s+(.*)', line)
         if heading_match:
-            skip_cover_meta = False
             # 如果正在收集表格，先输出
             if in_table and table_header:
                 add_table(doc, table_header, table_data_rows)
                 in_table = False; table_header = []; table_data_rows = []
 
             level = len(heading_match.group(1))
-            text = heading_match.group(2).strip()
+            text = normalize_heading_text(heading_match.group(2))
 
-            # 目录标题直接跳过（Word 可自动生成目录）
-            if text.strip() in ('目  录', '目录'):
-                # 插入提示语
+            if level == 1:
+                if level1_count > 0:
+                    doc.add_page_break()
+                level1_count += 1
+                current_section = text
+
+            # 目录标题直接转为提示页，正文目录项不再逐行写入
+            if level == 1 and text == '目  录':
+                add_heading(doc, text, 1)
                 p = doc.add_paragraph()
                 run = p.add_run('（此处请在 Word 中通过"引用 → 目录"自动生成目录）')
                 set_font(run, name_cn="宋体", name_en="Times New Roman",
-                         size_pt=10, color=RGBColor(0x80, 0x80, 0x80))
+                         size_pt=12)
                 p.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.CENTER
                 p.paragraph_format.first_line_indent = Pt(0)
-                doc.add_page_break()
+                p.paragraph_format.line_spacing = Pt(20)
+                skip_toc_body = True
                 i += 1
                 continue
 
-            # 摘要/Abstract/参考文献/附录 等视为 Heading 1
-            if level == 1 and text in ('摘  要', '摘要', 'Abstract', '参考文献', '附录'):
-                add_heading(doc, text, 1)
-                if text in ('摘  要', '摘要', 'Abstract'):
-                    pass  # 不分页
-                else:
-                    pass
-            elif level == 1:
-                doc.add_page_break()
-                add_heading(doc, text, level)
-            else:
-                add_heading(doc, text, level)
+            add_heading(doc, text, level)
             i += 1
             continue
 
@@ -446,15 +665,32 @@ def convert_md_to_docx(md_path: str, docx_path: str):
             i += 1
             continue
         else:
-            # 非表格行：如果之前在收集表格，先提交
+            # 非表格行：如果之前在收集表格，优先识别紧随其后的表题并置于表格上方
             if in_table and table_header:
+                table_caption = extract_table_caption(stripped)
+                if table_caption:
+                    add_caption(doc, table_caption, before_pt=12, after_pt=6, caption_type="table")
+                    add_table(doc, table_header, table_data_rows)
+                    in_table = False; table_header = []; table_data_rows = []
+                    i += 1
+                    continue
                 add_table(doc, table_header, table_data_rows)
                 in_table = False; table_header = []; table_data_rows = []
 
-        stripped = line.strip()
-
         # ── 空行 ─────────────────────────────────────────
         if not stripped:
+            i += 1
+            continue
+
+        # ── Markdown 图片：![图4.1 单任务处理页面](materials/screenshots/a.png)
+        img_match = re.match(r'^!\[(.*?)\]\((.*?)\)\s*$', stripped)
+        if img_match:
+            caption_text = img_match.group(1).strip() or "图片"
+            image_ref = img_match.group(2).strip().strip('"')
+            image_path = Path(image_ref)
+            if not image_path.is_absolute():
+                image_path = md_dir / image_path
+            add_image_with_caption(doc, image_path, caption_text)
             i += 1
             continue
 
@@ -481,8 +717,23 @@ def convert_md_to_docx(md_path: str, docx_path: str):
             add_caption(doc, f"（占位：{caption_text}）")
             continue
 
+        figure_caption = extract_figure_caption(stripped)
+        if figure_caption:
+            pending_diagram_caption = None
+            add_placeholder_box(doc, figure_caption)
+            add_caption(doc, figure_caption)
+            i += 1
+            continue
+
+        if pending_diagram_caption and re.match(r'^图\s*\d+(?:[.-]\d+)+', stripped):
+            add_placeholder_box(doc, stripped)
+            add_caption(doc, stripped)
+            pending_diagram_caption = None
+            i += 1
+            continue
+
         # 跳过 > *图... 行（已被占位图处理消耗）
-        if re.match(r'^>\s*\*?图\d+-\d+', stripped):
+        if re.match(r'^>\s*\*?图\d+(?:[.-]\d+)+', stripped):
             i += 1
             continue
 
@@ -492,7 +743,7 @@ def convert_md_to_docx(md_path: str, docx_path: str):
             p = doc.add_paragraph()
             run = p.add_run(text_content)
             set_font(run, name_cn="宋体", name_en="Times New Roman",
-                     size_pt=10, color=RGBColor(0x55, 0x55, 0x55))
+                     size_pt=12)
             p.paragraph_format.left_indent = Cm(1.0)
             p.paragraph_format.first_line_indent = Pt(0)
             p.paragraph_format.space_before = Pt(2)
@@ -528,9 +779,9 @@ def convert_md_to_docx(md_path: str, docx_path: str):
             continue
 
         # ── 表格标题行（**表X-X ...**） ───────────────────
-        table_title_match = re.match(r'^\*\*(表\d+-\d+[^*]*)\*\*', stripped)
-        if table_title_match:
-            add_caption(doc, table_title_match.group(1))
+        table_caption = extract_table_caption(stripped)
+        if table_caption:
+            add_caption(doc, table_caption, before_pt=12, after_pt=6, caption_type="table")
             i += 1
             continue
 
@@ -540,20 +791,21 @@ def convert_md_to_docx(md_path: str, docx_path: str):
 
         # ── 普通正文段落 ─────────────────────────────────
         # 判断是否是摘要/关键词行（无缩进）
-        no_indent_prefixes = ('**关键词', '**Keywords', 'Co-Authored',
-                              '作者签名', '\\*热红外')
+        no_indent_prefixes = ('**关键词', '**Keywords', '关键词：', 'Key words:',
+                              '声明人签名', '学生签名', '指导教师签名', '日期：',
+                              'Co-Authored', '作者签名', '\\*热红外')
         is_no_indent = any(stripped.startswith(p) for p in no_indent_prefixes)
         first_indent = 0 if is_no_indent else 2
 
-        add_body_paragraph(doc, stripped, first_indent=first_indent)
+        add_special_paragraph(doc, stripped, section_name=current_section, first_indent=first_indent)
         i += 1
 
     # 收尾：若表格还未提交
     if in_table and table_header:
         add_table(doc, table_header, table_data_rows)
 
-    doc.save(docx_path)
-    print(f"[OK] 已生成: {docx_path}")
+    doc.save(output_path)
+    print(f"[OK] 已生成: {output_path}")
 
 
 # ─────────────────────────── 入口 ────────────────────────────────

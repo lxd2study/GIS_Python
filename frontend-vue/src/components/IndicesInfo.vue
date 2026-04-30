@@ -9,6 +9,7 @@ const categories = [
   { id: 'rgb', name: 'RGB合成', icon: 'palette' },
   { id: 'vegetation', name: '植被指数', icon: 'leaf' },
   { id: 'water', name: '水体指数', icon: 'drop' },
+  { id: 'greenhouse', name: '大棚指数', icon: 'greenhouse' },
   { id: 'urban', name: '建筑指数', icon: 'city' },
   { id: 'other', name: '其他指数', icon: 'flask' }
 ]
@@ -230,6 +231,16 @@ const indices = [
     bands: 'B5 (NIR), B7 (SWIR2)'
   },
   {
+    category: 'greenhouse',
+    type: 'apgi',
+    name: 'APGI - Sentinel-2 大棚指数',
+    formula: '100 * Coastal * Red * (2*NIR - Red - SWIR2) / (2*NIR + Red + SWIR2)',
+    range: '区域相关，建议结合样本阈值',
+    usage: '塑料大棚提取、设施农业空间制图',
+    threshold: '建议按研究区样本或人工判读结果确定阈值',
+    bands: 'B01 (Coastal), B04 (Red), B08 (NIR), B12 (SWIR2)'
+  },
+  {
     category: 'other',
     type: 'bsi',
     name: 'BSI - 裸土指数',
@@ -278,6 +289,7 @@ const stats = computed(() => {
     rgb: indices.filter(i => i.category === 'rgb').length,
     vegetation: indices.filter(i => i.category === 'vegetation').length,
     water: indices.filter(i => i.category === 'water').length,
+    greenhouse: indices.filter(i => i.category === 'greenhouse').length,
     urban: indices.filter(i => i.category === 'urban').length,
     other: indices.filter(i => i.category === 'other').length
   }
@@ -308,6 +320,13 @@ function iconPaths(icon) {
     case 'drop':
       return [
         'M12 3C9.5 7.2 6 10.6 6 14a6 6 0 0 0 12 0c0-3.4-3.5-6.8-6-11Z'
+      ]
+    case 'greenhouse':
+      return [
+        'M4 20V9l8-6 8 6v11',
+        'M8 20v-8h8v8',
+        'M4 12h16',
+        'M12 4v16'
       ]
     case 'city':
       return [

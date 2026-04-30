@@ -17,6 +17,7 @@ logger = logging.getLogger(__name__)
 PROCESSED_BAND_NODATA = -9999.0
 LANDSAT_L2_SR_SCALE = np.float32(0.0000275)
 LANDSAT_L2_SR_OFFSET = np.float32(-0.2)
+SENTINEL2_L2A_SR_SCALE = np.float32(0.0001)
 
 # 启用GDAL异常处理
 gdal.UseExceptions()
@@ -24,7 +25,8 @@ warnings.filterwarnings('ignore', category=FutureWarning)
 
 from .constants import (
     RADIANCE_MULT, RADIANCE_ADD, ESUN, COMPOSITE_MAP, SIXS_PARAMETERS,
-    SUPPORTED_OPTICAL_BANDS, THERMAL_BANDS
+    SUPPORTED_OPTICAL_BANDS, THERMAL_BANDS,
+    SENTINEL2_OPTICAL_BANDS, SENTINEL2_CLASSIFICATION_BANDS,
 )
 from .config import settings
 from ..operations.radiometric import dn_to_radiance, radiance_to_reflectance
@@ -1145,3 +1147,169 @@ class Landsat8Processor:
             'height': int(height),
             'bands': int(bands)
         }
+
+
+class Sentinel2Processor(Landsat8Processor):
+    """Sentinel-2 L2A 影像处理器。"""
+
+    def __init__(self):
+        super().__init__()
+        self.metadata = {
+            'sensor': 'Sentinel-2',
+            'product_level': 'L2A',
+            'scene_id': '',
+        }
+
+    @staticmethod
+    def _init_results() -> Dict:
+        results = Landsat8Processor._init_results()
+        results['sensor'] = 'sentinel-2'
+        results['product_level'] = 'L2A'
+        results['processing_mode'] = 'sentinel2_l2a_analysis'
+        return results
+
+    @staticmethod
+    def _normalize_product_level(product_level: Optional[str]) -> str:
+        return 'L2A'
+
+    @staticmethod
+    def _processing_mode_for_level(product_level: str) -> str:
+        return 'sentinel2_l2a_analysis'
+
+    def _load_metadata_for_preprocess(self, mtl_path: Optional[str], results: Dict, report: Callable) -> None:
+        results['metadata'] = {
+            **(results.get('metadata') or {}),
+            'sensor': 'Sentinel-2',
+            'product_level': 'L2A',
+        }
+        report('metadata', 'Sentinel-2 L2A 无需 MTL 定标文件', progress=25, status='completed')
+
+    @staticmethod
+    def _filter_bands_to_process(band_paths: Dict[str, str]) -> Tuple[List[Tuple[str, str]], List[str]]:
+        bands_to_process: List[Tuple[str, str]] = []
+        skipped_bands: List[str] = []
+
+        for band_name, band_path in band_paths.items():
+            normalized_band = str(band_name).upper()
+            if not os.path.exists(band_path):
+                continue
+
+            if normalized_band in SENTINEL2_CLASSIFICATION_BANDS:
+                skipped_bands.append(normalized_band)
+                continue
+
+            if normalized_band not in SENTINEL2_OPTICAL_BANDS:
+                logger.warning("跳过 Sentinel-2 非反射率波段: %s", band_name)
+                skipped_bands.append(normalized_band)
+                continue
+
+            bands_to_process.append((normalized_band, band_path))
+
+        return bands_to_process, skipped_bands
+
+    def _load_l2a_surface_reflectance(self, band_path: str, band_name: str) -> np.ndarray:
+        dataset = gdal.Open(band_path)
+        if dataset is None:
+            raise Exception(f"无法打开 Sentinel-2 波段文件: {band_path}")
+
+        raster_band = dataset.GetRasterBand(1)
+        try:
+            raw_values = raster_band.ReadAsArray(buf_type=gdal.GDT_Float32)
+        except TypeError:
+            raw_values = raster_band.ReadAsArray().astype(np.float32, copy=False)
+
+        nodata = raster_band.GetNoDataValue()
+        mask_band = raster_band.GetMaskBand()
+        mask = mask_band.ReadAsArray() if mask_band is not None else None
+        dataset = None
+
+        if raw_values.size == 0:
+            raise Exception(f"Sentinel-2 波段文件为空: {band_path}")
+
+        reflectance = np.asarray(raw_values, dtype=np.float32)
+        valid_mask = np.isfinite(reflectance) & (reflectance > 0)
+        if nodata is not None:
+            valid_mask &= reflectance != nodata
+        if mask is not None:
+            valid_mask &= mask != 0
+
+        np.multiply(reflectance, SENTINEL2_L2A_SR_SCALE, out=reflectance)
+        if np.any(valid_mask):
+            reflectance[valid_mask] = np.clip(reflectance[valid_mask], 0.0, 1.6)
+        reflectance[~valid_mask] = np.nan
+        self._log_array_stats(f"Sentinel-2 波段 {band_name} L2A表面反射率", reflectance)
+        return reflectance
+
+    def process_band(self, band_path: str, band_name: str,
+                    apply_atm_correction: bool = True,
+                    atm_correction_method: str = 'NONE',
+                    product_level: str = 'L2A') -> Tuple[np.ndarray, str]:
+        return self._load_l2a_surface_reflectance(band_path, band_name), 'S2_L2A_SCALE'
+
+    def _process_single_band(
+        self,
+        band_info: Tuple[str, str],
+        output_dir: str,
+        quality_mask: Optional[np.ndarray],
+        clip_extent: Optional[List[float]],
+        clip_shapefile: Optional[str],
+        atm_correction_method: str,
+        product_level: str,
+    ) -> Tuple[str, Optional[str], Optional[str], Optional[str]]:
+        band_name, band_path = band_info
+
+        try:
+            reflectance, actual_method = self.process_band(
+                band_path,
+                band_name,
+                apply_atm_correction=False,
+                atm_correction_method='NONE',
+                product_level='L2A',
+            )
+            self._log_reflectance_quality(band_name, reflectance)
+
+            output_band_path = self._safe_join(output_dir, f'{band_name}_processed.tif')
+            self._write_processed_band(output_band_path, band_path, reflectance)
+            final_path = self._clip_output_if_needed(
+                output_band_path,
+                output_dir,
+                band_name,
+                clip_extent,
+                clip_shapefile,
+            )
+            del reflectance
+            return band_name, final_path, actual_method, None
+        except Exception as exc:
+            return band_name, None, None, str(exc)
+
+    def one_click_preprocess(self,
+                            band_paths: Dict[str, str],
+                            output_dir: str,
+                            mtl_path: str = None,
+                            clip_extent: List[float] = None,
+                            clip_shapefile: str = None,
+                            create_composites: List[str] = None,
+                            apply_cloud_mask: bool = False,
+                            qa_band_path: str = None,
+                            qa_radsat_band_path: str = None,
+                            atm_correction_method: str = 'NONE',
+                            product_level: str = 'L2A',
+                            custom_index_formula: Optional[str] = None,
+                            custom_index_name: Optional[str] = None,
+                            progress_callback: Optional[Callable[[Dict], None]] = None) -> Dict:
+        return super().one_click_preprocess(
+            band_paths=band_paths,
+            output_dir=output_dir,
+            mtl_path=None,
+            clip_extent=clip_extent,
+            clip_shapefile=clip_shapefile,
+            create_composites=create_composites,
+            apply_cloud_mask=False,
+            qa_band_path=None,
+            qa_radsat_band_path=None,
+            atm_correction_method='NONE',
+            product_level='L2A',
+            custom_index_formula=custom_index_formula,
+            custom_index_name=custom_index_name,
+            progress_callback=progress_callback,
+        )

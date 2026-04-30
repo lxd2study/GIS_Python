@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import logging
 import mimetypes
-import os
 import re
 import threading
 import uuid
@@ -33,6 +33,15 @@ DOWNLOAD_CHUNK_SIZE = 1024 * 1024
 DOWNLOAD_MAX_ATTEMPTS = 4
 DOWNLOAD_RETRY_DELAYS = (2, 5, 10)
 DOWNLOAD_MAX_RETRIES = len(DOWNLOAD_RETRY_DELAYS)
+ALLOWED_DOWNLOAD_URL_HOSTS = {
+    "planetarycomputer.microsoft.com",
+    "landsatlook.usgs.gov",
+    "ers.cr.usgs.gov",
+}
+ALLOWED_DOWNLOAD_URL_SUFFIXES = (
+    ".blob.core.windows.net",
+    ".usgs.gov",
+)
 RETRYABLE_DOWNLOAD_EXCEPTIONS = (
     httpx.RemoteProtocolError,
     httpx.ReadError,
@@ -233,10 +242,6 @@ class LandsatDownloadService:
         self.http_timeout = http_timeout or settings.HTTP_TIMEOUT
         self.download_timeout = max(self.http_timeout, 3600)
         self._lock = threading.Lock()
-        self._initial_proxy_env = {
-            key: os.environ.get(key)
-            for key in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "NO_PROXY", "no_proxy")
-        }
 
         self._eros_username = eros_username if eros_username is not None else settings.LANDSAT_EROS_USERNAME
         self._eros_password = eros_password if eros_password is not None else settings.LANDSAT_EROS_PASSWORD
@@ -786,7 +791,6 @@ class LandsatDownloadService:
 
     async def search(self, request: ImagerySearchRequest) -> Dict:
         self._validate_search_request(request)
-        self._apply_proxy_env()
         sensor = request.sensor
         product = request.product
         if self._normalize_search_mode(request.search_mode) == "scene_name":
@@ -806,11 +810,13 @@ class LandsatDownloadService:
         return self._search_spatial(catalog, config, request)
 
     async def sign_url(self, url: str) -> Dict:
+        self._validate_download_url(url)
         if self._is_usgs_url(url):
             return {"signed_url": url}
         return {"signed_url": planetary_computer.sign(url)}
 
     async def create_proxy_download_response(self, url: str, filename: str) -> StreamingResponse:
+        self._validate_download_url(url)
         client, response = await self._execute_retryable_download(
             operation=lambda _attempt: self._open_download_stream(url),
             on_retry=self._sleep_before_retry,
@@ -936,6 +942,33 @@ class LandsatDownloadService:
             if task["status"] in {"pending", "downloading", "retrying"}:
                 task["status"] = "cancelled"
                 task["updated_at"] = self._format_timestamp(self._utc_now())
+
+        return {"ok": True, "task_id": task_id}
+
+    def retry_download_task(self, task_id: str, sensor: Optional[str] = None) -> Dict:
+        with self._lock:
+            task = self._tasks.get(task_id)
+            if not task or (sensor and task.get("sensor") != self._normalize_sensor(explicit_sensor=sensor)):
+                raise KeyError(task_id)
+            if task["status"] != "failed":
+                raise ValueError("仅失败任务支持重新下载")
+
+            task["status"] = "pending"
+            task["progress"] = 0
+            task["size_total"] = 0
+            task["size_downloaded"] = 0
+            task["error"] = None
+            task["last_error"] = None
+            task["retry_count"] = 0
+            task["max_retries"] = DOWNLOAD_MAX_RETRIES
+            task["local_path"] = None
+            task["download_date"] = self._local_today_folder()
+            task["updated_at"] = self._format_timestamp(self._utc_now())
+            task["target_dir"] = self._build_task_target_relative_dir(task).as_posix()
+            mode = task.get("mode", "server")
+
+        if mode == "server":
+            asyncio.create_task(self._download_in_background(task_id))
 
         return {"ok": True, "task_id": task_id}
 
@@ -1102,6 +1135,7 @@ class LandsatDownloadService:
             task["updated_at"] = self._format_timestamp(self._utc_now())
 
     async def _resolve_download_url(self, url: str) -> Tuple[str, Dict[str, str]]:
+        self._validate_download_url(url)
         if self._is_usgs_url(url):
             return url, await self._get_usgs_cookies()
         return planetary_computer.sign(url), {}
@@ -1113,6 +1147,7 @@ class LandsatDownloadService:
                 timeout=self.download_timeout,
                 follow_redirects=True,
                 cookies=cookies,
+                url=final_url,
             )
         )
 
@@ -1172,7 +1207,11 @@ class LandsatDownloadService:
     async def _try_login(self, username: str, password: str) -> bool:
         try:
             async with httpx.AsyncClient(
-                **self._build_httpx_client_kwargs(timeout=30, follow_redirects=True)
+                **self._build_httpx_client_kwargs(
+                    timeout=30,
+                    follow_redirects=True,
+                    url=self.EROS_LOGIN_URL,
+                )
             ) as client:
                 login_page = await client.get(self.EROS_LOGIN_URL)
                 login_page.raise_for_status()
@@ -1208,10 +1247,12 @@ class LandsatDownloadService:
         timeout: int,
         follow_redirects: bool = False,
         cookies: Optional[Dict[str, str]] = None,
+        url: str = "",
     ) -> Dict:
         with self._lock:
             proxy_enabled = self._proxy_enabled
             proxy_url = self._proxy_url
+            no_proxy = self._no_proxy
 
         kwargs: Dict[str, object] = {
             "timeout": httpx.Timeout(connect=30.0, read=float(timeout), write=30.0, pool=30.0),
@@ -1219,9 +1260,10 @@ class LandsatDownloadService:
         }
         if cookies:
             kwargs["cookies"] = cookies
-        if proxy_enabled and proxy_url:
-            kwargs["proxy"] = proxy_url
+        if proxy_enabled:
             kwargs["trust_env"] = False
+            if proxy_url and not self._matches_no_proxy(url, no_proxy):
+                kwargs["proxy"] = proxy_url
         return kwargs
 
     @staticmethod
@@ -1235,34 +1277,49 @@ class LandsatDownloadService:
             self._proxy_enabled = enabled and bool(proxy_url)
             self._proxy_url = proxy_url if self._proxy_enabled else ""
             self._no_proxy = no_proxy if self._proxy_enabled else ""
-        self._apply_proxy_env()
 
-    def _apply_proxy_env(self) -> None:
-        with self._lock:
-            proxy_enabled = self._proxy_enabled
-            proxy_url = self._proxy_url
-            no_proxy = self._no_proxy
+    @staticmethod
+    def _validate_download_url(url: str) -> None:
+        parsed = urlsplit(str(url or "").strip())
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            raise ValueError("下载地址必须是有效的 http 或 https URL")
 
-        proxy_keys = ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy")
-        no_proxy_keys = ("NO_PROXY", "no_proxy")
+        host = parsed.hostname.strip().lower().rstrip(".")
+        try:
+            address = ipaddress.ip_address(host)
+        except ValueError:
+            address = None
 
-        if proxy_enabled and proxy_url:
-            for key in proxy_keys:
-                os.environ[key] = proxy_url
-            if no_proxy:
-                for key in no_proxy_keys:
-                    os.environ[key] = no_proxy
-            else:
-                for key in no_proxy_keys:
-                    os.environ.pop(key, None)
-            return
+        if address is not None:
+            if not address.is_global:
+                raise ValueError("禁止代理下载本机、内网或保留地址")
+            raise ValueError("禁止直接代理下载 IP 地址，请使用受信任的遥感资产域名")
 
-        for key in proxy_keys + no_proxy_keys:
-            original_value = self._initial_proxy_env.get(key)
-            if original_value is None:
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = original_value
+        if host in {"localhost", "localhost.localdomain"} or host.endswith(".localhost"):
+            raise ValueError("禁止代理下载本机地址")
+
+        allowed = host in ALLOWED_DOWNLOAD_URL_HOSTS or any(
+            host.endswith(suffix) for suffix in ALLOWED_DOWNLOAD_URL_SUFFIXES
+        )
+        if not allowed:
+            raise ValueError("下载地址域名不在允许的遥感资产来源列表中")
+
+    @staticmethod
+    def _matches_no_proxy(url: str, no_proxy: str) -> bool:
+        if not url or not no_proxy:
+            return False
+
+        host = (urlsplit(url).hostname or "").lower().rstrip(".")
+        if not host:
+            return False
+
+        for raw_item in no_proxy.split(","):
+            item = raw_item.strip().lower().lstrip(".")
+            if not item:
+                continue
+            if item == "*" or host == item or host.endswith(f".{item}"):
+                return True
+        return False
 
     @staticmethod
     def _extract_csrf_token(html: str) -> str:

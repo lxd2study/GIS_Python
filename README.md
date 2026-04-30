@@ -10,13 +10,13 @@
 
 | 模块 | 说明 |
 |---|---|
-| 单景预处理 | 上传波段、MTL、QA 文件后提交异步任务，支持结果预览与步骤进度追踪 |
+| 单景预处理 | 上传波段、MTL、QA 文件后提交异步任务，支持结果预览与步骤进度追踪；新增 Sentinel-2 L2A 独立处理入口 |
 | 产品级别 | 支持 `L1` 与 `L2` 输入；`L1` 走辐射定标 + 大气校正链，`L2` 自动跳过辐射/大气预处理，直接按官方缩放系数生成分析结果 |
 | 质量掩膜 | 支持 `QA_PIXEL` 云/阴影/雪/卷云掩膜，支持 `QA_RADSAT` 饱和像元掩膜，并返回质量摘要与有效像元比例 |
 | 大气校正 | DOS 简化模型；Py6S 精确 6S 辐射传输模型（依赖缺失或失败时自动回退） |
 | 几何裁剪 | 基于范围框或 `.shp` 的栅格裁剪 |
 | 波段合成 | 真彩色、假彩色、城市、农业、短波红外等预设；支持自定义指数公式 |
-| 遥感指数 | NDVI、EVI、SAVI、MSAVI、ARVI、RVI、NDWI、MNDWI、AWEI、WRI、NDBI、IBI 等 |
+| 遥感指数 | NDVI、EVI、SAVI、MSAVI、ARVI、RVI、NDWI、MNDWI、AWEI、WRI、NDBI、IBI、APGI 大棚指数等 |
 | 批量处理 | Vue Flow 节点式流程编辑器，支持数据目录扫描、场景筛选、条件裁剪、合成指数和输出路径编排 |
 | 影像下载检索 | STAC 检索 Landsat `L1/L2` 与 Sentinel-2 `L2A` 场景，支持 AOI 框选或矢量导入、资产勾选、浏览器下载与服务端下载队列，支持代理与下载目录配置 |
 
@@ -106,7 +106,7 @@ python -m remote_sensing_tools serve
 rstool serve
 ```
 
-默认监听地址为 [http://127.0.0.1:5001](http://127.0.0.1:5001)，接口文档位于 [http://127.0.0.1:5001/docs](http://127.0.0.1:5001/docs)。
+默认监听地址由 `.env` 中的 `HOST` 与 `PORT` 控制，接口文档位于 [http://127.0.0.1:5001/docs](http://127.0.0.1:5001/docs)。如使用 `HOST=0.0.0.0` 做局域网演示，请勿暴露到不可信网络。
 
 ### 2. 启动前端
 
@@ -124,7 +124,7 @@ npm run dev
 ## 推荐使用流程
 
 1. 在预处理页确认后端在线，设置输出目录。
-2. 如果是本地单景数据，选择 `L1` 或 `L2` 产品级别后上传波段、MTL、`QA_PIXEL`、可选的 `QA_RADSAT`。
+2. 如果是本地单景数据，Landsat 选择 `L1` 或 `L2` 产品级别后上传波段、MTL、`QA_PIXEL`、可选的 `QA_RADSAT`；Sentinel-2 选择 L2A 入口后上传 `B01/B02/B03/B04/B08/B11/B12` 等波段即可计算 APGI。
 3. 如果是批量数据，进入批量处理页扫描数据目录，由节点自动传播场景和产品级别。
 4. 如需在线取数，先在影像下载页完成 AOI 检索（矩形框选或矢量导入）与资产下载；Landsat L1 需配置 USGS 账号；如访问 STAC 或下载较慢，可配置 HTTP/HTTPS 代理或调整服务端下载目录。
 5. 任务完成后在结果区查看产物路径、预览图和摘要信息。
@@ -148,9 +148,14 @@ CACHE_DIR=./cache
 MAX_WORKERS=4
 GDAL_CACHEMAX=512
 GDAL_NUM_THREADS=ALL_CPUS
-LANDSAT_PROXY_URL=http://127.0.0.1:7890
+LANDSAT_DOWNLOAD_DIR=./output/landsat_downloads
+LANDSAT_EROS_USERNAME=
+LANDSAT_EROS_PASSWORD=
+LANDSAT_PROXY_URL=
 LANDSAT_NO_PROXY=127.0.0.1,localhost
 ```
+
+`.env` 仅用于本机运行，请不要提交或放入项目交付压缩包。`data/`、`output/`、`cache/`、`temp/` 与 `frontend-vue/dist/` 均为本地数据或生成产物，交付源码时应保持排除。
 
 前端默认读取 `frontend-vue/.env`：
 
@@ -164,8 +169,8 @@ VITE_API_BASE_URL=http://127.0.0.1:5001
 
 详见 [`docs/`](docs/) 目录：
 
+- [文档导航](docs/README.md)
+- [项目结构说明](docs/project_structure.md)
 - [批量处理快速开始](docs/batch_processing_quickstart.md)
 - [批量处理指南](docs/batch_processing_guide.md)
 - [遥感指数使用指南](docs/indices_usage_guide.md)
-- [预处理科学分析](docs/PREPROCESSING_SCIENTIFIC_ANALYSIS.md)
-- [项目目录结构](docs/project_structure.md)

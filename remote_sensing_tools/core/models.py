@@ -43,6 +43,9 @@ class CompositeType(str, Enum):
     BSI = "bsi"
     NDSI = "ndsi"
 
+    # 大棚指数
+    APGI = "apgi"
+
 
 class BandPaths(BaseModel):
     """波段路径模型"""
@@ -62,6 +65,7 @@ class ProcessingResult(BaseModel):
     skipped_bands: List[str] = Field(default_factory=list)
     product_level: Optional[str] = None
     processing_mode: Optional[str] = None
+    sensor: Optional[str] = None
     qa_mask_summary: Optional[Dict[str, ScalarValue]] = None
     valid_pixel_ratio: Optional[float] = None
 
