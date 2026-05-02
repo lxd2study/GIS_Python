@@ -1,6 +1,15 @@
 <script setup>
 import { computed, defineAsyncComponent, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import AoiMapPicker from './components/AoiMapPicker.vue'
+import {
+  ALL_BANDS,
+  CORE_BANDS,
+  SENTINEL_ALL_BANDS,
+  SENTINEL_COMPOSITE_ORDER,
+  SENTINEL_CORE_BANDS,
+  fallbackComposites,
+} from './config/processingOptions'
+import { apiRequest, normalizeApiBase } from './utils/apiClient'
 import { assessCoverage } from './utils/coverage'
 
 const BatchManager = defineAsyncComponent(() => import('./components/BatchManager.vue'))
@@ -14,64 +23,23 @@ const API_KEY = 'rst_vue_api_base'
 const OUTPUT_MODE_KEY = 'rst_output_mode'
 const OUTPUT_BASE_KEY = 'rst_output_base'
 const OUTPUT_MANUAL_KEY = 'rst_output_manual'
+const CURRENT_TAB_KEY = 'rst_current_tab'
+const ADVANCED_OPEN_KEY = 'rst_single_advanced_open'
+const PREVIEW_SIZE_KEY = 'rst_preview_size'
+const VALID_TABS = ['single', 'batch', 'download', 'results', 'indices']
+const RESULT_GROUP_LABELS = {
+  processed: '处理波段',
+  composite: '合成与指数',
+  mask: '质量掩膜',
+  binary: '二值化结果',
+  derived: '派生产物',
+}
 const TOAST_DURATION = {
   idle: 2200,
   ok: 2600,
   warn: 3600,
   error: 5200
 }
-
-const CORE_BANDS = ['B2', 'B3', 'B4', 'B5']
-const SENTINEL_CORE_BANDS = ['B01', 'B04', 'B08', 'B12']
-const ALL_BANDS = Array.from({ length: 11 }, (_, i) => `B${i + 1}`)
-const SENTINEL_ALL_BANDS = ['B01', 'B02', 'B03', 'B04', 'B05', 'B06', 'B07', 'B08', 'B8A', 'B09', 'B11', 'B12']
-
-const fallbackComposites = [
-  // RGB合成 (6种)
-  { type: 'true_color', name: '真彩色 (RGB)' },
-  { type: 'false_color', name: '假彩色 (CIR)' },
-  { type: 'agriculture', name: '农业监测' },
-  { type: 'urban', name: '城市研究' },
-  { type: 'natural_color', name: '自然彩色' },
-  { type: 'swir', name: '短波红外' },
-  // 植被指数 (6种)
-  { type: 'ndvi', name: 'NDVI - 归一化植被指数' },
-  { type: 'evi', name: 'EVI - 增强型植被指数' },
-  { type: 'savi', name: 'SAVI - 土壤调节植被指数' },
-  { type: 'msavi', name: 'MSAVI - 修正土壤调节植被指数' },
-  { type: 'arvi', name: 'ARVI - 抗大气植被指数' },
-  { type: 'rvi', name: 'RVI - 比值植被指数' },
-  // 水体指数 (4种)
-  { type: 'ndwi', name: 'NDWI - 归一化水体指数' },
-  { type: 'mndwi', name: 'MNDWI - 改进归一化水体指数' },
-  { type: 'awei', name: 'AWEI - 自动水体提取指数' },
-  { type: 'wri', name: 'WRI - 水体比率指数' },
-  // 建筑/城市指数 (4种)
-  { type: 'ndbi', name: 'NDBI - 归一化建筑指数' },
-  { type: 'ibi', name: 'IBI - 综合建筑指数' },
-  { type: 'ndbai', name: 'NDBaI - 归一化裸地与建筑指数' },
-  { type: 'ui', name: 'UI - 城市指数' },
-  // 其他指数 (3种)
-  { type: 'apgi', name: 'APGI - 大棚指数' },
-  { type: 'nbr', name: 'NBR - 归一化燃烧指数' },
-  { type: 'bsi', name: 'BSI - 裸土指数' },
-  { type: 'ndsi', name: 'NDSI - 归一化积雪指数' }
-]
-
-const SENTINEL_COMPOSITE_ORDER = [
-  'apgi',
-  'true_color',
-  'false_color',
-  'agriculture',
-  'urban',
-  'natural_color',
-  'swir',
-  'ndvi',
-  'evi',
-  'ndwi',
-  'mndwi',
-  'ndbi'
-]
 
 function loadHistory() {
   try {
@@ -82,9 +50,19 @@ function loadHistory() {
   }
 }
 
+function loadSavedTab() {
+  const saved = localStorage.getItem(CURRENT_TAB_KEY)
+  return VALID_TABS.includes(saved) ? saved : 'single'
+}
+
+function loadPreviewSize() {
+  const value = Number(localStorage.getItem(PREVIEW_SIZE_KEY))
+  return Number.isFinite(value) ? Math.max(128, Math.min(2048, value)) : 768
+}
+
 const state = reactive({
   apiBase: localStorage.getItem(API_KEY) || ENV_API || 'http://127.0.0.1:5001',
-  currentTab: 'single',
+  currentTab: loadSavedTab(),
   health: null,
   sensor: 'landsat',
   inputSource: 'upload',
@@ -125,7 +103,7 @@ const state = reactive({
   outputHistory: loadHistory(),
   outputBookmarks: JSON.parse(localStorage.getItem('rst_output_bookmarks') || '[]'),
   showHistoryDropdown: false,
-  showAdvancedOptions: false,
+  showAdvancedOptions: localStorage.getItem(ADVANCED_OPEN_KEY) === '1',
   showBandDetails: false,
   pathPickerOpen: false,
   pathPickerLoading: false,
@@ -145,7 +123,7 @@ const state = reactive({
   polling: true,
   derivedResults: [],
   previewPath: '',
-  previewSize: 768,
+  previewSize: loadPreviewSize(),
   previewImage: '',
   previewMeta: null,
   binaryThreshold: '0',
@@ -161,8 +139,7 @@ const clipFileInput = ref(null)
 let singleCoverageRequestId = 0
 
 function normalizedApiBase() {
-  const value = state.apiBase.trim().replace(/\/+$/, '')
-  return value || 'http://127.0.0.1:5001'
+  return normalizeApiBase(state.apiBase)
 }
 
 function bandSortValue(band) {
@@ -295,20 +272,8 @@ function setToast(text, type = 'idle') {
   }, duration)
 }
 
-function parseDetail(detail) {
-  if (typeof detail === 'string') return detail
-  if (Array.isArray(detail)) {
-    return detail.map((item) => (typeof item === 'object' ? item.msg || JSON.stringify(item) : String(item))).join(' | ')
-  }
-  if (detail && typeof detail === 'object') return detail.msg || JSON.stringify(detail)
-  return '请求失败'
-}
-
 async function request(path, options = {}) {
-  const resp = await fetch(`${normalizedApiBase()}${path}`, options)
-  const data = await resp.json().catch(() => ({}))
-  if (!resp.ok) throw new Error(parseDetail(data.detail || data.message || `HTTP ${resp.status}`))
-  return data
+  return apiRequest(normalizedApiBase(), path, options)
 }
 
 const bandAnalysis = computed(() => {
@@ -404,16 +369,114 @@ const pathPickerTitle = computed(() => {
   return '选择目录'
 })
 
-const canSubmit = computed(() => {
+const singleReadinessItems = computed(() => {
+  const items = []
+  const outputDir = outputDirResolved.value.trim()
+  const hasOutput = outputDir.length > 0
+
   if (state.inputSource === 'server') {
-    return !!selectedServerScene.value && outputDirResolved.value.length > 0 && !state.submitting
+    const hasRoot = normalizePath(state.serverResourceRoot).length > 0
+    items.push({
+      key: 'input',
+      label: '输入数据',
+      status: selectedServerScene.value ? 'ok' : 'blocked',
+      text: selectedServerScene.value
+        ? `已选择 ${selectedServerScene.value.name || shortPath(selectedServerScene.value.path, 2)}`
+        : (hasRoot ? '已设置根目录，请扫描并选择场景' : '请先选择资源根目录并扫描场景'),
+    })
+  } else {
+    const bandStatus = selectedBandCount.value > 0
+      ? (bandAnalysis.value.duplicates.length ? 'blocked' : (bandAnalysis.value.missingCore.length ? 'warn' : 'ok'))
+      : 'blocked'
+    items.push({
+      key: 'input',
+      label: '输入数据',
+      status: bandStatus,
+      text: selectedBandCount.value > 0
+        ? `${selectedBandCount.value} 个文件，识别 ${bandAnalysis.value.recognized.length} 个波段`
+        : '请上传 GeoTIFF/IMG 波段文件',
+    })
   }
-  return (
-    selectedBandCount.value > 0 &&
-    outputDirResolved.value.length > 0 &&
-    bandAnalysis.value.duplicates.length === 0 &&
-    !state.submitting
-  )
+
+  items.push({
+    key: 'output',
+    label: '输出目录',
+    status: hasOutput ? 'ok' : 'blocked',
+    text: hasOutput ? shortPath(outputDir, 3) : '请设置输出目录',
+  })
+
+  if (state.inputSource === 'upload' && bandAnalysis.value.duplicates.length) {
+    items.push({
+      key: 'duplicates',
+      label: '波段冲突',
+      status: 'blocked',
+      text: `重复波段：${bandAnalysis.value.duplicates.map((item) => item.band).join(', ')}`,
+    })
+  } else if (state.inputSource === 'upload' && bandAnalysis.value.missingCore.length) {
+    items.push({
+      key: 'missingCore',
+      label: '核心波段',
+      status: 'warn',
+      text: `缺少核心波段：${bandAnalysis.value.missingCore.join(', ')}`,
+    })
+  } else {
+    items.push({
+      key: 'bands',
+      label: '波段识别',
+      status: state.inputSource === 'server' || selectedBandCount.value > 0 ? 'ok' : 'blocked',
+      text: state.inputSource === 'server' ? '使用在线场景元数据' : '未发现阻塞项',
+    })
+  }
+
+  const coverageStatus = singleCoverageValidation.value.status
+  if (state.sceneCoverageLoading && singleClipRoiBbox.value) {
+    items.push({ key: 'roi', label: 'ROI 覆盖', status: 'blocked', text: '正在读取覆盖范围，请稍候' })
+  } else if (['partial', 'outside'].includes(coverageStatus)) {
+    items.push({
+      key: 'roi',
+      label: 'ROI 覆盖',
+      status: 'blocked',
+      text: coverageStatus === 'partial' ? 'ROI 部分超出影像覆盖范围' : 'ROI 完全不在影像覆盖范围内',
+    })
+  } else if (singleClipRoiBbox.value) {
+    items.push({
+      key: 'roi',
+      label: 'ROI 覆盖',
+      status: state.sceneCoverageBbox ? 'ok' : 'warn',
+      text: state.sceneCoverageBbox ? 'ROI 可用于裁剪' : '未加载影像覆盖范围，提交时仍会按 ROI 裁剪',
+    })
+  } else {
+    items.push({ key: 'roi', label: 'ROI 覆盖', status: 'ok', text: '未设置裁剪 ROI，将处理完整影像' })
+  }
+
+  items.push({
+    key: 'composites',
+    label: '合成项',
+    status: state.selectedComposites.length ? 'ok' : 'warn',
+    text: state.selectedComposites.length ? `已选 ${state.selectedComposites.length} 项` : '未选择合成项，仅输出基础处理结果',
+  })
+
+  const hasFormula = state.customFormula.trim().length > 0
+  items.push({
+    key: 'formula',
+    label: '自定义公式',
+    status: hasFormula && !state.customName.trim() ? 'warn' : 'ok',
+    text: hasFormula
+      ? (state.customName.trim() ? `输出名 ${state.customName.trim()}` : '未填写名称，将使用后端默认命名')
+      : '未启用',
+  })
+
+  return items
+})
+
+const singleSubmitBlockReason = computed(() => {
+  if (state.submitting) return '任务正在提交'
+  const blocked = singleReadinessItems.value.find((item) => item.status === 'blocked')
+  return blocked ? `${blocked.label}：${blocked.text}` : ''
+})
+
+const canSubmit = computed(() => {
+  return !singleSubmitBlockReason.value
 })
 
 const resultItems = computed(() => {
@@ -433,6 +496,36 @@ const resultItems = computed(() => {
     list.push({ label: item.label, path: item.path, group: item.group || 'derived' })
   })
   return list
+})
+
+const groupedResultItems = computed(() => {
+  const groups = []
+  resultItems.value.forEach((item) => {
+    const key = item.group || 'derived'
+    let group = groups.find((entry) => entry.key === key)
+    if (!group) {
+      group = {
+        key,
+        label: RESULT_GROUP_LABELS[key] || RESULT_GROUP_LABELS.derived,
+        items: [],
+      }
+      groups.push(group)
+    }
+    group.items.push(item)
+  })
+  return groups
+})
+
+const currentJobId = computed(() => (state.manualJobId || state.jobId || '').trim())
+const hasTerminalProgress = computed(() => ['success', 'error', 'partial'].includes(state.progress?.status))
+const previewDisplayName = computed(() => {
+  if (!state.previewPath) return '等待预览'
+  return fileStem(state.previewPath)
+})
+const binaryDisabledReason = computed(() => {
+  if (state.binaryRunning) return '二值化处理中'
+  if (!state.previewPath) return '请先加载一个栅格结果'
+  return ''
 })
 
 async function checkHealth() {
@@ -897,7 +990,10 @@ function pickHistory(path) {
 }
 
 async function submitTask() {
-  if (!canSubmit.value) return
+  if (!canSubmit.value) {
+    setToast(singleSubmitBlockReason.value || '请先完成必填配置', 'warn')
+    return
+  }
   state.submitting = true
   setToast('提交任务中...', 'idle')
   state.previewImage = ''
@@ -987,7 +1083,12 @@ async function queryStatus(silent = false) {
     const task = await request(`/preprocess_landsat8_status/${encodeURIComponent(targetId)}`)
     state.jobId = targetId
     state.progress = task
-    if (['success', 'error', 'partial'].includes(task.status)) stopPolling()
+    if (['success', 'error', 'partial'].includes(task.status)) {
+      stopPolling()
+      if (task.status === 'success' || task.status === 'partial') {
+        await loadFirstPreviewResult()
+      }
+    }
   } catch (error) {
     if (!silent) setToast(`查询失败：${error.message}`, 'error')
     stopPolling()
@@ -1015,6 +1116,12 @@ function resetForm() {
   state.binaryResult = null
   state.binaryOutputPath = ''
   setToast('表单已重置', 'idle')
+}
+
+async function loadFirstPreviewResult() {
+  const first = resultItems.value[0]
+  if (!first?.path || (state.previewImage && state.previewPath === first.path)) return
+  await loadPreview(first.path)
 }
 
 const singleClipRoiBbox = computed(() => {
@@ -1096,7 +1203,10 @@ async function loadPreview(path = '', options = {}) {
   try {
     const body = new FormData()
     body.append('file_path', targetPath)
-    body.append('max_size', String(Math.max(128, Math.min(2048, Number(state.previewSize) || 768))))
+    const previewSize = Math.max(128, Math.min(2048, Number(state.previewSize) || 768))
+    state.previewSize = previewSize
+    localStorage.setItem(PREVIEW_SIZE_KEY, String(previewSize))
+    body.append('max_size', String(previewSize))
     const data = await request('/preview_raster', { method: 'POST', body })
     if (!options.preserveBinaryResult && targetPath !== state.previewPath) {
       state.binaryResult = null
@@ -1168,7 +1278,14 @@ function handleBatchToast({ type = 'idle', message } = {}) {
 }
 
 function switchTab(tab) {
+  if (!VALID_TABS.includes(tab)) return
   state.currentTab = tab
+  localStorage.setItem(CURRENT_TAB_KEY, tab)
+}
+
+function toggleAdvancedOptions() {
+  state.showAdvancedOptions = !state.showAdvancedOptions
+  localStorage.setItem(ADVANCED_OPEN_KEY, state.showAdvancedOptions ? '1' : '0')
 }
 
 function toggleHistoryDropdown() {
@@ -1206,8 +1323,16 @@ function useBookmark(path) {
 }
 
 function copyToClipboard(text) {
+  if (!text) {
+    setToast('没有可复制的内容', 'warn')
+    return
+  }
+  if (!navigator.clipboard?.writeText) {
+    setToast('复制失败，请手动复制', 'warn')
+    return
+  }
   navigator.clipboard.writeText(text).then(() => {
-    setToast('路径已复制到剪贴板', 'ok')
+    setToast('已复制到剪贴板', 'ok')
   }).catch(() => {
     setToast('复制失败，请手动复制', 'warn')
   })
@@ -1296,10 +1421,13 @@ onBeforeUnmount(() => {
     </section>
 
     <!-- Tab Navigation -->
-    <section class="tabs-bar">
+    <section class="tabs-bar" role="tablist" aria-label="主功能导航">
       <button
         class="tab-btn"
         :class="{ active: state.currentTab === 'single' }"
+        type="button"
+        role="tab"
+        :aria-selected="state.currentTab === 'single'"
         @click="switchTab('single')"
       >
         单任务处理
@@ -1307,6 +1435,9 @@ onBeforeUnmount(() => {
       <button
         class="tab-btn"
         :class="{ active: state.currentTab === 'batch' }"
+        type="button"
+        role="tab"
+        :aria-selected="state.currentTab === 'batch'"
         @click="switchTab('batch')"
       >
         批量处理
@@ -1314,6 +1445,9 @@ onBeforeUnmount(() => {
       <button
         class="tab-btn"
         :class="{ active: state.currentTab === 'download' }"
+        type="button"
+        role="tab"
+        :aria-selected="state.currentTab === 'download'"
         @click="switchTab('download')"
       >
         影像下载
@@ -1321,6 +1455,9 @@ onBeforeUnmount(() => {
       <button
         class="tab-btn"
         :class="{ active: state.currentTab === 'results' }"
+        type="button"
+        role="tab"
+        :aria-selected="state.currentTab === 'results'"
         @click="switchTab('results')"
       >
         结果下载
@@ -1328,6 +1465,9 @@ onBeforeUnmount(() => {
       <button
         class="tab-btn"
         :class="{ active: state.currentTab === 'indices' }"
+        type="button"
+        role="tab"
+        :aria-selected="state.currentTab === 'indices'"
         @click="switchTab('indices')"
       >
         遥感指数百科
@@ -1337,15 +1477,33 @@ onBeforeUnmount(() => {
     <!-- Single Task View -->
     <section v-if="state.currentTab === 'single'" class="layout-compact">
       <article class="card form-card-compact">
-        <div class="title-row-compact">
-          <h2>任务配置</h2>
-          <small>{{ singleInputSummaryText }}</small>
-        </div>
+          <div class="title-row-compact">
+            <h2>任务配置</h2>
+            <small>{{ singleInputSummaryText }}</small>
+          </div>
+
+          <div class="readiness-panel" :class="{ blocked: !!singleSubmitBlockReason }">
+            <div class="readiness-head">
+              <strong>{{ singleSubmitBlockReason ? '任务未就绪' : '任务已就绪' }}</strong>
+              <span>{{ singleSubmitBlockReason || '可以提交单景预处理任务' }}</span>
+            </div>
+            <div class="readiness-grid">
+              <div
+                v-for="item in singleReadinessItems"
+                :key="item.key"
+                class="readiness-item"
+                :data-status="item.status"
+              >
+                <strong>{{ item.label }}</strong>
+                <span>{{ item.text }}</span>
+              </div>
+            </div>
+          </div>
 
         <div class="form-grid-compact">
           <div class="field-compact full">
             <span>数据来源</span>
-            <div class="mode-row-compact">
+              <div class="mode-row-compact">
               <button class="btn-tiny" :class="{ active: state.inputSource === 'upload' }" type="button" @click="switchInputSource('upload')">
                 本地上传
               </button>
@@ -1427,7 +1585,7 @@ onBeforeUnmount(() => {
                   placeholder="服务端白名单目录"
                   @change="handleServerRootEdited"
                 />
-                <button class="btn-mini" type="button" @click="openPathPicker('serverRoot')">...</button>
+                <button class="btn-mini" type="button" aria-label="选择资源根目录" @click="openPathPicker('serverRoot')">...</button>
                 <button
                   class="btn-mini pri"
                   type="button"
@@ -1500,10 +1658,10 @@ onBeforeUnmount(() => {
           <div class="field-compact full">
             <span>输出模式</span>
             <div class="mode-row-compact">
-              <button class="btn-tiny" :class="{ active: state.outputMode === 'auto' }" @click="switchOutputMode('auto')">
+              <button class="btn-tiny" :class="{ active: state.outputMode === 'auto' }" type="button" @click="switchOutputMode('auto')">
                 自动组合
               </button>
-              <button class="btn-tiny" :class="{ active: state.outputMode === 'manual' }" @click="switchOutputMode('manual')">
+              <button class="btn-tiny" :class="{ active: state.outputMode === 'manual' }" type="button" @click="switchOutputMode('manual')">
                 手动输入
               </button>
             </div>
@@ -1514,14 +1672,14 @@ onBeforeUnmount(() => {
               <span>基路径</span>
               <div class="input-row">
                 <input v-model="state.outputBaseDir" type="text" @change="saveOutputPrefs" placeholder="E:\..." />
-                <button class="btn-mini" @click="openPathPicker('base')">...</button>
+                <button class="btn-mini" type="button" aria-label="选择输出基路径" @click="openPathPicker('base')">...</button>
               </div>
             </label>
             <label class="field-compact full">
               <span>场景名</span>
               <div class="input-row">
                 <input v-model="state.outputSceneName" type="text" @change="saveOutputPrefs" placeholder="LC08_..." />
-                <button class="btn-mini" @click="useSceneHint" :disabled="!suggestedOutputSceneName">识别</button>
+                <button class="btn-mini" type="button" @click="useSceneHint" :disabled="!suggestedOutputSceneName">识别</button>
               </div>
             </label>
           </template>
@@ -1530,7 +1688,7 @@ onBeforeUnmount(() => {
             <span>输出目录</span>
             <div class="input-row">
               <input v-model="state.outputDirManual" type="text" @change="saveOutputPrefs" placeholder="完整路径" />
-              <button class="btn-mini" @click="openPathPicker('manual')">...</button>
+              <button class="btn-mini" type="button" aria-label="选择输出目录" @click="openPathPicker('manual')">...</button>
             </div>
           </label>
 
@@ -1545,13 +1703,13 @@ onBeforeUnmount(() => {
                 <option v-for="path in state.outputHistory" :key="'h-'+path" :value="path">{{ path }}</option>
               </optgroup>
             </select>
-            <button class="btn-mini" @click="addBookmark">+</button>
+            <button class="btn-mini" type="button" aria-label="添加输出路径书签" @click="addBookmark">+</button>
           </div>
 
           <!-- 高级选项（可折叠） -->
           <div class="field-compact full">
-            <button class="toggle-section" @click="state.showAdvancedOptions = !state.showAdvancedOptions">
-              <span>高级选项</span>
+            <button class="toggle-section" type="button" :aria-expanded="state.showAdvancedOptions" @click="toggleAdvancedOptions">
+              <span>高级选项：ROI、校正与掩膜</span>
               <span class="toggle-section-icon" :class="{ open: state.showAdvancedOptions }" aria-hidden="true">
                 <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
                   <path d="M5 3.5 10 8l-5 4.5" />
@@ -1644,17 +1802,22 @@ onBeforeUnmount(() => {
                 :key="item.type"
                 class="chip-compact"
                 :class="{ active: state.selectedComposites.includes(item.type) }"
+                type="button"
                 @click="toggleComposite(item.type)"
               >
                 {{ item.name }}
               </button>
-              <button v-if="compositeOptions.length > 12" class="chip-compact more" @click="switchTab('indices')">
+              <button v-if="compositeOptions.length > 12" class="chip-compact more" type="button" @click="switchTab('indices')">
                 +{{ compositeOptions.length - 12 }} 更多...
               </button>
             </div>
           </div>
 
           <!-- 自定义公式 -->
+          <div class="field-compact full optional-section-label">
+            <span>可选分析项</span>
+          </div>
+
           <label class="field-compact">
             <span>自定义公式</span>
             <input v-model="state.customFormula" type="text" placeholder="(B5-B4)/(B5+B4)" />
@@ -1667,10 +1830,10 @@ onBeforeUnmount(() => {
         </div>
 
         <div class="actions-compact">
-          <button class="btn pri" :disabled="!canSubmit" @click="submitTask">
+          <button class="btn pri" type="button" :disabled="!canSubmit" :title="singleSubmitBlockReason || '提交任务'" @click="submitTask">
             {{ state.submitting ? '提交中...' : '提交任务' }}
           </button>
-          <button class="btn sub" @click="resetForm">重置</button>
+          <button class="btn sub" type="button" @click="resetForm">重置</button>
         </div>
       </article>
 
@@ -1680,9 +1843,17 @@ onBeforeUnmount(() => {
           <small>{{ statusLabel }}</small>
         </div>
 
+        <div class="job-card-compact" :class="{ done: hasTerminalProgress }">
+          <span>当前 Job ID</span>
+          <strong>{{ currentJobId || '尚未创建' }}</strong>
+          <button class="btn-mini" type="button" :disabled="!currentJobId" @click="copyToClipboard(currentJobId)">
+            复制
+          </button>
+        </div>
+
         <div class="query-row-compact">
           <input v-model="state.manualJobId" type="text" placeholder="job_id" />
-          <button class="btn-mini pri" @click="queryStatus()">查询</button>
+          <button class="btn-mini pri" type="button" @click="queryStatus()">查询</button>
           <label class="poll-compact">
             <input v-model="state.polling" type="checkbox" @change="restartPolling" />
             <span>轮询</span>
@@ -1696,10 +1867,21 @@ onBeforeUnmount(() => {
 
         <div class="result-box-compact">
           <strong>产物列表</strong>
-          <div v-if="resultItems.length" class="result-list-compact">
-            <button v-for="item in resultItems" :key="`${item.group}-${item.label}`" class="result-item-compact" @click="loadPreview(item.path)">
-              {{ item.label }}
-            </button>
+          <div v-if="groupedResultItems.length" class="result-list-compact">
+            <section v-for="group in groupedResultItems" :key="group.key" class="result-group">
+              <h3>{{ group.label }}</h3>
+              <div class="result-group-list">
+                <article v-for="item in group.items" :key="`${item.group}-${item.label}-${item.path}`" class="result-item-compact">
+                  <button class="result-main-action" type="button" @click="loadPreview(item.path)">
+                    <strong>{{ item.label }}</strong>
+                    <span>{{ shortPath(item.path, 3) }}</span>
+                  </button>
+                  <button class="result-copy-action" type="button" @click="copyToClipboard(item.path)">
+                    复制
+                  </button>
+                </article>
+              </div>
+            </section>
           </div>
           <p v-else class="empty-compact">暂无产物</p>
         </div>
@@ -1708,21 +1890,23 @@ onBeforeUnmount(() => {
       <article class="card preview-card-compact">
         <div class="title-row-compact">
           <h2>影像预览</h2>
+          <small>{{ previewDisplayName }}</small>
         </div>
 
         <div class="preview-query-compact">
           <input v-model="state.previewPath" type="text" placeholder="路径" />
-          <input v-model="state.previewSize" type="number" min="128" max="1024" style="width: 70px;" />
-          <button class="btn-mini pri" @click="loadPreview()">加载</button>
+          <input v-model="state.previewSize" class="preview-size-input" type="number" min="128" max="2048" aria-label="预览尺寸" />
+          <button class="btn-mini pri" type="button" @click="loadPreview()">加载</button>
         </div>
 
         <div class="binary-panel-compact">
           <div class="binary-head-compact">
             <strong>二值化与面积统计</strong>
-            <button class="btn-mini pri" :disabled="state.binaryRunning || !state.previewPath" @click="runBinarization">
+            <button class="btn-mini pri" type="button" :disabled="!!binaryDisabledReason" :title="binaryDisabledReason || '生成二值化结果'" @click="runBinarization">
               {{ state.binaryRunning ? '处理中...' : '生成' }}
             </button>
           </div>
+          <p v-if="binaryDisabledReason" class="binary-hint-compact">{{ binaryDisabledReason }}</p>
           <div class="binary-controls-compact" :class="{ range: binaryNeedsUpperThreshold() }">
             <select v-model="state.binaryComparison">
               <option value="gte">≥ 阈值</option>
@@ -1751,7 +1935,7 @@ onBeforeUnmount(() => {
         </div>
 
         <div class="preview-frame-compact">
-          <img v-if="state.previewImage" :src="state.previewImage" alt="preview" />
+          <img v-if="state.previewImage" :src="state.previewImage" :alt="`${previewDisplayName} 预览图`" />
           <p v-else class="empty-compact">等待预览</p>
         </div>
       </article>
@@ -1775,7 +1959,7 @@ onBeforeUnmount(() => {
       <IndicesInfo />
     </section>
 
-    <p v-if="state.toast" :class="toastClass()">{{ state.toast }}</p>
+    <p v-if="state.toast" :class="toastClass()" role="status" aria-live="polite">{{ state.toast }}</p>
 
     <div v-if="state.pathPickerOpen" class="picker-mask" @click.self="closePathPicker">
       <div class="picker-dialog card">

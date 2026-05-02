@@ -1,5 +1,6 @@
 <script setup>
 import { computed, onMounted, reactive, watch } from 'vue'
+import { apiRequest, buildApiUrl, normalizeApiBase } from '../utils/apiClient'
 
 const props = defineProps({
   apiBase: {
@@ -44,22 +45,11 @@ const state = reactive({
 })
 
 function apiBase() {
-  const value = String(props.apiBase || '').trim().replace(/\/+$/, '')
-  return value || 'http://127.0.0.1:5001'
-}
-
-function parseDetail(detail) {
-  if (typeof detail === 'string') return detail
-  if (Array.isArray(detail)) return detail.map((item) => (typeof item === 'object' ? item.msg || JSON.stringify(item) : String(item))).join(' | ')
-  if (detail && typeof detail === 'object') return detail.msg || JSON.stringify(detail)
-  return '请求失败'
+  return normalizeApiBase(props.apiBase)
 }
 
 async function request(path, options = {}) {
-  const resp = await fetch(`${apiBase()}${path}`, options)
-  const data = await resp.json().catch(() => ({}))
-  if (!resp.ok) throw new Error(parseDetail(data.detail || data.message || `HTTP ${resp.status}`))
-  return data
+  return apiRequest(apiBase(), path, options)
 }
 
 const taskStats = computed(() => ({
@@ -187,12 +177,12 @@ function triggerDownload(url) {
 
 function downloadFile(item) {
   if (!item?.path) return
-  triggerDownload(`${apiBase()}/results/download/file?file_path=${encodeURIComponent(item.path)}`)
+  triggerDownload(buildApiUrl(apiBase(), `/results/download/file?file_path=${encodeURIComponent(item.path)}`))
 }
 
 function downloadArchive(task = selectedTask.value) {
   if (!task?.output_dir) return
-  triggerDownload(`${apiBase()}/results/download/archive?output_dir=${encodeURIComponent(task.output_dir)}`)
+  triggerDownload(buildApiUrl(apiBase(), `/results/download/archive?output_dir=${encodeURIComponent(task.output_dir)}`))
 }
 
 function formatTime(value) {
@@ -438,9 +428,11 @@ onMounted(() => {
 .results-sidebar,
 .results-detail {
   min-height: 0;
+  min-width: 0;
   display: flex;
   flex-direction: column;
   gap: 0.6rem;
+  overflow-x: hidden;
 }
 
 .results-section-head {
@@ -448,14 +440,20 @@ onMounted(() => {
   justify-content: space-between;
   align-items: flex-start;
   gap: 0.75rem;
+  min-width: 0;
+}
+
+.results-section-head > div {
+  min-width: 0;
 }
 
 .results-section-head h2 {
   margin: 0;
   font-family: 'Teko', sans-serif;
   font-size: 1.1rem;
-  letter-spacing: 0.05em;
+  letter-spacing: 0;
   text-transform: uppercase;
+  overflow-wrap: anywhere;
 }
 
 .results-section-head p {
@@ -463,6 +461,7 @@ onMounted(() => {
   color: var(--muted);
   font-size: 0.74rem;
   line-height: 1.5;
+  overflow-wrap: anywhere;
 }
 
 .results-filters {
@@ -502,6 +501,7 @@ onMounted(() => {
 
 .stat-pill,
 .summary-card {
+  min-width: 0;
   border: 1px solid #dbe4e1;
   border-radius: 10px;
   background: linear-gradient(180deg, #ffffff 0%, #f7fbf9 100%);
@@ -513,6 +513,7 @@ onMounted(() => {
   display: block;
   font-size: 0.95rem;
   color: var(--pri-dark);
+  overflow-wrap: anywhere;
 }
 
 .stat-pill span,
@@ -529,10 +530,13 @@ onMounted(() => {
   gap: 0.45rem;
   min-height: 0;
   overflow-y: auto;
+  overflow-x: hidden;
   padding-right: 0.1rem;
 }
 
 .task-card {
+  width: 100%;
+  min-width: 0;
   border: 1px solid #d6dfdc;
   border-radius: 12px;
   padding: 0.7rem;
@@ -561,12 +565,15 @@ onMounted(() => {
   justify-content: space-between;
   align-items: flex-start;
   gap: 0.5rem;
+  min-width: 0;
 }
 
 .task-card-head strong {
+  min-width: 0;
   font-size: 0.83rem;
   line-height: 1.45;
   color: var(--text);
+  overflow-wrap: anywhere;
 }
 
 .source-badge,
@@ -598,6 +605,7 @@ onMounted(() => {
   display: flex;
   flex-wrap: wrap;
   gap: 0.35rem;
+  min-width: 0;
 }
 
 .task-chip.mono {
@@ -615,7 +623,11 @@ onMounted(() => {
   color: #30423d;
   font-size: 0.68rem;
   line-height: 1.5;
-  word-break: break-all;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
 }
 
 .detail-head {
@@ -627,6 +639,7 @@ onMounted(() => {
   display: flex;
   gap: 0.4rem;
   flex-wrap: wrap;
+  flex-shrink: 0;
 }
 
 .detail-summary-grid {
@@ -642,6 +655,7 @@ onMounted(() => {
 }
 
 .summary-row {
+  min-width: 0;
   border: 1px solid #e2e8e6;
   border-radius: 10px;
   background: #fbfcfc;
@@ -694,6 +708,7 @@ onMounted(() => {
 }
 
 .artifact-item {
+  min-width: 0;
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
   gap: 0.65rem;
@@ -711,6 +726,7 @@ onMounted(() => {
 .artifact-main strong {
   display: block;
   font-size: 0.8rem;
+  overflow-wrap: anywhere;
 }
 
 .artifact-main p {

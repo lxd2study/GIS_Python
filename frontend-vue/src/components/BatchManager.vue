@@ -794,10 +794,19 @@ import ConditionalNode from './flow-nodes/ConditionalNode.vue'
 import SynthesisNode from './flow-nodes/SynthesisNode.vue'
 import OutputNode from './flow-nodes/OutputNode.vue'
 import AoiMapPicker from './AoiMapPicker.vue'
+import { apiRequest, buildApiUrl } from '../utils/apiClient'
 import { assessCoverage, buildBboxFeatureCollection, normalizeBbox } from '../utils/coverage'
 
 const props = defineProps(['apiBase'])
 const emit = defineEmits(['toast'])
+
+function apiBase() {
+  return props.apiBase
+}
+
+async function request(path, options = {}) {
+  return apiRequest(apiBase(), path, options)
+}
 
 const { zoomIn: vfZoomIn, zoomOut: vfZoomOut, fitView: vfFitView, screenToFlowCoordinate } = useVueFlow()
 const canvasWrapperRef = ref(null)
@@ -1131,14 +1140,10 @@ async function loadClipVectorPreview(path = '', options = {}) {
   try {
     const body = new FormData()
     body.append('path', targetPath)
-    const resp = await fetch(`${props.apiBase}/filesystem/vector_preview`, {
+    const data = await request('/filesystem/vector_preview', {
       method: 'POST',
       body,
     })
-    const data = await resp.json().catch(() => ({}))
-    if (!resp.ok) {
-      throw new Error(data.detail || '矢量预览失败')
-    }
 
     applyClipPreview({
       bbox: data.bbox,
@@ -1239,15 +1244,10 @@ async function loadRasterFootprint(path, productLevel = '') {
   const body = new FormData()
   body.append('path', path)
   if (productLevel) body.append('product_level', productLevel)
-  const resp = await fetch(`${props.apiBase}/filesystem/raster_footprint`, {
+  return request('/filesystem/raster_footprint', {
     method: 'POST',
     body,
   })
-  const data = await resp.json().catch(() => ({}))
-  if (!resp.ok) {
-    throw new Error(data.detail || '影像覆盖范围读取失败')
-  }
-  return data
 }
 
 async function restoreClipCoverage() {
@@ -2219,9 +2219,7 @@ async function scanAndPropagateScenes(dataDirNodeId) {
       ? [...dataDirNode.data.selectedScenes]
       : null
 
-    const resp = await fetch(`${props.apiBase}/filesystem/scan_scenes?path=${encodeURIComponent(dataDirNode.data.root_dir)}`)
-    if (!resp.ok) return
-    const data = await resp.json()
+    const data = await request(`/filesystem/scan_scenes?path=${encodeURIComponent(dataDirNode.data.root_dir)}`)
 
     dataDirNode.data.scenes = data.scenes
     dataDirNode.data.selectedScenes = Array.isArray(previousDataDirSelections)
@@ -2343,18 +2341,11 @@ async function submitTask() {
 
   state.submitting = true
   try {
-    const resp = await fetch(`${props.apiBase}/batch/submit_graph`, {
+    const result = await request('/batch/submit_graph', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
     })
-
-    if (!resp.ok) {
-      const err = await resp.json()
-      throw new Error(err.detail || '提交失败')
-    }
-
-    const result = await resp.json()
     emit('toast', { type: 'ok', message: `已提交 ${result.total_jobs} 个任务到队列` })
     await fetchQueue()
   } catch (error) {
@@ -2366,9 +2357,7 @@ async function submitTask() {
 
 async function fetchQueue() {
   try {
-    const resp = await fetch(`${props.apiBase}/tasks/queue`)
-    if (!resp.ok) return
-    const data = await resp.json()
+    const data = await request('/tasks/queue')
     state.taskQueue = data.jobs || []
     state.queueStats = {
       total: data.total || 0,
@@ -2382,7 +2371,7 @@ async function fetchQueue() {
 
 async function cancelJob(jobId) {
   try {
-    await fetch(`${props.apiBase}/batch/job/${jobId}/cancel`, { method: 'POST' })
+    await request(`/batch/job/${encodeURIComponent(jobId)}/cancel`, { method: 'POST' })
     await fetchQueue()
   } catch (_) {}
 }
@@ -2505,7 +2494,7 @@ async function loadPickerDir(path, { preselectPath = '' } = {}) {
     }
 
     const query = params.toString()
-    const resp = await fetch(`${props.apiBase}/filesystem/list_dirs${query ? `?${query}` : ''}`)
+    const resp = await fetch(buildApiUrl(apiBase(), `/filesystem/list_dirs${query ? `?${query}` : ''}`))
     if (!resp.ok) return false
     const data = await resp.json()
     state.pickerCurrentPath = data.current || path

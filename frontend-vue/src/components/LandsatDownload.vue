@@ -12,6 +12,7 @@ import Feature from 'ol/Feature'
 import { fromExtent as polygonFromExtent } from 'ol/geom/Polygon'
 import { Fill, Stroke, Style } from 'ol/style'
 import { fromLonLat, transformExtent } from 'ol/proj'
+import { apiRequest, buildApiUrl, normalizeApiBase, parseApiErrorDetail } from '../utils/apiClient'
 
 const DOWNLOAD_MAX_RETRIES = 3
 const DOWNLOAD_RETRY_DELAYS = [2000, 5000, 10000]
@@ -166,7 +167,7 @@ const serverPanel = computed(() => buildTaskPanelData(state.serverTasks, state.t
 const isSceneNameSearch = computed(() => state.searchMode === 'scene_name')
 const searchResultsEmptyText = computed(() => isSceneNameSearch.value ? '还没有检索结果。先输入官方 scene ID / entity ID，再点击“开始检索”。' : '还没有检索结果。先画框或上传矢量选区，再点击“开始检索”。')
 function offsetDay(days) { const d = new Date(); d.setDate(d.getDate() + days); return d.toISOString().slice(0, 10) }
-function apiBase() { return (props.apiBase || '').trim().replace(/\/+$/, '') || 'http://127.0.0.1:5001' }
+function apiBase() { return normalizeApiBase(props.apiBase) }
 function toast(message, type = 'idle') { emit('toast', { message, type }) }
 function statusLabel(status) { return { pending: '等待中', downloading: '下载中', retrying: '重试中', completed: '已完成', failed: '失败', cancelled: '已取消' }[status] || status }
 function statusClass(status) { return `status-${status || 'pending'}` }
@@ -206,7 +207,7 @@ function taskTargetDir(task) {
 }
 function sortedAssets(assets) { return Object.entries(assets || {}).sort((a, b) => a[0].localeCompare(b[0], 'en')) }
 function filenameFrom(url, sceneId, band) { const name = (url || '').split('?')[0].split('/').pop(); return name || `${sceneId}_${band}.tif` }
-function errorText(detail) { if (typeof detail === 'string') return detail; if (Array.isArray(detail)) return detail.map((item) => item.msg || JSON.stringify(item)).join(' | '); if (detail && typeof detail === 'object') return detail.msg || JSON.stringify(detail); return '请求失败' }
+function errorText(detail) { return parseApiErrorDetail(detail) }
 function normalizeErrorMessage(error) { return error?.message || String(error || '下载失败') }
 function buildRetryFailureMessage() { return `连接中断，已重试 ${DOWNLOAD_MAX_RETRIES} 次仍失败` }
 function retryText(task) { const retryCount = Number(task?.retry_count || 0); const maxRetries = Number(task?.max_retries ?? DOWNLOAD_MAX_RETRIES); if (!retryCount && task?.status !== 'retrying') return ''; return task?.status === 'retrying' ? `重试中 ${retryCount}/${maxRetries}` : `已重试 ${retryCount}/${maxRetries}` }
@@ -322,10 +323,7 @@ function historyEmptyText(panelKey) {
 }
 
 async function request(path, options = {}) {
-  const response = await fetch(`${apiBase()}${path}`, options)
-  const data = await response.json().catch(() => ({}))
-  if (!response.ok) throw new Error(errorText(data.detail || data.message || `HTTP ${response.status}`))
-  return data
+  return apiRequest(apiBase(), path, options)
 }
 
 function resetSearchState() {
@@ -559,7 +557,7 @@ async function enqueue(items) {
 
 function saveBlob(blob, filename) { const href = URL.createObjectURL(blob); const link = document.createElement('a'); link.href = href; link.download = filename; document.body.appendChild(link); link.click(); link.remove(); window.setTimeout(() => URL.revokeObjectURL(href), 5000) }
 async function waitForLocalRetry(task, delayMs) { const deadline = Date.now() + delayMs; while (Date.now() < deadline) { if (!task || task.status === 'cancelled') return false; await sleep(Math.min(250, deadline - Date.now())) } return task.status !== 'cancelled' }
-async function fetchLocalTaskBlob(task, signal) { const response = await fetch(`${apiBase()}/imagery/proxy_download?url=${encodeURIComponent(task.url)}&filename=${encodeURIComponent(task.filename)}`, { signal }); if (!response.ok) { const data = await response.json().catch(() => ({})); throw new Error(errorText(data.detail || `HTTP ${response.status}`)) } const total = Number(response.headers.get('content-length') || 0); task.size_total = total; if (response.body && response.body.getReader) { const reader = response.body.getReader(); const chunks = []; let downloaded = 0; try { while (true) { const { done, value } = await reader.read(); if (done) break; if (task.status === 'cancelled') { await reader.cancel().catch(() => {}); throw createAbortError() } chunks.push(value); downloaded += value.byteLength || value.length || 0; task.size_downloaded = downloaded; task.progress = total ? Math.round(downloaded / total * 100) : 0 } } catch (error) { await reader.cancel().catch(() => {}); throw error } const blob = new Blob(chunks); task.size_downloaded = blob.size; task.size_total = total || blob.size; return blob } const blob = await response.blob(); task.size_downloaded = blob.size; task.size_total = total || blob.size; return blob }
+async function fetchLocalTaskBlob(task, signal) { const response = await fetch(buildApiUrl(apiBase(), `/imagery/proxy_download?url=${encodeURIComponent(task.url)}&filename=${encodeURIComponent(task.filename)}`), { signal }); if (!response.ok) { const data = await response.json().catch(() => ({})); throw new Error(errorText(data.detail || `HTTP ${response.status}`)) } const total = Number(response.headers.get('content-length') || 0); task.size_total = total; if (response.body && response.body.getReader) { const reader = response.body.getReader(); const chunks = []; let downloaded = 0; try { while (true) { const { done, value } = await reader.read(); if (done) break; if (task.status === 'cancelled') { await reader.cancel().catch(() => {}); throw createAbortError() } chunks.push(value); downloaded += value.byteLength || value.length || 0; task.size_downloaded = downloaded; task.progress = total ? Math.round(downloaded / total * 100) : 0 } } catch (error) { await reader.cancel().catch(() => {}); throw error } const blob = new Blob(chunks); task.size_downloaded = blob.size; task.size_total = total || blob.size; return blob } const blob = await response.blob(); task.size_downloaded = blob.size; task.size_total = total || blob.size; return blob }
 async function downloadLocalTask(task) { if (!task || task.status === 'cancelled') return; for (let attemptIndex = 0; attemptIndex <= DOWNLOAD_MAX_RETRIES; attemptIndex += 1) { if (!task || task.status === 'cancelled') { task.status = 'cancelled'; return } resetLocalTaskProgress(task); task.status = 'downloading'; task.error = ''; task.last_error = ''; const controller = new AbortController(); task.controller = controller; try { const blob = await fetchLocalTaskBlob(task, controller.signal); if (task.status === 'cancelled') return; task.progress = 100; task.status = 'completed'; task.error = ''; task.last_error = ''; saveBlob(blob, task.filename); return } catch (error) { if (task.status === 'cancelled' || isAbortError(error)) { task.status = 'cancelled'; return } const rawError = normalizeErrorMessage(error); const retryable = isRetryableDownloadError(error); task.last_error = rawError; if (!retryable || attemptIndex >= DOWNLOAD_MAX_RETRIES) { task.status = 'failed'; if (retryable) resetLocalTaskProgress(task); task.error = retryable ? buildRetryFailureMessage() : rawError; return } task.retry_count = attemptIndex + 1; task.status = 'retrying'; task.error = ''; resetLocalTaskProgress(task); const shouldContinue = await waitForLocalRetry(task, DOWNLOAD_RETRY_DELAYS[attemptIndex]); if (!shouldContinue) { task.status = 'cancelled'; return } } finally { task.controller = null } } }
 // 浏览器模式顺序下载，避免多景并发时把内存和网络同时拉满。
 async function processLocalQueue() { if (state.localBusy || !state.localQueue.length) return; state.localBusy = true; try { while (state.localQueue.length) { const taskId = state.localQueue.shift(); const task = state.localTasks[taskId]; if (!task || task.status === 'cancelled') continue; await downloadLocalTask(task) } } finally { state.localBusy = false; if (state.localQueue.length) window.setTimeout(() => processLocalQueue(), 0) } }
@@ -663,7 +661,7 @@ function retryLocal(taskId) {
 }
 async function cancelServer(taskId) { try { await request(`/imagery/download_tasks/${encodeURIComponent(taskId)}`, { method: 'DELETE' }); await loadServerTasks(true) } catch (error) { toast(`取消失败：${error.message}`, 'error') } }
 async function retryServer(taskId) { try { await request(`/imagery/download_tasks/${encodeURIComponent(taskId)}/retry`, { method: 'POST' }); await loadServerTasks(true); toast('服务端失败任务已重新加入下载', 'ok') } catch (error) { toast(`重新下载失败：${error.message}`, 'error') } }
-function saveServer(task) { const link = document.createElement('a'); link.href = `${apiBase()}/imagery/download_tasks/${encodeURIComponent(task.id)}/file`; link.target = '_blank'; link.rel = 'noopener'; document.body.appendChild(link); link.click(); link.remove() }
+function saveServer(task) { const link = document.createElement('a'); link.href = buildApiUrl(apiBase(), `/imagery/download_tasks/${encodeURIComponent(task.id)}/file`); link.target = '_blank'; link.rel = 'noopener'; document.body.appendChild(link); link.click(); link.remove() }
 async function clearServer() { try { await request('/imagery/download_tasks/completed', { method: 'DELETE' }); await loadServerTasks(true) } catch (error) { toast(`清理失败：${error.message}`, 'error') } }
 function clearLocal() { Object.entries(state.localTasks).forEach(([id, task]) => { if (['completed', 'failed', 'cancelled'].includes(task.status)) delete state.localTasks[id] }) }
 

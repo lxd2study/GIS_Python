@@ -27,11 +27,15 @@ Remote_sensing_tools/
 remote_sensing_tools/
 ├── api/
 │   ├── app.py                       # FastAPI 应用创建与中间件配置
-│   └── routes.py                    # 预处理、下载、预览、文件系统等接口
+│   ├── batch_routes.py              # 批量处理与任务队列接口
+│   ├── metadata_routes.py           # 根路径、健康检查、合成类型和波段信息接口
+│   ├── route_helpers.py             # 路由共享识别、描述和兼容辅助函数
+│   └── routes.py                    # 兼容路由挂载入口，所有接口仍由 create_app() 注册
 ├── core/
 │   ├── config.py                    # 环境变量与运行配置
 │   ├── constants.py                 # 波段、合成类型等常量
 │   ├── models.py                    # Pydantic 请求与响应模型
+│   ├── processing_common.py         # Landsat/Sentinel 共用处理常量与基础工具
 │   └── processor.py                 # Landsat 与 Sentinel-2 处理器
 ├── operations/
 │   ├── atmospheric.py               # 大气校正
@@ -41,6 +45,7 @@ remote_sensing_tools/
 │   └── synthesis.py                 # 波段合成、指数计算、APGI
 ├── services/
 │   ├── batch_manager.py             # 批量任务队列
+│   ├── download_settings.py         # 下载重试、分块和安全域名配置
 │   ├── file_manager.py              # 文件与参数解析
 │   ├── graph_executor.py            # Vue Flow 节点流程执行
 │   ├── landsat_download.py          # Landsat/Sentinel-2 STAC 检索与下载
@@ -63,6 +68,8 @@ frontend-vue/
 └── src/
     ├── App.vue                      # 主应用与页面切换
     ├── style.css                    # 全局样式
+    ├── config/
+    │   └── processingOptions.js     # 波段、合成类型和 Sentinel 排序配置
     ├── components/
     │   ├── BatchManager.vue         # 批量流程编排
     │   ├── LandsatDownload.vue      # 影像检索下载
@@ -70,6 +77,7 @@ frontend-vue/
     │   ├── TaskAssetCenter.vue      # 结果资产中心
     │   └── flow-nodes/              # 批处理节点组件
     └── utils/
+        ├── apiClient.js             # 统一 API 地址、请求和错误解析
         └── coverage.js              # AOI 覆盖率计算
 ```
 

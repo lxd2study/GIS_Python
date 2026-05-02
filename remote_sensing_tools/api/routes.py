@@ -12,11 +12,8 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from osgeo import gdal, ogr, osr
 
 from ..core.config import settings
-from ..core.constants import BAND_INFO, COMPOSITE_MAP
 from ..core.processor import Landsat8Processor, Sentinel2Processor
 from ..core.models import (
-    BatchSubmitRequest,
-    GraphSubmitRequest,
     ImageryDownloadItem,
     ImageryDownloadTaskCreateRequest,
     ImagerySearchRequest,
@@ -25,7 +22,6 @@ from ..core.models import (
     LandsatDownloadTaskCreateRequest,
     LandsatProxyRequest,
     LandsatSearchRequest,
-    TaskQueueItem,
 )
 from ..operations.raster_analysis import binarize_raster
 from ..services.file_manager import FileManager
@@ -33,13 +29,18 @@ from ..services.progress import ProgressManager
 from ..services.batch_manager import BatchJobManager
 from ..services.landsat_download import LandsatDownloadService
 from ..services.task_results import TaskResultService, write_task_manifest
-from ..services.templates import ProcessingTemplates
-from ..services.graph_executor import GraphExecutor
+from .batch_routes import register_batch_routes
+from .metadata_routes import register_metadata_routes
+from .route_helpers import (
+    detect_upload_band_name as _detect_upload_band_name,
+    detect_upload_sentinel2_band_name as _detect_upload_sentinel2_band_name,
+    infer_product_level as _infer_product_level,
+    infer_sensor as _infer_sensor,
+)
 from ..utils.file_utils import (
     collect_band_paths,
     collect_sentinel2_band_paths,
     detect_sensor_from_path,
-    detect_sentinel2_band_name,
     find_scene_support_files,
     find_sentinel2_support_files,
     infer_available_product_levels,
@@ -53,88 +54,6 @@ VECTOR_PREVIEW_EXTENSIONS = (".shp", ".geojson", ".json")
 # 单次写入 1MB，避免大文件上传时把整个文件一次性读入内存。
 UPLOAD_CHUNK_SIZE = 1024 * 1024
 PATH_ACCESS = PathAccessController(settings.allowed_path_roots)
-
-COMPOSITE_DESCRIPTIONS = {
-    # RGB合成
-    "true_color": ("真彩色", "真实自然色彩 (Red-Green-Blue)", "自然地物识别，最接近人眼视觉"),
-    "false_color": ("假彩色", "植被增强 (NIR-Red-Green)", "植被健康监测，植物呈红色"),
-    "agriculture": ("农业监测", "农作物分析 (SWIR1-NIR-Blue)", "农作物类型识别，土壤湿度评估"),
-    "urban": ("城市研究", "城市区域增强 (SWIR2-SWIR1-Red)", "建筑物识别，城市规划"),
-    "natural_color": ("自然彩色", "自然色调 (Red-Green-Blue)", "与真彩色一致，更利于直观判读"),
-    "swir": ("短波红外", "短波红外合成 (SWIR2-NIR-Green)", "水体识别，云雾穿透"),
-
-    # 植被指数
-    "ndvi": ("NDVI", "归一化植被指数 (NIR-Red)/(NIR+Red)", "植被覆盖度与健康状况分析"),
-    "evi": ("EVI", "Enhanced Vegetation Index (NIR-Red-Blue)", "高生物量区域植被活力评估"),
-    "savi": ("SAVI", "土壤调节植被指数，适合植被稀疏区域", "减少土壤背景影响的植被监测"),
-    "msavi": ("MSAVI", "修正SAVI，自适应土壤调节", "植被覆盖度变化大的区域监测"),
-    "arvi": ("ARVI", "抗大气植被指数，减少大气干扰", "有雾霾时的植被监测"),
-    "rvi": ("RVI", "比值植被指数 NIR/Red", "简单快速的植被监测"),
-
-    # 水体指数
-    "ndwi": ("NDWI", "归一化水体指数 (Green-NIR)/(Green+NIR)", "水体与地表含水量识别"),
-    "mndwi": ("MNDWI", "改进归一化水体指数 (Green-SWIR1)", "城市区域水体提取，抑制建筑物噪声"),
-    "awei": ("AWEI", "自动水体提取指数，适合有阴影场景", "自动化水体提取与分类"),
-    "wri": ("WRI", "水体比率指数 (Green+Red)/(NIR+SWIR1)", "浅水和浑浊水体识别"),
-
-    # 建筑/城市指数
-    "ndbi": ("NDBI", "归一化建筑指数 (SWIR1-NIR)/(SWIR1+NIR)", "建筑区与城市扩张识别"),
-    "ibi": ("IBI", "综合建筑指数，结合NDBI/SAVI/MNDWI", "精确的城市建筑区提取"),
-    "ndbai": ("NDBaI", "归一化裸地与建筑指数", "裸地和建筑区识别"),
-    "ui": ("UI", "城市指数 (SWIR2-NIR)/(SWIR2+NIR)", "简单高效的城市区域识别"),
-
-    # 其他指数
-    "nbr": ("NBR", "归一化燃烧指数 (NIR-SWIR2)/(NIR+SWIR2)", "火灾监测与燃烧程度评估"),
-    "bsi": ("BSI", "裸土指数，用于裸土识别", "土壤侵蚀监测，裸地提取"),
-    "ndsi": ("NDSI", "归一化积雪指数 (Green-SWIR1)/(Green+SWIR1)", "雪盖监测，冰川变化分析"),
-
-    # 大棚指数
-    "apgi": ("APGI", "Sentinel-2 大棚指数，使用 Coastal/Red/NIR/SWIR2", "塑料大棚提取与设施农业识别"),
-}
-
-
-def _detect_upload_band_name(filename: str) -> Optional[str]:
-    """Try to parse Landsat band name from an uploaded filename."""
-    upper_name = filename.upper()
-    for band_idx in range(1, 12):
-        if (
-            f"_B{band_idx}." in upper_name
-            or f"_B{band_idx}_" in upper_name
-            or f"B{band_idx}." in upper_name
-        ):
-            return f"B{band_idx}"
-    return None
-
-
-def _detect_upload_sentinel2_band_name(filename: str) -> Optional[str]:
-    return detect_sentinel2_band_name(filename)
-
-
-def _infer_product_level(name: str, filenames: Optional[List[str]] = None) -> str:
-    normalized = (name or "").upper()
-    if "SENTINEL" in normalized or "L2A" in normalized or normalized.startswith(("S2A", "S2B", "S2C")):
-        return "L2A"
-    if "_L2" in normalized or "L2SP" in normalized:
-        return "L2"
-
-    for filename in filenames or []:
-        upper_name = filename.upper()
-        if "L2A" in upper_name or _detect_upload_sentinel2_band_name(filename):
-            return "L2A"
-        if any(token in upper_name for token in ("_SR_B", "_ST_B", "_L2", "L2SP", "SURFACE_REFLECTANCE")):
-            return "L2"
-    return "L1"
-
-
-def _infer_sensor(name: str, filenames: Optional[List[str]] = None) -> str:
-    candidates = [name or "", *(filenames or [])]
-    for candidate in candidates:
-        path = Path(candidate)
-        sensor = detect_sensor_from_path(path)
-        if sensor:
-            return sensor
-    return "landsat"
-
 
 def _find_first_matching_file(scene_path: Path, patterns: List[str]) -> Optional[str]:
     for pattern in patterns:
@@ -195,13 +114,6 @@ def _build_summary(
         "processing_mode": result.get("processing_mode"),
         "sensor": result.get("sensor"),
     }
-
-
-def _get_composite_description(comp_type: str) -> tuple[str, str, str]:
-    return COMPOSITE_DESCRIPTIONS.get(
-        comp_type,
-        (comp_type, "自定义组合", "请结合业务场景使用"),
-    )
 
 
 async def _save_optional_upload(upload: Optional[UploadFile], target_path: str) -> Optional[str]:
@@ -802,75 +714,8 @@ def setup_routes(
         batch_manager=batch_manager,
         path_access=PATH_ACCESS,
     )
-
-    @app.get("/")
-    def root_info() -> Dict:
-        return {
-            "service": "Remote Sensing Tools API",
-            "version": "3.0.0",
-            "docs": "/docs",
-            "health": "/health",
-            "frontend_project": "frontend-vue (Vue3 + Vite)",
-            "usage": "可通过 frontend-vue 前端项目调用 API，或通过 /docs 调用 API",
-            "core_endpoints": [
-                "/preprocess_landsat8_async",
-                "/preprocess_sentinel2_async",
-                "/preprocess_landsat8_status/{job_id}",
-                "/composite_types",
-                "/band_info",
-                "/preview_raster",
-                "/raster/binarize",
-                "/filesystem/list_dirs",
-            ],
-            "batch_endpoints": [
-                "/batch/templates",
-                "/batch/submit",
-                "/batch/list",
-                "/batch/{batch_id}/status",
-                "/batch/job/{job_id}/status",
-                "/batch/job/{job_id}/pause",
-                "/batch/job/{job_id}/resume",
-                "/batch/job/{job_id}/cancel",
-            ],
-            "imagery_download_endpoints": [
-                "/imagery/collections",
-                "/imagery/search",
-                "/imagery/aoi/parse",
-                "/imagery/auth/status",
-                "/imagery/auth/earthdata",
-                "/imagery/proxy/status",
-                "/imagery/proxy",
-                "/imagery/download_dir",
-                "/imagery/proxy_download",
-                "/imagery/download",
-                "/imagery/download_tasks",
-            ],
-            "landsat_download_compat_endpoints": [
-                "/landsat/collections",
-                "/landsat/search",
-                "/landsat/auth/status",
-                "/landsat/auth/earthdata",
-                "/landsat/proxy/status",
-                "/landsat/proxy",
-                "/landsat/download_dir",
-                "/landsat/proxy_download",
-                "/landsat/download",
-                "/landsat/download_tasks",
-            ],
-            "result_endpoints": [
-                "/results/tasks",
-                "/results/download/file",
-                "/results/download/archive",
-            ],
-        }
-
-    @app.get("/health")
-    def health_check() -> Dict:
-        return {
-            "status": "healthy",
-            "service": "remote-sensing-tools",
-            "version": "3.0.0",
-        }
+    register_metadata_routes(app)
+    register_batch_routes(app, batch_manager)
 
     def _download_dir_payload() -> Dict:
         payload = landsat_download_service.get_download_dir_status()
@@ -1212,26 +1057,6 @@ def setup_routes(
         except Exception as exc:
             logger.error("读取 Landsat 下载结果失败: %s", exc, exc_info=True)
             raise HTTPException(status_code=500, detail=f"读取下载结果失败: {exc}")
-
-    @app.get("/composite_types")
-    def get_composite_types() -> Dict:
-        return {
-            "composite_types": [
-                {
-                    "type": comp_type,
-                    "name": info[0],
-                    "bands": bands,
-                    "description": info[1],
-                    "use_case": info[2],
-                }
-                for comp_type, bands in COMPOSITE_MAP.items()
-                for info in [_get_composite_description(comp_type)]
-            ]
-        }
-
-    @app.get("/band_info")
-    def get_band_info() -> Dict:
-        return BAND_INFO
 
     @app.get("/filesystem/list_dirs")
     def list_directories(
@@ -1966,212 +1791,3 @@ def setup_routes(
             processor_class=Sentinel2Processor,
         )
         return {"job_id": job_id, "status": "processing"}
-
-    # ============== 批量处理 API ==============
-
-    @app.get("/batch/templates")
-    def list_processing_templates() -> Dict:
-        """列出所有预设处理流程模板"""
-        return {"templates": ProcessingTemplates.list_templates()}
-
-    @app.post("/batch/submit_graph")
-    def submit_graph_jobs(request: GraphSubmitRequest) -> Dict:
-        """基于节点图提交批量任务（图结构驱动执行顺序）
-
-        前端将 Vue Flow 的 nodes + edges 序列化后发送，
-        后端拓扑排序后确定各场景的执行步骤并生成 BatchJobConfig。
-        """
-        try:
-            executor = GraphExecutor()
-            nodes = [n.model_dump() for n in request.nodes]
-            edges = [e.model_dump() for e in request.edges]
-            configs, errors = executor.build_job_configs(nodes, edges)
-
-            if errors:
-                raise HTTPException(status_code=400, detail="; ".join(errors))
-            if not configs:
-                raise HTTPException(status_code=400, detail="未生成任何任务配置，请检查画布")
-
-            processed_configs = [ProcessingTemplates.apply_template(c) for c in configs]
-            batch_id = batch_manager.submit_batch(
-                batch_name=request.batch_name,
-                jobs_config=processed_configs,
-                priority=request.priority,
-                max_retries=request.max_retries if request.auto_retry else 0,
-            )
-            return {
-                "batch_id": batch_id,
-                "batch_name": request.batch_name,
-                "total_jobs": len(configs),
-                "status": "submitted",
-                "message": f"成功提交 {len(configs)} 个任务到批量处理队列",
-            }
-        except HTTPException:
-            raise
-        except PathAccessError as exc:
-            _raise_path_access_http_error(exc)
-        except Exception as exc:
-            logger.error("图任务提交失败: %s", exc, exc_info=True)
-            raise HTTPException(status_code=500, detail=f"图任务提交失败: {exc}")
-
-    @app.post("/batch/submit")
-    def submit_batch_jobs(request: BatchSubmitRequest) -> Dict:
-        """提交批量处理任务
-
-        Args:
-            request: 批量提交请求
-
-        Returns:
-            batch_id 和提交状态
-        """
-        try:
-            processed_configs = [
-                ProcessingTemplates.apply_template(job_config)
-                for job_config in request.jobs
-            ]
-            batch_id = batch_manager.submit_batch(
-                batch_name=request.batch_name,
-                jobs_config=processed_configs,
-                priority=request.priority,
-                max_retries=request.max_retries if request.auto_retry else 0,
-            )
-
-            return {
-                "batch_id": batch_id,
-                "batch_name": request.batch_name,
-                "total_jobs": len(request.jobs),
-                "status": "submitted",
-                "message": f"成功提交 {len(request.jobs)} 个任务到批量处理队列",
-            }
-
-        except PathAccessError as exc:
-            _raise_path_access_http_error(exc)
-        except Exception as exc:
-            logger.error("批量任务提交失败: %s", exc, exc_info=True)
-            raise HTTPException(status_code=500, detail=f"批量任务提交失败: {exc}")
-
-    @app.get("/batch/list")
-    def list_batches() -> Dict:
-        """列出所有批次"""
-        batches = batch_manager.list_batches()
-        return {"batches": batches, "total": len(batches)}
-
-    @app.get("/batch/{batch_id}/status")
-    def get_batch_status(batch_id: str) -> Dict:
-        """获取批次状态
-
-        Args:
-            batch_id: 批次ID
-
-        Returns:
-            批次详细状态
-        """
-        status = batch_manager.get_batch_status(batch_id)
-        if not status:
-            raise HTTPException(status_code=404, detail=f"批次不存在: {batch_id}")
-
-        return status.model_dump()
-
-    @app.get("/batch/job/{job_id}/status")
-    def get_job_status(job_id: str) -> Dict:
-        """获取单个任务状态
-
-        Args:
-            job_id: 任务ID
-
-        Returns:
-            任务详细状态
-        """
-        job = batch_manager.get_job_status(job_id)
-        if not job:
-            raise HTTPException(status_code=404, detail=f"任务不存在: {job_id}")
-
-        return job.model_dump()
-
-    @app.post("/batch/job/{job_id}/pause")
-    def pause_job(job_id: str) -> Dict:
-        """暂停任务
-
-        Args:
-            job_id: 任务ID
-
-        Returns:
-            操作结果
-        """
-        success = batch_manager.pause_job(job_id)
-        if not success:
-            raise HTTPException(
-                status_code=400,
-                detail="无法暂停任务（任务可能不存在或已在运行中）",
-            )
-
-        return {"job_id": job_id, "status": "paused", "message": "任务已暂停"}
-
-    @app.post("/batch/job/{job_id}/resume")
-    def resume_job(job_id: str) -> Dict:
-        """恢复任务
-
-        Args:
-            job_id: 任务ID
-
-        Returns:
-            操作结果
-        """
-        success = batch_manager.resume_job(job_id)
-        if not success:
-            raise HTTPException(
-                status_code=400,
-                detail="无法恢复任务（任务可能不存在或未暂停）",
-            )
-
-        return {"job_id": job_id, "status": "resumed", "message": "任务已恢复"}
-
-    @app.post("/batch/job/{job_id}/cancel")
-    def cancel_job(job_id: str) -> Dict:
-        """取消任务
-
-        Args:
-            job_id: 任务ID
-
-        Returns:
-            操作结果
-        """
-        success = batch_manager.cancel_job(job_id)
-        if not success:
-            raise HTTPException(
-                status_code=400,
-                detail="无法取消任务（任务可能不存在或已在运行中）",
-            )
-
-        return {"job_id": job_id, "status": "cancelled", "message": "任务已取消"}
-
-    @app.get("/tasks/queue")
-    def get_tasks_queue() -> Dict:
-        """获取所有任务队列状态（扁平化）"""
-        jobs = []
-        with batch_manager.lock:
-            all_jobs = list(batch_manager.jobs.values())
-        for job in all_jobs:
-            jobs.append(TaskQueueItem(
-                job_id=job.job_id,
-                batch_id=job.batch_id,
-                scene_name=job.config.scene_name,
-                status=job.status,
-                progress=job.progress,
-                priority=job.priority,
-                created_at=job.created_at,
-                started_at=job.started_at,
-            ).model_dump())
-        jobs.sort(key=lambda j: j["created_at"], reverse=True)
-        running = sum(1 for j in jobs if j["status"] == "running")
-        queued = sum(1 for j in jobs if j["status"] in ("queued", "pending"))
-        completed = sum(1 for j in jobs if j["status"] == "success")
-        failed = sum(1 for j in jobs if j["status"] == "failed")
-        return {
-            "jobs": jobs,
-            "total": len(jobs),
-            "running": running,
-            "queued": queued,
-            "completed": completed,
-            "failed": failed,
-        }

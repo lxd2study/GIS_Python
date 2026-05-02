@@ -1,23 +1,17 @@
 """Landsat 8 影像处理器核心模块"""
 
 import os
-import re
 import base64
 import logging
 import threading
 import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from pathlib import Path
 
 import numpy as np
 from osgeo import gdal
 from typing import Dict, List, Tuple, Optional, Callable
 
 logger = logging.getLogger(__name__)
-PROCESSED_BAND_NODATA = -9999.0
-LANDSAT_L2_SR_SCALE = np.float32(0.0000275)
-LANDSAT_L2_SR_OFFSET = np.float32(-0.2)
-SENTINEL2_L2A_SR_SCALE = np.float32(0.0001)
 
 # 启用GDAL异常处理
 gdal.UseExceptions()
@@ -29,6 +23,16 @@ from .constants import (
     SENTINEL2_OPTICAL_BANDS, SENTINEL2_CLASSIFICATION_BANDS,
 )
 from .config import settings
+from .processing_common import (
+    LANDSAT_L2_SR_OFFSET,
+    LANDSAT_L2_SR_SCALE,
+    PROCESSED_BAND_NODATA,
+    SENTINEL2_L2A_SR_SCALE,
+    build_reporter,
+    safe_join,
+    sample_valid_values,
+    sanitize_index_name,
+)
 from ..operations.radiometric import dn_to_radiance, radiance_to_reflectance
 from ..operations.atmospheric import (
     cloud_mask_from_qa,
@@ -63,31 +67,15 @@ class Landsat8Processor:
     @staticmethod
     def _safe_join(output_dir: str, filename: str) -> str:
         """以操作系统友好的分隔符拼接路径。"""
-        return str(Path(output_dir) / filename)
+        return safe_join(output_dir, filename)
 
     @staticmethod
     def _sanitize_index_name(name: Optional[str], fallback: str = 'custom_index') -> str:
-        if not name:
-            return fallback
-
-        safe = re.sub(r'[^A-Za-z0-9_-]+', '_', name).strip('_')
-        if not safe:
-            return fallback
-
-        return safe.lower()
+        return sanitize_index_name(name, fallback=fallback)
 
     @staticmethod
     def _build_reporter(progress_callback: Optional[Callable[[Dict], None]]) -> Callable[[str, str, Optional[int], str], None]:
-        def report(step_id: str, detail: str, progress: Optional[int] = None, status: str = 'active'):
-            if progress_callback:
-                progress_callback({
-                    'step': step_id,
-                    'detail': detail,
-                    'progress': progress,
-                    'status': status,
-                })
-
-        return report
+        return build_reporter(progress_callback)
 
     @staticmethod
     def _init_results() -> Dict:
@@ -119,13 +107,7 @@ class Landsat8Processor:
         positive_only: bool = False,
         max_samples: int = 1_000_000,
     ) -> np.ndarray:
-        flat = np.asarray(array).reshape(-1)
-        step = max(1, flat.size // max_samples)
-        sample = flat[::step]
-        mask = np.isfinite(sample)
-        if positive_only:
-            mask &= sample > 0
-        return sample[mask]
+        return sample_valid_values(array, positive_only=positive_only, max_samples=max_samples)
 
     @staticmethod
     def _log_array_stats(label: str, array: np.ndarray) -> None:
