@@ -1,0 +1,661 @@
+{
+  "schema": "openai.presentation.layout/v4",
+  "unit": "px",
+  "slide": {
+    "aid": "sl/bjesko",
+    "id": "bjesko",
+    "slide": 1,
+    "layoutId": "5d0e899a-150c-4a7f-a369-b00082453afe",
+    "layoutName": "Title Slide",
+    "layoutType": "title",
+    "masterLayoutId": "fc857034-88fe-4f18-a44b-ea6286ac83ac",
+    "masterLayoutName": "Master",
+    "frame": {
+      "left": 0,
+      "top": 0,
+      "width": 1280,
+      "height": 720
+    }
+  },
+  "theme": {
+    "colorSchemeName": "ChatGPT",
+    "colors": {
+      "accent1": "#156082",
+      "accent2": "#E97132",
+      "accent3": "#196B24",
+      "accent4": "#0F9ED5",
+      "accent5": "#A02B93",
+      "accent6": "#4EA72E",
+      "bg1": "#FFFFFF",
+      "bg2": "#000000",
+      "tx1": "#1F1F1F",
+      "tx2": "#FFFFFF",
+      "dk1": "#000000",
+      "lt1": "#FFFFFF",
+      "dk2": "#0E2841",
+      "lt2": "#E8E8E8",
+      "hlink": "#467886",
+      "folHlink": "#96607D"
+    },
+    "typefaces": [
+      "Microsoft YaHei"
+    ]
+  },
+  "inheritedLayers": [
+    {
+      "scope": "layout",
+      "id": "5d0e899a-150c-4a7f-a369-b00082453afe",
+      "name": "Title Slide",
+      "type": "title",
+      "parentLayoutId": "fc857034-88fe-4f18-a44b-ea6286ac83ac",
+      "elements": []
+    },
+    {
+      "scope": "master",
+      "id": "fc857034-88fe-4f18-a44b-ea6286ac83ac",
+      "name": "Master",
+      "type": "master",
+      "elements": []
+    }
+  ],
+  "elements": [
+    {
+      "order": 1,
+      "kind": "image",
+      "scope": "slide",
+      "aid": "im/5gbq1ory",
+      "id": "1",
+      "bbox": [
+        0,
+        0,
+        1280,
+        720
+      ],
+      "alt": "cover",
+      "contentType": "image/png",
+      "imageFit": "cover",
+      "asset": {
+        "assetId": "2d31adf7-bde9-416a-a113-695b87c938cf",
+        "contentType": "image/png",
+        "byteLength": 2028371
+      }
+    },
+    {
+      "order": 2,
+      "kind": "shape",
+      "scope": "slide",
+      "aid": "sh/7ed8bat4",
+      "id": "2",
+      "bbox": [
+        0,
+        0,
+        1280,
+        720
+      ],
+      "geometry": "rect",
+      "fillColor": "rgba(246, 244, 239, 0.8)",
+      "lineColor": "#F6F4EF",
+      "lineWidth": 0
+    },
+    {
+      "order": 3,
+      "kind": "shape",
+      "scope": "slide",
+      "aid": "sh/itgfmlkj",
+      "id": "3",
+      "bbox": [
+        0,
+        0,
+        1280,
+        86
+      ],
+      "geometry": "rect",
+      "fillColor": "#8A1E2D",
+      "lineColor": "#8A1E2D",
+      "lineWidth": 0
+    },
+    {
+      "order": 4,
+      "kind": "shape",
+      "scope": "slide",
+      "aid": "sh/p8nqxs72",
+      "id": "4",
+      "bbox": [
+        84,
+        29,
+        520,
+        24
+      ],
+      "geometry": "rect",
+      "text": "毕业设计答辩",
+      "textPreview": "毕业设计答辩",
+      "resolvedFontSize": 18,
+      "resolvedTextStyle": {
+        "anchor": 1,
+        "fontSize": 18,
+        "typeface": "Microsoft YaHei",
+        "color": "#FFFFFF",
+        "bold": true,
+        "alignment": "left",
+        "verticalAlignment": "top",
+        "insets": {
+          "top": 0,
+          "right": 0,
+          "bottom": 0,
+          "left": 0
+        }
+      },
+      "textLayout": {
+        "lineCount": 1,
+        "lines": [
+          {
+            "index": 1,
+            "text": "毕业设计答辩"
+          }
+        ]
+      },
+      "paragraphs": [
+        {
+          "index": 1,
+          "text": "毕业设计答辩",
+          "resolvedTextStyle": {
+            "fontSize": 18,
+            "typeface": "Microsoft YaHei",
+            "color": "#FFFFFF",
+            "bold": true,
+            "alignment": "left"
+          },
+          "runs": [
+            {
+              "index": 1,
+              "text": "毕业设计答辩",
+              "fontSize": 18,
+              "typeface": "Microsoft YaHei",
+              "color": "#FFFFFF",
+              "bold": true
+            }
+          ],
+          "marginLeft": 0
+        }
+      ],
+      "fillColor": "rgba(0, 0, 0, 0)",
+      "lineColor": "rgba(0, 0, 0, 0)",
+      "lineWidth": 0
+    },
+    {
+      "order": 5,
+      "kind": "shape",
+      "scope": "slide",
+      "aid": "sh/0nuxc3yl",
+      "id": "5",
+      "bbox": [
+        1136,
+        22,
+        40,
+        40
+      ],
+      "geometry": "ellipse",
+      "fillColor": "rgba(0, 0, 0, 0)",
+      "lineColor": "#F7E8EA",
+      "lineWidth": 1.2
+    },
+    {
+      "order": 6,
+      "kind": "shape",
+      "scope": "slide",
+      "aid": "sh/72x4nap4",
+      "id": "6",
+      "bbox": [
+        1142,
+        28,
+        28,
+        28
+      ],
+      "geometry": "ellipse",
+      "fillColor": "rgba(0, 0, 0, 0)",
+      "lineColor": "#F7E8EA",
+      "lineWidth": 0.8
+    },
+    {
+      "order": 7,
+      "kind": "shape",
+      "scope": "slide",
+      "aid": "sh/ih4byhgn",
+      "id": "7",
+      "bbox": [
+        1142,
+        32,
+        28,
+        14
+      ],
+      "geometry": "rect",
+      "text": "校",
+      "textPreview": "校",
+      "resolvedFontSize": 12,
+      "resolvedTextStyle": {
+        "anchor": 1,
+        "fontSize": 12,
+        "typeface": "Microsoft YaHei",
+        "color": "#F7E8EA",
+        "bold": true,
+        "alignment": "center",
+        "verticalAlignment": "top",
+        "insets": {
+          "top": 0,
+          "right": 0,
+          "bottom": 0,
+          "left": 0
+        }
+      },
+      "textLayout": {
+        "lineCount": 1,
+        "lines": [
+          {
+            "index": 1,
+            "text": "校"
+          }
+        ]
+      },
+      "paragraphs": [
+        {
+          "index": 1,
+          "text": "校",
+          "resolvedTextStyle": {
+            "fontSize": 12,
+            "typeface": "Microsoft YaHei",
+            "color": "#F7E8EA",
+            "bold": true,
+            "alignment": "center"
+          },
+          "runs": [
+            {
+              "index": 1,
+              "text": "校",
+              "fontSize": 12,
+              "typeface": "Microsoft YaHei",
+              "color": "#F7E8EA",
+              "bold": true
+            }
+          ],
+          "marginLeft": 0
+        }
+      ],
+      "fillColor": "rgba(0, 0, 0, 0)",
+      "lineColor": "rgba(0, 0, 0, 0)",
+      "lineWidth": 0
+    },
+    {
+      "order": 8,
+      "kind": "shape",
+      "scope": "slide",
+      "aid": "sh/p4r65wju",
+      "id": "8",
+      "bbox": [
+        86,
+        170,
+        650,
+        270
+      ],
+      "geometry": "rect",
+      "fillColor": "rgba(255, 255, 255, 0.94118)",
+      "lineColor": "#E3D7D9",
+      "lineWidth": 1
+    },
+    {
+      "order": 9,
+      "kind": "image",
+      "scope": "slide",
+      "aid": "im/1032lszq",
+      "id": "9",
+      "bbox": [
+        84,
+        108,
+        430,
+        94
+      ],
+      "alt": "school logo",
+      "contentType": "image/png",
+      "imageFit": "contain",
+      "asset": {
+        "assetId": "a5e822ef-0a1a-4ee4-a60f-e09f706e25d1",
+        "contentType": "image/png",
+        "byteLength": 95088
+      }
+    },
+    {
+      "order": 10,
+      "kind": "shape",
+      "scope": "slide",
+      "aid": "sh/6tovahoz",
+      "id": "10",
+      "bbox": [
+        126,
+        244,
+        560,
+        92
+      ],
+      "geometry": "rect",
+      "text": "基于 Web 的 Landsat 8\n遥感影像在线预处理系统",
+      "textPreview": "基于 Web 的 Landsat 8 | 遥感影像在线预处理系统",
+      "resolvedFontSize": 31,
+      "resolvedTextStyle": {
+        "anchor": 1,
+        "fontSize": 31,
+        "typeface": "Microsoft YaHei",
+        "color": "#18324A",
+        "bold": true,
+        "alignment": "left",
+        "verticalAlignment": "top",
+        "insets": {
+          "top": 0,
+          "right": 0,
+          "bottom": 0,
+          "left": 0
+        }
+      },
+      "textLayout": {
+        "lineCount": 2,
+        "lines": [
+          {
+            "index": 1,
+            "text": "基于 Web 的 Landsat 8"
+          },
+          {
+            "index": 2,
+            "text": "遥感影像在线预处理系统"
+          }
+        ]
+      },
+      "paragraphs": [
+        {
+          "index": 1,
+          "text": "基于 Web 的 Landsat 8",
+          "resolvedTextStyle": {
+            "fontSize": 31,
+            "typeface": "Microsoft YaHei",
+            "color": "#18324A",
+            "bold": true,
+            "alignment": "left"
+          },
+          "runs": [
+            {
+              "index": 1,
+              "text": "基于 Web 的 Landsat 8",
+              "fontSize": 31,
+              "typeface": "Microsoft YaHei",
+              "color": "#18324A",
+              "bold": true
+            }
+          ],
+          "marginLeft": 0
+        },
+        {
+          "index": 2,
+          "text": "遥感影像在线预处理系统",
+          "resolvedTextStyle": {
+            "fontSize": 31,
+            "typeface": "Microsoft YaHei",
+            "color": "#18324A",
+            "bold": true,
+            "alignment": "left"
+          },
+          "runs": [
+            {
+              "index": 1,
+              "text": "遥感影像在线预处理系统",
+              "fontSize": 31,
+              "typeface": "Microsoft YaHei",
+              "color": "#18324A",
+              "bold": true
+            }
+          ],
+          "marginLeft": 0
+        }
+      ],
+      "fillColor": "rgba(0, 0, 0, 0)",
+      "lineColor": "rgba(0, 0, 0, 0)",
+      "lineWidth": 0
+    },
+    {
+      "order": 11,
+      "kind": "shape",
+      "scope": "slide",
+      "aid": "sh/vahoza1g",
+      "id": "11",
+      "bbox": [
+        128,
+        358,
+        540,
+        24
+      ],
+      "geometry": "rect",
+      "text": "Remote Sensing Image Online Preprocessing Platform",
+      "textPreview": "Remote Sensing Image Online Preprocessing Platform",
+      "resolvedFontSize": 13,
+      "resolvedTextStyle": {
+        "anchor": 1,
+        "fontSize": 13,
+        "typeface": "Microsoft YaHei",
+        "color": "#6B7887",
+        "alignment": "left",
+        "verticalAlignment": "top",
+        "insets": {
+          "top": 0,
+          "right": 0,
+          "bottom": 0,
+          "left": 0
+        }
+      },
+      "textLayout": {
+        "lineCount": 1,
+        "lines": [
+          {
+            "index": 1,
+            "text": "Remote Sensing Image Online Preprocessing Platform"
+          }
+        ]
+      },
+      "paragraphs": [
+        {
+          "index": 1,
+          "text": "Remote Sensing Image Online Preprocessing Platform",
+          "resolvedTextStyle": {
+            "fontSize": 13,
+            "typeface": "Microsoft YaHei",
+            "color": "#6B7887",
+            "alignment": "left"
+          },
+          "runs": [
+            {
+              "index": 1,
+              "text": "Remote Sensing Image Online Preprocessing Platform",
+              "fontSize": 13,
+              "typeface": "Microsoft YaHei",
+              "color": "#6B7887"
+            }
+          ],
+          "marginLeft": 0
+        }
+      ],
+      "fillColor": "rgba(0, 0, 0, 0)",
+      "lineColor": "rgba(0, 0, 0, 0)",
+      "lineWidth": 0
+    },
+    {
+      "order": 12,
+      "kind": "shape",
+      "scope": "slide",
+      "aid": "sh/ovahoza1",
+      "id": "12",
+      "bbox": [
+        126,
+        408,
+        86,
+        4
+      ],
+      "geometry": "rect",
+      "fillColor": "#8A1E2D",
+      "lineColor": "#8A1E2D",
+      "lineWidth": 0
+    },
+    {
+      "order": 13,
+      "kind": "shape",
+      "scope": "slide",
+      "aid": "sh/dg7adsji",
+      "id": "13",
+      "bbox": [
+        760,
+        500,
+        330,
+        92
+      ],
+      "geometry": "rect",
+      "fillColor": "rgba(255, 255, 255, 0.91765)",
+      "lineColor": "#E3D7D9",
+      "lineWidth": 1
+    },
+    {
+      "order": 14,
+      "kind": "shape",
+      "scope": "slide",
+      "aid": "sh/6hcrmhk3",
+      "id": "14",
+      "bbox": [
+        790,
+        526,
+        270,
+        44
+      ],
+      "geometry": "rect",
+      "text": "答辩人：李旭东\n指导教师：待填写\n日期：2026 年 5 月",
+      "textPreview": "答辩人：李旭东 | 指导教师：待填写 | 日期：2026 年 5 月",
+      "resolvedFontSize": 12,
+      "resolvedTextStyle": {
+        "anchor": 1,
+        "fontSize": 12,
+        "typeface": "Microsoft YaHei",
+        "color": "#18324A",
+        "bold": true,
+        "alignment": "left",
+        "verticalAlignment": "top",
+        "insets": {
+          "top": 0,
+          "right": 0,
+          "bottom": 0,
+          "left": 0
+        }
+      },
+      "textLayout": {
+        "lineCount": 3,
+        "lines": [
+          {
+            "index": 1,
+            "text": "答辩人：李旭东"
+          },
+          {
+            "index": 2,
+            "text": "指导教师：待填写"
+          },
+          {
+            "index": 3,
+            "text": "日期：2026 年 5 月"
+          }
+        ]
+      },
+      "paragraphs": [
+        {
+          "index": 1,
+          "text": "答辩人：李旭东",
+          "resolvedTextStyle": {
+            "fontSize": 12,
+            "typeface": "Microsoft YaHei",
+            "color": "#18324A",
+            "bold": true,
+            "alignment": "left"
+          },
+          "runs": [
+            {
+              "index": 1,
+              "text": "答辩人：李旭东",
+              "fontSize": 12,
+              "typeface": "Microsoft YaHei",
+              "color": "#18324A",
+              "bold": true
+            }
+          ],
+          "marginLeft": 0
+        },
+        {
+          "index": 2,
+          "text": "指导教师：待填写",
+          "resolvedTextStyle": {
+            "fontSize": 12,
+            "typeface": "Microsoft YaHei",
+            "color": "#18324A",
+            "bold": true,
+            "alignment": "left"
+          },
+          "runs": [
+            {
+              "index": 1,
+              "text": "指导教师：待填写",
+              "fontSize": 12,
+              "typeface": "Microsoft YaHei",
+              "color": "#18324A",
+              "bold": true
+            }
+          ],
+          "marginLeft": 0
+        },
+        {
+          "index": 3,
+          "text": "日期：2026 年 5 月",
+          "resolvedTextStyle": {
+            "fontSize": 12,
+            "typeface": "Microsoft YaHei",
+            "color": "#18324A",
+            "bold": true,
+            "alignment": "left"
+          },
+          "runs": [
+            {
+              "index": 1,
+              "text": "日期：2026 年 5 月",
+              "fontSize": 12,
+              "typeface": "Microsoft YaHei",
+              "color": "#18324A",
+              "bold": true
+            }
+          ],
+          "marginLeft": 0
+        }
+      ],
+      "fillColor": "rgba(0, 0, 0, 0)",
+      "lineColor": "rgba(0, 0, 0, 0)",
+      "lineWidth": 0
+    },
+    {
+      "order": 15,
+      "kind": "image",
+      "scope": "slide",
+      "aid": "im/8z25kb6x",
+      "id": "15",
+      "bbox": [
+        1126,
+        16,
+        54,
+        54
+      ],
+      "alt": "school emblem",
+      "contentType": "image/png",
+      "imageFit": "contain",
+      "asset": {
+        "assetId": "e77eefd5-0e8e-4a16-a245-fc52d1f410f2",
+        "contentType": "image/png",
+        "byteLength": 46940
+      }
+    }
+  ],
+  "composeRuns": []
+}

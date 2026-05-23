@@ -35,6 +35,7 @@ frontend-vue/.vite-temp/
 .claude/
 
 # Docs - internal / thesis materials
+docs/
 docs/proposal/
 docs/school/
 docs/standard/

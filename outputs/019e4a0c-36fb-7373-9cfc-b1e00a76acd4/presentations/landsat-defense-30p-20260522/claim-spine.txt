@@ -1,0 +1,8 @@
+30-page defense deck claim spine
+
+1. The project solves a real remote-sensing preprocessing workflow problem.
+2. The system is positioned as a local Web workbench, not a single algorithm demo.
+3. The architecture separates frontend interaction, backend services, core processing, and result assets.
+4. The implementation proof is L1/L2 dual processing, batch graph execution, STAC download, and result management.
+5. The defense closes with real UI screenshots, test scope, truthful limits, and future improvement space.
+

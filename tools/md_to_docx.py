@@ -19,11 +19,15 @@
 
 import re
 import sys
+import xml.etree.ElementTree as ET
+from zipfile import ZIP_DEFLATED, ZipFile
 from pathlib import Path
 from docx import Document
 from docx.shared import Pt, Cm, RGBColor, Inches
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.enum.table import WD_TABLE_ALIGNMENT
+from docx.enum.section import WD_SECTION_START
+from docx.enum.style import WD_STYLE_TYPE
 from docx.oxml.ns import qn
 from docx.oxml import OxmlElement
 
@@ -31,13 +35,13 @@ from docx.oxml import OxmlElement
 # ─────────────────────────── 辅助函数 ────────────────────────────
 
 def set_font(run, name_cn="宋体", name_en="Times New Roman", size_pt=12, bold=False,
-             italic=False, color=None):
+             italic=False, color=RGBColor(0, 0, 0)):
     """同时设置中英文字体、字号、粗体、斜体、颜色。"""
     run.font.name = name_en
     run.font.size = Pt(size_pt)
     run.font.bold = bold
     run.font.italic = italic
-    if color:
+    if color is not None:
         run.font.color.rgb = color
     # 设置中文字体（东亚字体 rFonts）
     r = run._r
@@ -50,6 +54,155 @@ def set_font(run, name_cn="宋体", name_en="Times New Roman", size_pt=12, bold=
     if existing is not None:
         rPr.remove(existing)
     rPr.insert(0, rFonts)
+
+
+def set_style_font(style, name_cn="宋体", name_en="Times New Roman", size_pt=12,
+                   bold=False, italic=False):
+    """设置段落样式中的中英文字体，供自动目录样式使用。"""
+    style.font.name = name_en
+    style.font.size = Pt(size_pt)
+    style.font.bold = bold
+    style.font.italic = italic
+    style.font.color.rgb = RGBColor(0, 0, 0)
+
+    rPr = style.element.get_or_add_rPr()
+    existing = rPr.find(qn('w:rFonts'))
+    if existing is not None:
+        rPr.remove(existing)
+    rFonts = OxmlElement('w:rFonts')
+    rFonts.set(qn('w:eastAsia'), name_cn)
+    rFonts.set(qn('w:ascii'), name_en)
+    rFonts.set(qn('w:hAnsi'), name_en)
+    rPr.insert(0, rFonts)
+
+
+def configure_heading_styles(doc):
+    """覆盖 Word 内置标题样式的默认主题蓝色，保证标题为学校规范黑色。"""
+    style_specs = {
+        "Heading 1": ("黑体", "Times New Roman", 15, True),
+        "Heading 2": ("黑体", "Times New Roman", 14, True),
+        "Heading 3": ("黑体", "Times New Roman", 13, True),
+        "Heading 4": ("黑体", "Times New Roman", 12, True),
+    }
+    for style_name, (name_cn, name_en, size_pt, bold) in style_specs.items():
+        try:
+            style = doc.styles[style_name]
+        except KeyError:
+            continue
+        set_style_font(style, name_cn=name_cn, name_en=name_en,
+                       size_pt=size_pt, bold=bold)
+
+
+def normalize_saved_style_effects(docx_path):
+    """同步 stylesWithEffects.xml，避免 Word 打开后沿用默认蓝色标题缓存。"""
+    path = Path(docx_path)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    word_ns = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    ET.register_namespace("w", word_ns)
+
+    style_specs = {
+        "Heading1": ("黑体", "Times New Roman"),
+        "Heading2": ("黑体", "Times New Roman"),
+        "Heading3": ("黑体", "Times New Roman"),
+        "Heading4": ("黑体", "Times New Roman"),
+        "TOC1": ("黑体", "Times New Roman"),
+        "TOC2": ("宋体", "Times New Roman"),
+        "TOC3": ("宋体", "Times New Roman"),
+        "TOC4": ("宋体", "Times New Roman"),
+    }
+    target_xml = {"word/styles.xml", "word/stylesWithEffects.xml"}
+
+    def w_tag(name):
+        return f"{{{word_ns}}}{name}"
+
+    with ZipFile(path, "r") as src, ZipFile(tmp_path, "w", ZIP_DEFLATED) as dst:
+        for item in src.infolist():
+            data = src.read(item.filename)
+            if item.filename in target_xml:
+                root = ET.fromstring(data)
+                for style in root.findall(f".//{w_tag('style')}"):
+                    style_id = style.get(w_tag("styleId"))
+                    if style_id not in style_specs:
+                        continue
+
+                    rpr = style.find(w_tag("rPr"))
+                    if rpr is None:
+                        rpr = ET.SubElement(style, w_tag("rPr"))
+
+                    color = rpr.find(w_tag("color"))
+                    if color is None:
+                        color = ET.SubElement(rpr, w_tag("color"))
+                    color.set(w_tag("val"), "000000")
+                    for attr in ("themeColor", "themeTint", "themeShade"):
+                        color.attrib.pop(w_tag(attr), None)
+
+                    name_cn, name_en = style_specs[style_id]
+                    rfonts = rpr.find(w_tag("rFonts"))
+                    if rfonts is None:
+                        rfonts = ET.SubElement(rpr, w_tag("rFonts"))
+                    for attr in ("asciiTheme", "eastAsiaTheme", "hAnsiTheme", "cstheme"):
+                        rfonts.attrib.pop(w_tag(attr), None)
+                    rfonts.set(w_tag("eastAsia"), name_cn)
+                    rfonts.set(w_tag("ascii"), name_en)
+                    rfonts.set(w_tag("hAnsi"), name_en)
+
+                data = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+            dst.writestr(item, data)
+
+    tmp_path.replace(path)
+
+
+def configure_toc_styles(doc):
+    """配置 Word 自动目录生成后使用的 TOC 1-4 样式。"""
+    for level in range(1, 5):
+        style_name = f"TOC {level}"
+        try:
+            style = doc.styles[style_name]
+        except KeyError:
+            style = doc.styles.add_style(style_name, WD_STYLE_TYPE.PARAGRAPH)
+            style.base_style = doc.styles["Normal"]
+
+        if level == 1:
+            set_style_font(style, name_cn="黑体", name_en="Times New Roman",
+                           size_pt=12, bold=True)
+        else:
+            set_style_font(style, name_cn="宋体", name_en="Times New Roman",
+                           size_pt=12, bold=False)
+
+        pf = style.paragraph_format
+        pf.first_line_indent = Pt(0)
+        pf.left_indent = Cm((level - 1) * 0.6)
+        pf.space_before = Pt(6 if level == 1 else 0)
+        pf.space_after = Pt(0)
+        pf.line_spacing = Pt(20)
+
+
+def set_update_fields_on_open(doc):
+    """提示 Word 打开文档时刷新目录和页码字段。"""
+    settings = doc.settings.element
+    existing = settings.find(qn('w:updateFields'))
+    if existing is not None:
+        settings.remove(existing)
+    update_fields = OxmlElement('w:updateFields')
+    update_fields.set(qn('w:val'), 'true')
+    settings.append(update_fields)
+
+
+def set_page_numbering(section, fmt="decimal", start=1):
+    """设置 section 页码格式和起始页码。"""
+    sect_pr = section._sectPr
+    existing = sect_pr.find(qn('w:pgNumType'))
+    if existing is not None:
+        sect_pr.remove(existing)
+    pg_num_type = OxmlElement('w:pgNumType')
+    pg_num_type.set(qn('w:start'), str(start))
+    pg_num_type.set(qn('w:fmt'), fmt)
+    for index, child in enumerate(list(sect_pr)):
+        if child.tag == qn('w:cols'):
+            sect_pr.insert(index, pg_num_type)
+            break
+    else:
+        sect_pr.append(pg_num_type)
 
 
 def clear_run_color(run):
@@ -70,11 +223,11 @@ def set_paragraph_format(para, first_indent_chars=2, space_before=0,
     pf.alignment = alignment
 
 
-def add_heading(doc, text, level):
-    """添加标题段落（Word 内置 Heading 样式）。"""
+def add_heading(doc, text, level, include_in_toc=True):
+    """添加标题段落；正文章节使用 Heading 样式，前置部分使用直排格式。"""
     style_map = {1: 'Heading 1', 2: 'Heading 2', 3: 'Heading 3', 4: 'Heading 4'}
     style = style_map.get(level, 'Heading 4')
-    para = doc.add_paragraph(style=style)
+    para = doc.add_paragraph(style=style if include_in_toc else None)
     run = para.add_run(text)
 
     size_map = {1: 15, 2: 14, 3: 13, 4: 12}
@@ -409,11 +562,13 @@ def add_list_item(doc, text, ordered=False, number=1, level=0):
     return para
 
 
-def add_page_number(doc):
-    """在页脚中添加居中页码。"""
-    section = doc.sections[0]
+def add_page_number(section, number_format="decimal", start=1):
+    """在指定 section 页脚中添加居中页码。"""
+    set_page_numbering(section, fmt=number_format, start=start)
+    section.footer.is_linked_to_previous = False
     footer = section.footer
     para = footer.paragraphs[0]
+    para.clear()
     para.alignment = WD_ALIGN_PARAGRAPH.CENTER
     run = para.add_run()
     # 插入域代码 PAGE
@@ -431,29 +586,57 @@ def add_page_number(doc):
     run.font.name = 'Times New Roman'
 
 
-def setup_page(doc):
+def setup_page(section, different_first_page_header_footer=False):
     """设置A4页面、页边距。"""
-    section = doc.sections[0]
     section.page_width = Cm(21)
     section.page_height = Cm(29.7)
     section.left_margin = Cm(2.0)
     section.right_margin = Cm(2.0)
     section.top_margin = Cm(2.5)
     section.bottom_margin = Cm(2.0)
+    section.gutter = Cm(0.5)
     section.header_distance = Cm(1.5)
     section.footer_distance = Cm(1.75)
-    section.different_first_page_header_footer = True
+    section.different_first_page_header_footer = different_first_page_header_footer
 
 
-def add_header(doc, header_text="河北水利电力学院本科毕业设计"):
+def add_header(section, header_text="河北水利电力学院本科毕业设计"):
     """添加页眉（封面页除外）。"""
-    section = doc.sections[0]
+    section.header.is_linked_to_previous = False
     header = section.header
     para = header.paragraphs[0]
     para.clear()
     para.alignment = WD_ALIGN_PARAGRAPH.CENTER
     run = para.add_run(header_text)
     set_font(run, name_cn="宋体", name_en="Times New Roman", size_pt=10.5)
+
+
+def configure_numbered_section(section, number_format, start=1):
+    """统一配置正文类 section：页面、页眉和页码。"""
+    setup_page(section, different_first_page_header_footer=False)
+    add_header(section)
+    add_page_number(section, number_format=number_format, start=start)
+
+
+def add_toc_field(doc):
+    """插入 Word 自动目录字段。打开 Word 后会刷新为正式目录。"""
+    para = doc.add_paragraph()
+    para.paragraph_format.first_line_indent = Pt(0)
+    para.paragraph_format.space_before = Pt(0)
+    para.paragraph_format.space_after = Pt(0)
+    para.paragraph_format.line_spacing = Pt(20)
+    field = OxmlElement('w:fldSimple')
+    field.set(qn('w:instr'), r'TOC \o "1-4" \h \z \u')
+    field.set(qn('w:dirty'), 'true')
+    para._p.append(field)
+
+
+def is_chapter_heading(text):
+    return bool(re.match(r'^第\s*\d+\s*章', text))
+
+
+def is_back_matter_heading(text):
+    return text in {"参考文献", "致谢"} or text.startswith("附录")
 
 
 def add_title_page(doc, title, author, advisor, major, college, date, title_en="", student_id="", print_date=""):
@@ -503,8 +686,6 @@ def add_title_page(doc, title, author, advisor, major, college, date, title_en="
         p.paragraph_format.space_after = Pt(8)
         p.paragraph_format.first_line_indent = Pt(0)
 
-    doc.add_page_break()
-
 
 # ─────────────────────────── 主解析逻辑 ────────────────────────────
 
@@ -526,9 +707,10 @@ def is_table_separator(line):
 
 def convert_md_to_docx(md_path: str, docx_path: str):
     doc = Document()
-    setup_page(doc)
-    add_header(doc)
-    add_page_number(doc)
+    setup_page(doc.sections[0], different_first_page_header_footer=True)
+    set_update_fields_on_open(doc)
+    configure_heading_styles(doc)
+    configure_toc_styles(doc)
 
     lines = Path(md_path).read_text(encoding='utf-8').splitlines()
     md_dir = Path(md_path).resolve().parent
@@ -550,6 +732,7 @@ def convert_md_to_docx(md_path: str, docx_path: str):
     skip_toc_body = False
     level1_count = 0
     current_section = ""
+    main_text_section_started = False
 
     # 生成封面
     add_title_page(
@@ -564,6 +747,9 @@ def convert_md_to_docx(md_path: str, docx_path: str):
         date=cover_info["完成日期"],
         print_date=cover_info["打印日期"],
     )
+
+    front_matter_section = doc.add_section(WD_SECTION_START.NEW_PAGE)
+    configure_numbered_section(front_matter_section, "romanUpper", start=1)
 
     i = 0
     while i < len(lines):
@@ -615,28 +801,35 @@ def convert_md_to_docx(md_path: str, docx_path: str):
 
             level = len(heading_match.group(1))
             text = normalize_heading_text(heading_match.group(2))
+            chapter_heading = level == 1 and is_chapter_heading(text)
 
             if level == 1:
-                if level1_count > 0:
+                if chapter_heading and not main_text_section_started:
+                    main_section = doc.add_section(WD_SECTION_START.NEW_PAGE)
+                    configure_numbered_section(main_section, "decimal", start=1)
+                    main_text_section_started = True
+                elif level1_count > 0:
                     doc.add_page_break()
                 level1_count += 1
                 current_section = text
 
-            # 目录标题直接转为提示页，正文目录项不再逐行写入
+            # 目录标题插入 Word TOC 字段，正文目录项不再逐行写入
             if level == 1 and text == '目  录':
-                add_heading(doc, text, 1)
-                p = doc.add_paragraph()
-                run = p.add_run('（此处请在 Word 中通过"引用 → 目录"自动生成目录）')
-                set_font(run, name_cn="宋体", name_en="Times New Roman",
-                         size_pt=12)
-                p.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                p.paragraph_format.first_line_indent = Pt(0)
-                p.paragraph_format.line_spacing = Pt(20)
+                add_heading(doc, text, 1, include_in_toc=False)
+                add_toc_field(doc)
                 skip_toc_body = True
                 i += 1
                 continue
 
-            add_heading(doc, text, level)
+            include_in_toc = False
+            if level == 1:
+                include_in_toc = chapter_heading
+            elif main_text_section_started and is_chapter_heading(current_section):
+                include_in_toc = True
+            if main_text_section_started and is_back_matter_heading(text):
+                include_in_toc = True
+
+            add_heading(doc, text, level, include_in_toc=include_in_toc)
             i += 1
             continue
 
@@ -805,6 +998,7 @@ def convert_md_to_docx(md_path: str, docx_path: str):
         add_table(doc, table_header, table_data_rows)
 
     doc.save(output_path)
+    normalize_saved_style_effects(output_path)
     print(f"[OK] 已生成: {output_path}")
 
 

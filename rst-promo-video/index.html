@@ -1,0 +1,769 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Remote Sensing Tools Promo</title>
+    <style>
+      :root {
+        --bg: #f3f5f4;
+        --card: #ffffff;
+        --line: #d9e1de;
+        --ink: #1f2b27;
+        --muted: #5f726b;
+        --teal: #0f7c66;
+        --teal-dark: #0a6352;
+        --amber: #8a5c12;
+        --red: #b23a32;
+        --soft-teal: #e7f4f1;
+        --soft-amber: #fffbf0;
+      }
+
+      * { box-sizing: border-box; }
+
+      body {
+        margin: 0;
+        background: var(--bg);
+        color: var(--ink);
+        font-family: 'Noto Sans Japanese', sans-serif;
+        overflow: hidden;
+      }
+
+      #rst-promo {
+        position: relative;
+        overflow: hidden;
+        width: 1920px;
+        height: 1080px;
+        background:
+          radial-gradient(circle at 16% 20%, rgba(15, 124, 102, 0.11), rgba(15, 124, 102, 0) 27%),
+          radial-gradient(circle at 82% 76%, rgba(138, 92, 18, 0.12), rgba(138, 92, 18, 0) 25%),
+          #f3f5f4;
+      }
+
+      .scene {
+        position: absolute;
+        inset: 0;
+        width: 100%;
+        height: 100%;
+        overflow: hidden;
+        background-color: #f3f5f4;
+      }
+
+      .scene-content {
+        width: 100%;
+        height: 100%;
+        padding: 96px 116px;
+        display: flex;
+        flex-direction: column;
+        gap: 34px;
+        box-sizing: border-box;
+      }
+
+      .kicker {
+        display: inline-flex;
+        width: fit-content;
+        align-items: center;
+        gap: 12px;
+        border: 1px solid rgba(15, 124, 102, 0.24);
+        border-radius: 999px;
+        padding: 10px 18px;
+        background: rgba(255, 255, 255, 0.78);
+        color: var(--teal-dark);
+        font-family: 'JetBrains Mono', monospace;
+        font-size: 21px;
+        font-weight: 700;
+      }
+
+      .kicker::before {
+        content: "";
+        width: 10px;
+        height: 10px;
+        border-radius: 50%;
+        background: currentColor;
+      }
+
+      h1, h2, p { margin: 0; }
+
+      .display {
+        font-family: 'League Gothic', 'Noto Sans Japanese', sans-serif;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 0.02em;
+        line-height: 0.9;
+      }
+
+      .headline-cn {
+        max-width: 1120px;
+        font-size: 86px;
+        line-height: 1.08;
+        font-weight: 800;
+        letter-spacing: 0;
+      }
+
+      .subline {
+        max-width: 980px;
+        color: var(--muted);
+        font-size: 31px;
+        line-height: 1.55;
+        font-weight: 500;
+      }
+
+      .mono {
+        font-family: 'JetBrains Mono', monospace;
+        font-variant-numeric: tabular-nums;
+      }
+
+      .grid-bg {
+        position: absolute;
+        inset: 0;
+        background-image:
+          linear-gradient(rgba(31, 43, 39, 0.06) 1px, transparent 1px),
+          linear-gradient(90deg, rgba(31, 43, 39, 0.06) 1px, transparent 1px);
+        background-size: 48px 48px;
+        opacity: 0.48;
+      }
+
+      .satellite {
+        position: relative;
+        width: 760px;
+        height: 560px;
+        border: 1px solid #c8d7d2;
+        border-radius: 18px;
+        overflow: hidden;
+        background:
+          radial-gradient(ellipse at 30% 18%, rgba(222, 227, 195, 0.95) 0 10%, rgba(76, 128, 89, 0.95) 11% 22%, rgba(36, 88, 75, 0.95) 23% 34%, rgba(176, 165, 112, 0.95) 35% 46%, rgba(64, 111, 104, 0.95) 47% 60%, rgba(32, 77, 68, 0.95) 61%),
+          linear-gradient(135deg, #375c4f, #aab583 46%, #2f675c 47%, #7d8d68);
+        box-shadow: 0 24px 70px rgba(23, 32, 29, 0.16);
+      }
+
+      .satellite::before {
+        content: "";
+        position: absolute;
+        inset: 0;
+        background-image:
+          linear-gradient(25deg, rgba(255,255,255,0.18) 0 2px, rgba(255,255,255,0) 2px 38px),
+          linear-gradient(90deg, rgba(255,255,255,0.08) 0 1px, rgba(255,255,255,0) 1px 36px);
+        mix-blend-mode: screen;
+      }
+
+      .aoi {
+        position: absolute;
+        left: 158px;
+        top: 126px;
+        width: 342px;
+        height: 236px;
+        border: 5px solid var(--teal);
+        background: rgba(15, 124, 102, 0.15);
+      }
+
+      .scan-line {
+        position: absolute;
+        left: 0;
+        top: 0;
+        width: 100%;
+        height: 8px;
+        background: #ffffff;
+        box-shadow: 0 0 28px rgba(255,255,255,0.86), 0 0 22px rgba(15,124,102,0.72);
+      }
+
+      .ui-panel {
+        border: 1px solid var(--line);
+        border-radius: 14px;
+        background: rgba(255, 255, 255, 0.94);
+        box-shadow: 0 18px 42px rgba(23, 32, 29, 0.09);
+      }
+
+      .panel-head {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        border-bottom: 1px solid var(--line);
+        padding: 18px 22px;
+      }
+
+      .panel-head strong {
+        font-family: 'League Gothic', 'Noto Sans Japanese', sans-serif;
+        font-size: 36px;
+        letter-spacing: 0.04em;
+        text-transform: uppercase;
+      }
+
+      .status-pill {
+        border: 1px solid #b8d7cf;
+        border-radius: 999px;
+        padding: 8px 14px;
+        color: var(--teal);
+        background: #f2fbf7;
+        font-size: 18px;
+        font-weight: 700;
+      }
+
+      .hero-layout {
+        flex: 1;
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) 790px;
+        gap: 64px;
+        align-items: center;
+      }
+
+      .hero-copy {
+        display: flex;
+        flex-direction: column;
+        gap: 30px;
+      }
+
+      .hero-title {
+        font-size: 112px;
+        color: var(--ink);
+      }
+
+      .problem-grid {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 22px;
+        margin-top: auto;
+      }
+
+      .problem-card {
+        min-height: 180px;
+        padding: 24px;
+      }
+
+      .problem-card b {
+        display: block;
+        margin-bottom: 14px;
+        font-size: 28px;
+      }
+
+      .problem-card span {
+        color: var(--muted);
+        font-size: 22px;
+        line-height: 1.45;
+      }
+
+      .pipeline {
+        display: grid;
+        grid-template-columns: 1.05fr 1.3fr;
+        gap: 50px;
+        align-items: stretch;
+        flex: 1;
+        min-height: 0;
+      }
+
+      .stack {
+        display: flex;
+        flex-direction: column;
+        gap: 18px;
+      }
+
+      .asset-row {
+        display: grid;
+        grid-template-columns: 104px minmax(0, 1fr) auto;
+        align-items: center;
+        gap: 16px;
+        padding: 18px 20px;
+      }
+
+      .asset-row .thumb {
+        height: 72px;
+        border-radius: 10px;
+        background: linear-gradient(135deg, #476c5a, #e0d89c 45%, #49716b 46%, #263f3b);
+      }
+
+      .asset-row b {
+        display: block;
+        font-size: 25px;
+      }
+
+      .asset-row span {
+        color: var(--muted);
+        font-size: 19px;
+      }
+
+      .route-card {
+        padding: 28px;
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 18px;
+      }
+
+      .route-box {
+        min-height: 180px;
+        padding: 24px;
+        border-radius: 12px;
+        border: 1px solid var(--line);
+        background: #fbfdfc;
+      }
+
+      .route-box strong {
+        display: block;
+        font-size: 48px;
+        color: var(--teal-dark);
+      }
+
+      .route-box em {
+        display: block;
+        margin-top: 10px;
+        color: var(--muted);
+        font-size: 22px;
+        font-style: normal;
+        line-height: 1.45;
+      }
+
+      .process-list {
+        grid-column: 1 / -1;
+        display: grid;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        gap: 14px;
+      }
+
+      .process-step {
+        min-height: 112px;
+        border-radius: 12px;
+        border: 1px solid #cfe0da;
+        background: #f5fbf8;
+        padding: 18px;
+      }
+
+      .process-step b {
+        display: block;
+        color: var(--teal-dark);
+        font-size: 22px;
+      }
+
+      .process-step span {
+        display: block;
+        margin-top: 7px;
+        color: var(--muted);
+        font-size: 17px;
+        line-height: 1.35;
+      }
+
+      .flow-board {
+        flex: 1;
+        position: relative;
+        min-height: 0;
+        padding: 34px;
+      }
+
+      .flow-canvas {
+        position: relative;
+        height: 100%;
+        border: 1px solid #cbd8d4;
+        border-radius: 22px;
+        background:
+          linear-gradient(rgba(255,255,255,0.72), rgba(246,249,248,0.86)),
+          linear-gradient(rgba(31,43,39,0.055) 1px, transparent 1px),
+          linear-gradient(90deg, rgba(31,43,39,0.055) 1px, transparent 1px);
+        background-size: auto, 38px 38px, 38px 38px;
+        overflow: hidden;
+      }
+
+      .node {
+        position: absolute;
+        width: 250px;
+        min-height: 112px;
+        border: 1px solid #cad8d3;
+        border-radius: 15px;
+        background: #ffffff;
+        box-shadow: 0 12px 28px rgba(23, 32, 29, 0.08);
+        padding: 18px;
+      }
+
+      .node b {
+        display: block;
+        font-size: 24px;
+      }
+
+      .node span {
+        display: block;
+        margin-top: 7px;
+        color: var(--muted);
+        font-size: 18px;
+        line-height: 1.35;
+      }
+
+      .node.input { left: 82px; top: 96px; }
+      .node.mask { left: 408px; top: 96px; border-left: 5px solid var(--amber); }
+      .node.clip-node { left: 734px; top: 96px; }
+      .node.index { left: 245px; top: 330px; border-left: 5px solid var(--teal); }
+      .node.output { left: 572px; top: 330px; }
+
+      .edge {
+        position: absolute;
+        height: 4px;
+        background: var(--teal);
+        border-radius: 999px;
+        transform-origin: left center;
+      }
+
+      .edge.e1 { left: 332px; top: 154px; width: 76px; }
+      .edge.e2 { left: 658px; top: 154px; width: 76px; }
+      .edge.e3 { left: 226px; top: 280px; width: 216px; transform: rotate(42deg); }
+      .edge.e4 { left: 498px; top: 392px; width: 74px; }
+
+      .batch-meta {
+        position: absolute;
+        right: 46px;
+        bottom: 38px;
+        display: flex;
+        gap: 12px;
+      }
+
+      .metric {
+        padding: 14px 18px;
+        border-radius: 999px;
+        border: 1px solid var(--line);
+        background: rgba(255,255,255,0.92);
+        font-size: 20px;
+        font-weight: 700;
+      }
+
+      .results-layout {
+        flex: 1;
+        display: grid;
+        grid-template-columns: 1.12fr 0.88fr;
+        gap: 42px;
+        min-height: 0;
+      }
+
+      .preview {
+        position: relative;
+        padding: 22px;
+      }
+
+      .preview-frame {
+        position: relative;
+        width: 100%;
+        height: 100%;
+        min-height: 580px;
+        border-radius: 12px;
+        overflow: hidden;
+        border: 1px solid #ccd8d4;
+        background:
+          radial-gradient(circle at 42% 48%, rgba(71,134,84,1) 0 9%, rgba(214,202,123,1) 10% 19%, rgba(54,105,89,1) 20% 34%, rgba(169,154,100,1) 35% 44%, rgba(42,84,77,1) 45%),
+          linear-gradient(120deg, #314f46, #b2aa75);
+      }
+
+      .index-mask {
+        position: absolute;
+        inset: 78px 126px 108px 162px;
+        border-radius: 20px;
+        background:
+          linear-gradient(120deg, rgba(15,124,102,0.0), rgba(15,124,102,0.42)),
+          repeating-linear-gradient(45deg, rgba(255,255,255,0.22) 0 6px, rgba(255,255,255,0) 6px 18px);
+        border: 4px solid rgba(255,255,255,0.82);
+      }
+
+      .result-list {
+        display: flex;
+        flex-direction: column;
+        gap: 18px;
+      }
+
+      .result-item {
+        padding: 22px 24px;
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) auto;
+        gap: 16px;
+        align-items: center;
+      }
+
+      .result-item strong {
+        font-size: 27px;
+      }
+
+      .result-item code {
+        display: block;
+        margin-top: 8px;
+        color: #4f6962;
+        font-size: 18px;
+        word-break: break-all;
+      }
+
+      .result-stat {
+        min-width: 118px;
+        text-align: right;
+        color: var(--teal-dark);
+        font-family: 'League Gothic', 'Noto Sans Japanese', sans-serif;
+        font-size: 45px;
+      }
+
+      .final-content {
+        height: 100%;
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) 650px;
+        align-items: center;
+        gap: 64px;
+      }
+
+      .final-title {
+        font-size: 108px;
+        line-height: 1.06;
+        font-weight: 800;
+      }
+
+      .final-name {
+        margin-top: 22px;
+        font-size: 104px;
+        color: var(--teal-dark);
+      }
+
+      .final-points {
+        display: grid;
+        gap: 18px;
+      }
+
+      .final-point {
+        padding: 24px 28px;
+        border-radius: 14px;
+        border: 1px solid var(--line);
+        background: rgba(255,255,255,0.9);
+      }
+
+      .final-point b {
+        display: block;
+        font-size: 30px;
+      }
+
+      .final-point span {
+        display: block;
+        margin-top: 8px;
+        color: var(--muted);
+        font-size: 21px;
+      }
+
+      .transition {
+        position: absolute;
+        inset: 0;
+        overflow: hidden;
+        pointer-events: none;
+      }
+
+      .wipe-band {
+        position: absolute;
+        top: -10%;
+        left: -24%;
+        width: 42%;
+        height: 120%;
+        transform: skewX(-14deg);
+        background: #0f7c66;
+        box-shadow: 80px 0 0 #ffffff, 140px 0 0 rgba(138,92,18,0.72);
+      }
+    </style>
+  </head>
+  <body>
+    <div id="rst-promo" data-composition-id="rst-promo" data-start="0" data-duration="34" data-width="1920" data-height="1080">
+      <div id="scene-1" class="clip scene" data-start="0" data-duration="6.2" data-track-index="0">
+        <div class="grid-bg" data-layout-ignore></div>
+        <div class="scene-content">
+          <div class="hero-layout">
+            <div class="hero-copy">
+              <div class="kicker" id="s1-kicker">LOCAL WEB PLATFORM · LANDSAT 8</div>
+              <h1 class="display hero-title" id="s1-title">REMOTE<br />SENSING<br />TOOLS</h1>
+              <p class="subline" id="s1-copy">把遥感影像获取、预处理、批量编排与结果预览，压缩进一个本地化 Web 工作台。</p>
+            </div>
+            <div class="satellite" id="s1-sat">
+              <div class="aoi" id="s1-aoi"></div>
+              <div class="scan-line" id="s1-scan"></div>
+            </div>
+          </div>
+          <div class="problem-grid">
+            <div class="ui-panel problem-card" id="s1-card-a"><b>多源数据</b><span>Landsat L1/L2 与 Sentinel-2 L2A 检索下载。</span></div>
+            <div class="ui-panel problem-card" id="s1-card-b"><b>处理链复杂</b><span>定标、校正、QA 掩膜、裁剪、合成连续执行。</span></div>
+            <div class="ui-panel problem-card" id="s1-card-c"><b>结果要可查</b><span>任务进度、产物路径、预览与面积统计同步返回。</span></div>
+          </div>
+        </div>
+      </div>
+
+      <div id="scene-2" class="clip scene" data-start="5.7" data-duration="6.2" data-track-index="1">
+        <div class="scene-content">
+          <div class="kicker" id="s2-kicker">ONLINE SCENE SEARCH</div>
+          <h2 class="headline-cn" id="s2-title">先画 AOI，再把影像资产拉进本地流程。</h2>
+          <div class="pipeline">
+            <div class="satellite" id="s2-map">
+              <div class="aoi" id="s2-aoi"></div>
+              <div class="scan-line" id="s2-scan"></div>
+            </div>
+            <div class="stack">
+              <div class="ui-panel asset-row" id="s2-row-a"><div class="thumb"></div><div><b>LC08_L2SP_124033</b><span>2026-03-16 · cloud 8.4%</span></div><span class="status-pill">L2</span></div>
+              <div class="ui-panel asset-row" id="s2-row-b"><div class="thumb"></div><div><b>LC08_L1TP_124034</b><span>2026-03-24 · path / row ready</span></div><span class="status-pill">L1</span></div>
+              <div class="ui-panel asset-row" id="s2-row-c"><div class="thumb"></div><div><b>S2A_MSIL2A_TILE</b><span>Sentinel-2 · APGI 支持</span></div><span class="status-pill">L2A</span></div>
+              <p class="subline" id="s2-copy">支持矩形框选、矢量导入、资产勾选、浏览器下载与服务端下载队列。</p>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div id="scene-3" class="clip scene" data-start="11.4" data-duration="6.2" data-track-index="0">
+        <div class="scene-content">
+          <div class="kicker" id="s3-kicker">PROCESSING CHAIN</div>
+          <h2 class="headline-cn" id="s3-title">同一套界面，同时容纳传统预处理与地表反射率直用。</h2>
+          <div class="route-card ui-panel" id="s3-panel">
+            <div class="route-box" id="s3-l1"><strong class="display">L1</strong><em>辐射定标 + DOS / 6S 大气校正，适合完整预处理实验链。</em></div>
+            <div class="route-box" id="s3-l2"><strong class="display">L2</strong><em>自动跳过定标与大气校正，按官方缩放系数直接分析。</em></div>
+            <div class="process-list">
+              <div class="process-step" id="s3-p1"><b>QA_PIXEL</b><span>云 / 阴影 / 雪 / 卷云掩膜</span></div>
+              <div class="process-step" id="s3-p2"><b>QA_RADSAT</b><span>饱和像元过滤</span></div>
+              <div class="process-step" id="s3-p3"><b>ROI Clip</b><span>范围框或 SHP 裁剪</span></div>
+              <div class="process-step" id="s3-p4"><b>Composite</b><span>真彩、假彩、农业、短波红外</span></div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div id="scene-4" class="clip scene" data-start="17.1" data-duration="6.2" data-track-index="1">
+        <div class="scene-content">
+          <div class="kicker" id="s4-kicker">BATCH FLOW BUILDER</div>
+          <h2 class="headline-cn" id="s4-title">把目录级多景任务，编排成可复用的节点流程。</h2>
+          <div class="flow-board ui-panel" id="s4-board">
+            <div class="panel-head"><strong>批量流程</strong><span class="status-pill">可提交</span></div>
+            <div class="flow-canvas">
+              <div class="edge e1" id="s4-e1"></div>
+              <div class="edge e2" id="s4-e2"></div>
+              <div class="edge e3" id="s4-e3"></div>
+              <div class="edge e4" id="s4-e4"></div>
+              <div class="node input" id="s4-n1"><b>数据目录</b><span>扫描场景与产品级别</span></div>
+              <div class="node mask" id="s4-n2"><b>条件裁剪</b><span>按 ROI 与场景覆盖判断</span></div>
+              <div class="node clip-node" id="s4-n3"><b>质量掩膜</b><span>过滤异常像元</span></div>
+              <div class="node index" id="s4-n4"><b>合成指数</b><span>NDVI / NDWI / NDBI / APGI</span></div>
+              <div class="node output" id="s4-n5"><b>输出路径</b><span>按日期、传感器、场景归档</span></div>
+              <div class="batch-meta">
+                <div class="metric mono" id="s4-m1">18 场景</div>
+                <div class="metric mono" id="s4-m2">5 节点</div>
+                <div class="metric mono" id="s4-m3">队列运行</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div id="scene-5" class="clip scene" data-start="22.8" data-duration="6.2" data-track-index="0">
+        <div class="scene-content">
+          <div class="kicker" id="s5-kicker">OUTPUTS THAT CAN BE USED</div>
+          <h2 class="headline-cn" id="s5-title">产物不止落盘，还能直接预览、阈值二值化与面积统计。</h2>
+          <div class="results-layout">
+            <div class="preview ui-panel" id="s5-preview">
+              <div class="preview-frame">
+                <div class="index-mask" id="s5-mask"></div>
+              </div>
+            </div>
+            <div class="result-list">
+              <div class="ui-panel result-item" id="s5-r1"><div><strong>NDVI 植被指数</strong><code>output/scene/composite/ndvi.tif</code></div><div class="result-stat">0.72</div></div>
+              <div class="ui-panel result-item" id="s5-r2"><div><strong>质量摘要</strong><code>valid_pixels_ratio</code></div><div class="result-stat">91%</div></div>
+              <div class="ui-panel result-item" id="s5-r3"><div><strong>二值化面积</strong><code>target_area_mu</code></div><div class="result-stat">864</div></div>
+              <p class="subline" id="s5-copy">从算法结果到可交付摘要，减少人工跳转与重复处理。</p>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div id="scene-6" class="clip scene" data-start="28.5" data-duration="5.5" data-track-index="1">
+        <div class="grid-bg" data-layout-ignore></div>
+        <div class="scene-content">
+          <div class="final-content">
+            <div>
+              <div class="kicker" id="s6-kicker">GRADUATION DESIGN · V3.0.0</div>
+              <h2 class="final-title" id="s6-title">基于 Web 的 Landsat 8 遥感影像在线预处理系统</h2>
+              <div class="display final-name" id="s6-name">REMOTE SENSING TOOLS</div>
+            </div>
+            <div class="final-points">
+              <div class="final-point" id="s6-p1"><b>在线取数</b><span>STAC 检索、AOI、下载队列与资产管理。</span></div>
+              <div class="final-point" id="s6-p2"><b>可靠处理</b><span>L1 / L2、QA 掩膜、校正、裁剪、合成与指数。</span></div>
+              <div class="final-point" id="s6-p3"><b>流程化交付</b><span>Vue Flow 批量编排、FastAPI 异步任务、结果预览。</span></div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div id="tr-1" class="clip transition" data-start="5.55" data-duration="0.55" data-track-index="10"><div class="wipe-band"></div></div>
+      <div id="tr-2" class="clip transition" data-start="11.25" data-duration="0.55" data-track-index="11"><div class="wipe-band"></div></div>
+      <div id="tr-3" class="clip transition" data-start="16.95" data-duration="0.55" data-track-index="10"><div class="wipe-band"></div></div>
+      <div id="tr-4" class="clip transition" data-start="22.65" data-duration="0.55" data-track-index="11"><div class="wipe-band"></div></div>
+      <div id="tr-5" class="clip transition" data-start="28.35" data-duration="0.55" data-track-index="10"><div class="wipe-band"></div></div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/gsap@3.14.2/dist/gsap.min.js"></script>
+    <script>
+      window.__timelines = window.__timelines || {};
+      const tl = gsap.timeline({ paused: true });
+
+      function sweep(selector, at) {
+        tl.fromTo(`${selector} .wipe-band`, { x: -980 }, { x: 2500, duration: 0.55, ease: "power3.inOut" }, at);
+      }
+
+      tl.from("#s1-kicker", { y: 28, opacity: 0, duration: 0.42, ease: "power2.out" }, 0.18);
+      tl.from("#s1-title", { x: -72, opacity: 0, duration: 0.82, ease: "expo.out" }, 0.34);
+      tl.from("#s1-copy", { y: 42, opacity: 0, duration: 0.54, ease: "sine.out" }, 0.7);
+      tl.from("#s1-sat", { scale: 0.92, rotation: -2, opacity: 0, duration: 0.72, ease: "back.out(1.4)" }, 0.48);
+      tl.from("#s1-aoi", { scaleX: 0.18, scaleY: 0.18, opacity: 0, transformOrigin: "center", duration: 0.5, ease: "power4.out" }, 1.05);
+      tl.from("#s1-scan", { y: -120, opacity: 0, duration: 0.44, ease: "circ.out" }, 1.28);
+      tl.to("#s1-scan", { y: 560, duration: 3.8, ease: "none" }, 1.72);
+      tl.from("#s1-card-a", { y: 58, opacity: 0, duration: 0.5, ease: "power3.out" }, 1.55);
+      tl.from("#s1-card-b", { scale: 0.94, opacity: 0, duration: 0.46, ease: "back.out(1.2)" }, 1.74);
+      tl.from("#s1-card-c", { x: 52, opacity: 0, duration: 0.5, ease: "sine.out" }, 1.93);
+
+      sweep("#tr-1", 5.55);
+
+      tl.from("#s2-kicker", { x: -42, opacity: 0, duration: 0.42, ease: "power2.out" }, 5.92);
+      tl.from("#s2-title", { y: 52, opacity: 0, duration: 0.62, ease: "expo.out" }, 6.08);
+      tl.from("#s2-map", { x: -78, scale: 0.96, opacity: 0, duration: 0.62, ease: "power3.out" }, 6.45);
+      tl.from("#s2-aoi", { scale: 0.4, opacity: 0, transformOrigin: "center", duration: 0.46, ease: "back.out(1.5)" }, 6.86);
+      tl.from("#s2-scan", { y: -80, opacity: 0, duration: 0.34, ease: "circ.out" }, 7.05);
+      tl.to("#s2-scan", { y: 560, duration: 2.7, ease: "none" }, 7.42);
+      tl.from("#s2-row-a", { x: 76, opacity: 0, duration: 0.48, ease: "power4.out" }, 6.72);
+      tl.from("#s2-row-b", { y: 48, opacity: 0, duration: 0.46, ease: "sine.out" }, 6.94);
+      tl.from("#s2-row-c", { scale: 0.95, opacity: 0, duration: 0.44, ease: "back.out(1.2)" }, 7.16);
+      tl.from("#s2-copy", { y: 30, opacity: 0, duration: 0.48, ease: "power2.out" }, 7.54);
+
+      sweep("#tr-2", 11.25);
+
+      tl.from("#s3-kicker", { y: 30, opacity: 0, duration: 0.4, ease: "sine.out" }, 11.62);
+      tl.from("#s3-title", { x: -54, opacity: 0, duration: 0.62, ease: "expo.out" }, 11.78);
+      tl.from("#s3-panel", { y: 62, opacity: 0, duration: 0.58, ease: "power3.out" }, 12.16);
+      tl.from("#s3-l1", { scale: 0.92, opacity: 0, duration: 0.46, ease: "back.out(1.25)" }, 12.52);
+      tl.from("#s3-l2", { x: 46, opacity: 0, duration: 0.46, ease: "power4.out" }, 12.72);
+      tl.from("#s3-p1", { y: 42, opacity: 0, duration: 0.38, ease: "circ.out" }, 13.02);
+      tl.from("#s3-p2", { y: 42, opacity: 0, duration: 0.38, ease: "sine.out" }, 13.14);
+      tl.from("#s3-p3", { y: 42, opacity: 0, duration: 0.38, ease: "power2.out" }, 13.26);
+      tl.from("#s3-p4", { y: 42, opacity: 0, duration: 0.38, ease: "back.out(1.2)" }, 13.38);
+
+      sweep("#tr-3", 16.95);
+
+      tl.from("#s4-kicker", { x: -38, opacity: 0, duration: 0.4, ease: "power2.out" }, 17.32);
+      tl.from("#s4-title", { y: 46, opacity: 0, duration: 0.6, ease: "expo.out" }, 17.48);
+      tl.from("#s4-board", { scale: 0.97, opacity: 0, duration: 0.58, ease: "power3.out" }, 17.85);
+      tl.from("#s4-n1", { x: -56, opacity: 0, duration: 0.42, ease: "circ.out" }, 18.2);
+      tl.from("#s4-n2", { y: -42, opacity: 0, duration: 0.42, ease: "power4.out" }, 18.38);
+      tl.from("#s4-n3", { x: 56, opacity: 0, duration: 0.42, ease: "sine.out" }, 18.56);
+      tl.from("#s4-n4", { scale: 0.88, opacity: 0, duration: 0.44, ease: "back.out(1.4)" }, 18.78);
+      tl.from("#s4-n5", { y: 44, opacity: 0, duration: 0.42, ease: "power2.out" }, 18.98);
+      tl.from("#s4-e1,#s4-e2,#s4-e3,#s4-e4", { scaleX: 0, opacity: 0, duration: 0.5, ease: "power3.out", stagger: 0.08 }, 19.18);
+      tl.from("#s4-m1,#s4-m2,#s4-m3", { y: 24, opacity: 0, duration: 0.34, ease: "sine.out", stagger: 0.08 }, 19.6);
+
+      sweep("#tr-4", 22.65);
+
+      tl.from("#s5-kicker", { y: 28, opacity: 0, duration: 0.4, ease: "power2.out" }, 23.02);
+      tl.from("#s5-title", { x: -50, opacity: 0, duration: 0.62, ease: "expo.out" }, 23.18);
+      tl.from("#s5-preview", { y: 58, opacity: 0, duration: 0.55, ease: "power3.out" }, 23.55);
+      tl.from("#s5-mask", { scale: 0.72, opacity: 0, transformOrigin: "center", duration: 0.48, ease: "back.out(1.25)" }, 23.98);
+      tl.from("#s5-r1", { x: 58, opacity: 0, duration: 0.42, ease: "circ.out" }, 23.72);
+      tl.from("#s5-r2", { x: 58, opacity: 0, duration: 0.42, ease: "sine.out" }, 23.94);
+      tl.from("#s5-r3", { x: 58, opacity: 0, duration: 0.42, ease: "power4.out" }, 24.16);
+      tl.from("#s5-copy", { y: 28, opacity: 0, duration: 0.44, ease: "power2.out" }, 24.58);
+
+      sweep("#tr-5", 28.35);
+
+      tl.from("#s6-kicker", { y: 30, opacity: 0, duration: 0.42, ease: "sine.out" }, 28.72);
+      tl.from("#s6-title", { x: -54, opacity: 0, duration: 0.66, ease: "expo.out" }, 28.88);
+      tl.from("#s6-name", { y: 48, opacity: 0, duration: 0.5, ease: "power4.out" }, 29.3);
+      tl.from("#s6-p1", { x: 58, opacity: 0, duration: 0.42, ease: "circ.out" }, 29.1);
+      tl.from("#s6-p2", { x: 58, opacity: 0, duration: 0.42, ease: "sine.out" }, 29.32);
+      tl.from("#s6-p3", { x: 58, opacity: 0, duration: 0.42, ease: "back.out(1.25)" }, 29.54);
+      tl.to("[data-composition-id='rst-promo']", { backgroundColor: "#e8f1ee", duration: 0.8, ease: "sine.inOut" }, 33.0);
+      tl.to("#scene-6", { opacity: 0, duration: 0.65, ease: "sine.inOut" }, 33.35);
+
+      window.__timelines["rst-promo"] = tl;
+    </script>
+  </body>
+</html>

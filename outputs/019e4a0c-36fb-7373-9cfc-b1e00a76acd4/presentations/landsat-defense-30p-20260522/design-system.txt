@@ -1,0 +1,9 @@
+Design direction
+
+Tone: official school defense, steady and formal.
+Canvas: 16:9, 1280 x 720.
+Palette: white paper, academic navy, muted blue, teal, restrained gold.
+Chrome: top academic rule, small slide number, source footer, optional school emblem placeholder.
+Rhythm: cover, flow/agenda, section dividers, diagrams, code evidence, screenshots, test close.
+Evidence policy: real project screenshots and source-code facts only; no fabricated accuracy metrics.
+
