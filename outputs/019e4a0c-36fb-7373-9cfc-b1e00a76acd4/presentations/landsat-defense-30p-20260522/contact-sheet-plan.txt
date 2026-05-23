@@ -1,9 +1,0 @@
-Contact sheet plan
-
-Rows should show a clear defense story:
-1-3 opening and agenda.
-4-10 background, goal, route.
-11-20 architecture, modules, flows.
-21-27 algorithm, code, technical difficulties.
-28-30 screenshots, tests, conclusion.
-
