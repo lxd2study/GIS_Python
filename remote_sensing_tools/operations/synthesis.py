@@ -1,13 +1,19 @@
 """波段合成操作模块"""
 
-import os
 import ast
+import logging
+import os
 import re
 import tempfile
+from typing import Dict, List
+
 import numpy as np
 from osgeo import gdal
-from typing import Dict, List
+
 from ..core.constants import COMPOSITE_MAP
+
+
+logger = logging.getLogger(__name__)
 
 
 SENTINEL2_BANDS = {'B01', 'B02', 'B03', 'B04', 'B05', 'B06', 'B07', 'B08', 'B8A', 'B09', 'B11', 'B12'}
@@ -385,7 +391,22 @@ def _write_float_raster(output_path: str, reference_ds: gdal.Dataset,
     out_band.WriteArray(data)
     out_band.SetColorInterpretation(gdal.GCI_GrayIndex)
     out_band.SetNoDataValue(nodata_value)
-    out_band.ComputeStatistics(False)
+
+    valid_mask = np.isfinite(data)
+    if nodata_value is not None:
+        valid_mask &= data != nodata_value
+
+    valid_values = data[valid_mask]
+    if valid_values.size > 0:
+        out_band.SetStatistics(
+            float(valid_values.min()),
+            float(valid_values.max()),
+            float(valid_values.mean()),
+            float(valid_values.std()),
+        )
+    else:
+        logger.warning("输出栅格 %s 没有有效像元，已跳过统计信息计算", output_path)
+
     out_band.FlushCache()
     out_ds.FlushCache()
     out_ds = None

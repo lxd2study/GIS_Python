@@ -21,6 +21,7 @@ tmp*/
 cache/
 output/
 data/
+remote_sensing_tools/operations/
 
 frontend-vue/node_modules/
 frontend-vue/dist/
